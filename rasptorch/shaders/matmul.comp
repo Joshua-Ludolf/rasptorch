@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufA { float a[]; } bufa;
+layout(set = 0, binding = 1, std430) readonly buffer BufB { float b[]; } bufb;
+layout(set = 0, binding = 2, std430) writeonly buffer BufO { float o[]; } bufo;
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+// Row-major matrices:
+// A: [m,k], B: [k,n], O: [m,n]
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+
+    // Tiled matmul (16x16). Uses shared memory to reduce global loads.
+    // Works for any m/n/k (handles edge tiles).
+    shared float Asub[16][16];
+    shared float Bsub[16][16];
+
+    uvec2 lid = gl_LocalInvocationID.xy;
+
+    float sum = 0.0;
+    uint tiles = (pc.k + 15u) / 16u;
+    for (uint t = 0u; t < tiles; t++) {
+        uint a_col = t * 16u + lid.x;
+        uint b_row = t * 16u + lid.y;
+
+        Asub[lid.y][lid.x] = (row < pc.m && a_col < pc.k) ? bufa.a[row * pc.k + a_col] : 0.0;
+        Bsub[lid.y][lid.x] = (b_row < pc.k && col < pc.n) ? bufb.b[b_row * pc.n + col] : 0.0;
+
+        barrier();
+
+        for (uint i = 0u; i < 16u; i++) {
+            sum += Asub[lid.y][i] * Bsub[i][lid.x];
+        }
+
+        barrier();
+    }
+
+    if (row < pc.m && col < pc.n) {
+        bufo.o[row * pc.n + col] = sum;
+    }
+}
