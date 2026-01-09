@@ -158,10 +158,6 @@ Build:
 - `python -m pip install -U build twine`
 - `python -m build`
 
-Upload (TestPyPI first):
-
-- `python -m twine upload -r testpypi dist/*`
-
-Then PyPI:
+Upload PyPI:
 
 - `python -m twine upload dist/*`
