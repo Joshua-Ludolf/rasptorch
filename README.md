@@ -1,3 +1,5 @@
+[GitHub-flavored Markdown](https://guides.github.com/features/mastering-markdown/)
+
 ## rasptorch
 
 rasptorch is an experimental deep learning library inspired by PyTorch,
@@ -32,10 +34,20 @@ focused test + benchmark suite for the Vulkan backend.
 
 ## Quickstart
 
-- Run the CPU training demo: `uv run main.py --device cpu`
-- Run Vulkan GPU training (explicit kernels): `uv run main.py --device gpu`
-- Run GPU demos + benchmarks: `uv run gpu_demo.py`
-- Run the CNN + classifier training demo (with accuracy logs): `uv run cnn_demo.py`
+
+## Installation
+
+From PyPI (CPU-only dependencies):
+
+- `pip install rasptorch`
+
+If you want the optional Python Vulkan bindings (still requires working Vulkan drivers on your system):
+
+- `pip install "rasptorch[gpu]"`
+
+For local development from this repo:
+
+- `pip install -e .`
 
 ## GPU Training (Vulkan)
 
@@ -139,3 +151,18 @@ If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
 	are still limited.
 - The Vulkan backend only implements a small set of ops/kernels; expanding model coverage will
 	require more kernels (and ideally more fusion).
+
+## Publishing (maintainers)
+
+Build:
+
+- `python -m pip install -U build twine`
+- `python -m build`
+
+Upload (TestPyPI first):
+
+- `python -m twine upload -r testpypi dist/*`
+
+Then PyPI:
+
+- `python -m twine upload dist/*`
