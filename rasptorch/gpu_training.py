@@ -106,13 +106,9 @@ def train_mlp_regression_gpu(
     - Loss is computed via CPU readback for logging.
     """
 
-    vk.init()
-
-    probe = vk.to_gpu(np.zeros((1,), dtype=np.float32))
-    using_vulkan = probe.host is None and probe.buffer != 0
-    vk.free(probe)
-
-    print(f"GPU training backend: {'Vulkan' if using_vulkan else 'NumPy fallback'}")
+    # GPU mode must use Vulkan; fail fast with a clear error if unavailable.
+    vk.init(strict=True)
+    print("GPU training backend: Vulkan")
 
     dataset = TensorDataset(np.asarray(x, dtype=np.float32), np.asarray(y, dtype=np.float32))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)

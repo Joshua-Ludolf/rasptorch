@@ -22,13 +22,23 @@ def main() -> None:
     y = 2 * (x ** 2) + 1
 
     if args.device == "gpu":
-        train_mlp_regression_gpu(
-            x,
-            y,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            lr=args.lr,
-        )
+        try:
+            train_mlp_regression_gpu(
+                x,
+                y,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+            )
+        except RuntimeError as e:
+            print("Vulkan GPU mode failed:")
+            print(f"  {e}")
+            print(
+                "Tip: ensure Vulkan is installed and working, the Python 'vulkan' package is available, "
+                "and 'glslc' (shader compiler) is installed on the system."
+            )
+            raise SystemExit(1) from e
+
         print("Training done.")
         return
 

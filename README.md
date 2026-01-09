@@ -118,8 +118,7 @@ via `.numpy()` for logging.
 Notes:
 
 - Parameters and gradients stay on GPU; **loss is read back to CPU for logging**.
-- If Vulkan is unavailable or shader compilation fails, it will fall back to NumPy and print:
-	`GPU training backend: NumPy fallback`.
+- `uv run main.py --device gpu` now **requires Vulkan**. If Vulkan init or shader compilation fails, it raises a clear error instead of silently falling back.
 - Broadcasting is still limited; common 2D + 1D row-vector forms like `(N,M) + (M,)` and `(N,M) * (M,)` are supported.
 
 ## Benchmarks

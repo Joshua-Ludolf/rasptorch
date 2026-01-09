@@ -26,13 +26,17 @@ import subprocess
 import numpy as np
 
 
+_VULKAN_DISABLED_REASON: Optional[str] = None
+
+
 try:
     # python package: "vulkan" (ctypes bindings)
     from vulkan import *  # type: ignore
 
     _HAS_VULKAN = True
-except Exception:
+except Exception as e:
     _HAS_VULKAN = False
+    _VULKAN_DISABLED_REASON = f"Python package 'vulkan' not available: {e}"
 
 # Help type checkers know the Vulkan symbols exist when installed.
 if TYPE_CHECKING:  # pragma: no cover
@@ -1096,7 +1100,6 @@ class _VulkanContext:
 
 
 _CTX: Optional[_VulkanContext] = None
-_VULKAN_DISABLED_REASON: Optional[str] = None
 
 
 def _disable_vulkan(reason: str) -> None:
@@ -1116,15 +1119,34 @@ def _ctx() -> _VulkanContext:
     return _CTX
 
 
-def init() -> None:
-    """Initialize Vulkan backend (or do nothing if unavailable)."""
+def init(*, strict: bool = False) -> None:
+    """Initialize Vulkan backend.
+
+    When strict=False (default), initialization failures disable Vulkan and
+    allow the library to continue in NumPy fallback mode.
+
+    When strict=True, failures raise instead of silently falling back.
+    """
 
     if not _HAS_VULKAN:
+        if strict:
+            raise RuntimeError(_VULKAN_DISABLED_REASON or "Vulkan backend disabled")
         return
+
     try:
         _ctx()
     except Exception as e:
         _disable_vulkan(str(e))
+        if strict:
+            raise RuntimeError(_VULKAN_DISABLED_REASON or str(e)) from e
+
+
+def disabled_reason() -> Optional[str]:
+    """Return the reason Vulkan is unavailable/disabled (if known)."""
+
+    if _HAS_VULKAN:
+        return _VULKAN_DISABLED_REASON
+    return _VULKAN_DISABLED_REASON or "Vulkan bindings unavailable"
 
 
 def to_gpu(data: np.ndarray) -> VulkanBuffer:

@@ -46,7 +46,7 @@ def accuracy_from_logits(logits: np.ndarray, labels: np.ndarray) -> float:
 
 
 def main() -> None:
-    vk.init()
+    vk.init(strict=True)
 
     # Tiny CNN -> classifier head.
     model = Sequential(
