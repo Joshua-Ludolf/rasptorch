@@ -163,17 +163,22 @@ wheels = [
 [[package]]
 name = "rasptorch"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "numpy" },
+]
+
+[package.optional-dependencies]
+gpu = [
     { name = "vulkan" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
-    { name = "vulkan", specifier = ">=1.3.0" },
+    { name = "vulkan", marker = "extra == 'gpu'", specifier = ">=1.3.0" },
 ]
+provides-extras = ["gpu"]
 
 [[package]]
 name = "vulkan"
