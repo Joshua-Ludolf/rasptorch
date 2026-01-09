@@ -1,5 +1,5 @@
 from .tensor import Tensor, Parameter
-from . import nn, functional, data
+from . import nn, functional, data, train
 
 __all__ = [
 	"Tensor",
@@ -7,4 +7,5 @@ __all__ = [
 	"nn",
 	"functional",
 	"data",
+	"train",
 ]

@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufX { float x[]; } bufx; // [N,C,H,W]
+layout(set = 0, binding = 1, std430) writeonly buffer BufO { float o[]; } bufo; // [N*H*W, C]
+
+layout(push_constant) uniform Push {
+    uint total; // total elements in output matrix (N*H*W*C)
+    uint N;
+    uint C;
+    uint H;
+    uint W;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint c = idx % pc.C;
+    uint row = idx / pc.C;
+
+    uint hw = pc.H * pc.W;
+    uint n = row / hw;
+    uint s = row - n * hw;
+    uint h = s / pc.W;
+    uint w = s - h * pc.W;
+
+    uint xidx = ((n * pc.C + c) * pc.H + h) * pc.W + w;
+    bufo.o[idx] = bufx.x[xidx];
+}

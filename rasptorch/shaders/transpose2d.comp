@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufIn { float x[]; } bufin;
+layout(set = 0, binding = 1, std430) writeonly buffer BufOut { float y[]; } bufout;
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+// Row-major transpose:
+// In:  [rows, cols]
+// Out: [cols, rows]
+
+void main() {
+    uint r = gl_GlobalInvocationID.y;
+    uint c = gl_GlobalInvocationID.x;
+    if (r >= pc.rows || c >= pc.cols) return;
+
+    float v = bufin.x[r * pc.cols + c];
+    bufout.y[c * pc.rows + r] = v;
+}

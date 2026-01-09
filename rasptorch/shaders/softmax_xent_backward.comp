@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufLogits { float logits[]; } bufl;
+layout(set = 0, binding = 1, std430) readonly buffer BufTarget { float target[]; } buft;
+layout(set = 0, binding = 2, std430) writeonly buffer BufGrad { float grad[]; } bufg; // [N*C]
+
+layout(push_constant) uniform Push {
+    uint N;
+    uint C;
+} pc;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.N) return;
+
+    uint base = n * pc.C;
+
+    float m = -3.402823e38;
+    for (uint c = 0u; c < pc.C; c++) {
+        float v = bufl.logits[base + c];
+        m = max(m, v);
+    }
+
+    float sumexp = 0.0;
+    for (uint c = 0u; c < pc.C; c++) {
+        sumexp += exp(bufl.logits[base + c] - m);
+    }
+
+    float invsum = 1.0 / sumexp;
+    float invN = 1.0 / max(1.0, float(pc.N));
+
+    for (uint c = 0u; c < pc.C; c++) {
+        float soft = exp(bufl.logits[base + c] - m) * invsum;
+        float y = buft.target[base + c];
+        bufg.grad[base + c] = (soft - y) * invN;
+    }
+}

@@ -1,0 +1,23 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufA { float a[]; } bufa; // [rows, cols]
+layout(set = 0, binding = 1, std430) writeonly buffer BufO { float o[]; } bufo; // [cols]
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+// out[col] = sum_{r=0..rows-1} a[r,col]
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    if (col >= pc.cols) return;
+
+    float sum = 0.0;
+    for (uint r = 0u; r < pc.rows; r++) {
+        sum += bufa.a[r * pc.cols + col];
+    }
+    bufo.o[col] = sum;
+}

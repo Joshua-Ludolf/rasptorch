@@ -1,0 +1,17 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufP { float p[]; } bufp; // param (in/out)
+layout(set = 0, binding = 1, std430) readonly buffer BufG { float g[]; } bufg; // grad
+
+layout(push_constant) uniform Push {
+    uint n;
+    float lr;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+    bufp.p[idx] = bufp.p[idx] - pc.lr * bufg.g[idx];
+}

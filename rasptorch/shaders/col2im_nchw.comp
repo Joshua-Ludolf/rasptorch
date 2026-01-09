@@ -1,0 +1,63 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufC { float col[]; } bufc; // [N*OH*OW, C*KH*KW]
+layout(set = 0, binding = 1, std430) writeonly buffer BufX { float x[]; } bufx;   // [N,C,H,W]
+
+layout(push_constant) uniform Push {
+    uint total;     // total elements in output image tensor (N*C*H*W)
+    uint N;
+    uint C;
+    uint H;
+    uint W;
+    uint KH;
+    uint KW;
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint W = pc.W;
+    uint H = pc.H;
+    uint C = pc.C;
+
+    uint w = idx % W;
+    uint tmp = idx / W;
+    uint h = tmp % H;
+    tmp = tmp / H;
+    uint c = tmp % C;
+    uint n = tmp / C;
+
+    uint OH = (pc.H + 2u * pc.pad_h - pc.KH) / pc.stride_h + 1u;
+    uint OW = (pc.W + 2u * pc.pad_w - pc.KW) / pc.stride_w + 1u;
+    uint K = pc.C * pc.KH * pc.KW;
+
+    float acc = 0.0;
+
+    // For each kernel position, find the output (oh,ow) that would have sampled (h,w).
+    for (uint kh = 0u; kh < pc.KH; kh++) {
+        for (uint kw = 0u; kw < pc.KW; kw++) {
+            int oh_i = int(h) + int(pc.pad_h) - int(kh);
+            int ow_i = int(w) + int(pc.pad_w) - int(kw);
+            if (oh_i < 0 || ow_i < 0) continue;
+            if ((oh_i % int(pc.stride_h)) != 0) continue;
+            if ((ow_i % int(pc.stride_w)) != 0) continue;
+
+            int oh = oh_i / int(pc.stride_h);
+            int ow = ow_i / int(pc.stride_w);
+            if (oh < 0 || ow < 0 || oh >= int(OH) || ow >= int(OW)) continue;
+
+            uint row = n * (OH * OW) + uint(oh) * OW + uint(ow);
+            uint col_idx = c * (pc.KH * pc.KW) + kh * pc.KW + kw;
+            acc += bufc.col[row * K + col_idx];
+        }
+    }
+
+    bufx.x[idx] = acc;
+}

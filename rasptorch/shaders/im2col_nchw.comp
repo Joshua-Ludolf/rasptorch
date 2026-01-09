@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufX { float x[]; } bufx; // [N,C,H,W] flattened
+layout(set = 0, binding = 1, std430) writeonly buffer BufO { float o[]; } bufo; // [N*OH*OW, C*KH*KW] flattened
+
+layout(push_constant) uniform Push {
+    uint total;     // total elements in output matrix
+    uint N;
+    uint C;
+    uint H;
+    uint W;
+    uint KH;
+    uint KW;
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint K = pc.C * pc.KH * pc.KW;
+
+    uint col = idx % K;
+    uint row = idx / K;
+
+    uint OH = (pc.H + 2u * pc.pad_h - pc.KH) / pc.stride_h + 1u;
+    uint OW = (pc.W + 2u * pc.pad_w - pc.KW) / pc.stride_w + 1u;
+
+    uint n = row / (OH * OW);
+    uint s = row - n * (OH * OW);
+    uint oh = s / OW;
+    uint ow = s - oh * OW;
+
+    uint c = col / (pc.KH * pc.KW);
+    uint t = col - c * (pc.KH * pc.KW);
+    uint kh = t / pc.KW;
+    uint kw = t - kh * pc.KW;
+
+    int ih = int(oh * pc.stride_h + kh) - int(pc.pad_h);
+    int iw = int(ow * pc.stride_w + kw) - int(pc.pad_w);
+
+    float v = 0.0;
+    if (ih >= 0 && iw >= 0 && ih < int(pc.H) && iw < int(pc.W)) {
+        uint xidx = ((n * pc.C + c) * pc.H + uint(ih)) * pc.W + uint(iw);
+        v = bufx.x[xidx];
+    }
+
+    bufo.o[idx] = v;
+}

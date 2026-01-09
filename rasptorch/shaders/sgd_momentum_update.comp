@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer BufParam { float p[]; } bufp; // readwrite
+layout(set = 0, binding = 1, std430) readonly buffer BufGrad { float g[]; } bufg;
+layout(set = 0, binding = 2, std430) buffer BufVel { float v[]; } bufv; // readwrite
+
+layout(push_constant) uniform Push {
+    uint n;
+    float lr;
+    float momentum;
+    float weight_decay;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+
+    float p = bufp.p[i];
+    float g = bufg.g[i] + pc.weight_decay * p;
+    float v = pc.momentum * bufv.v[i] + g;
+
+    bufv.v[i] = v;
+    bufp.p[i] = p - pc.lr * v;
+}

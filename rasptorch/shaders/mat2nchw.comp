@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufM { float m[]; } bufm; // [N*H*W, C]
+layout(set = 0, binding = 1, std430) writeonly buffer BufX { float x[]; } bufx; // [N,C,H,W]
+
+layout(push_constant) uniform Push {
+    uint total; // total elements in output tensor (N*C*H*W)
+    uint N;
+    uint C;
+    uint H;
+    uint W;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total) return;
+
+    uint w = idx % pc.W;
+    uint tmp = idx / pc.W;
+    uint h = tmp % pc.H;
+    tmp = tmp / pc.H;
+    uint c = tmp % pc.C;
+    uint n = tmp / pc.C;
+
+    uint row = n * (pc.H * pc.W) + h * pc.W + w;
+    uint midx = row * pc.C + c;
+    bufx.x[idx] = bufm.m[midx];
+}

@@ -32,8 +32,95 @@ focused test + benchmark suite for the Vulkan backend.
 
 ## Quickstart
 
-- Run the CPU training demo: `uv run main.py`
+- Run the CPU training demo: `uv run main.py --device cpu`
+- Run Vulkan GPU training (explicit kernels): `uv run main.py --device gpu`
 - Run GPU demos + benchmarks: `uv run gpu_demo.py`
+- Run the CNN + classifier training demo (with accuracy logs): `uv run cnn_demo.py`
+
+## GPU Training (Vulkan)
+
+There are currently two “modes” of training in this repo:
+
+- **CPU autograd training** (PyTorch-like): uses the NumPy-backed autograd engine.
+- **Vulkan GPU training** (explicit kernels): runs forward + backward + SGD updates on GPU
+	using purpose-built compute shaders.
+
+The Vulkan training path lives in `rasptorch/gpu_training.py` and currently supports a
+2-layer MLP:
+
+`Linear -> ReLU -> Linear` with MSE loss and SGD.
+
+Run it via:
+
+- `uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.1`
+
+## GPU Autograd (WIP)
+
+There is now an experimental **gpu-autograd** mode that enables `loss.backward()` even when
+the model and activations live on GPU, for a limited set of ops.
+
+Run it via:
+
+- `uv run main.py --device gpu-autograd --epochs 50 --batch-size 32 --lr 0.1`
+
+Currently supported (GPU) in autograd:
+
+- `+`, `*`, `-` (scalar and tensor forms), `@` (matmul)
+- scalar ops: `tensor + s`, `tensor * s`, `tensor / s`, plus `s + tensor`, `s * tensor`, `s - tensor`
+- `neg`, `relu`, `sum`, `mean`, `T` (2D transpose)
+- `Linear` backward (GPU grads for `weight`/`bias`)
+- `SGD.step()` updates GPU parameters in-place (SGD + optional momentum/weight decay)
+- `functional.cross_entropy(logits, target_onehot)` (softmax cross-entropy, mean reduction)
+
+## Training Loop Utilities
+
+There is now a small, reusable training loop helper in `rasptorch.train` that provides
+PyTorch-like epoch logs (loss, accuracy/metrics, throughput) for **any** model.
+
+Key pieces:
+
+- `rasptorch.train.fit(...)`: train loop with optional validation
+- `rasptorch.train.Accuracy()`: top-1 classification accuracy
+- `rasptorch.train.classification_target_one_hot(C, device=...)`: converts integer labels -> one-hot
+
+Example (classifier):
+
+```python
+from rasptorch import functional as F
+from rasptorch.train import fit, Accuracy, classification_target_one_hot
+from rasptorch.optim import SGD
+
+model = ...
+opt = SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
+
+fit(
+	model,
+	opt,
+	train_loader,
+	loss_fn=F.cross_entropy,
+	device="gpu",
+	epochs=10,
+	val_loader=val_loader,
+	target_transform=classification_target_one_hot(num_classes=10, device="gpu"),
+	metrics=[Accuracy()],
+)
+```
+
+Notes:
+
+- Metrics like accuracy call `.numpy()` on logits, which triggers a GPU readback.
+- There is not yet a `no_grad()` context; evaluation still builds graphs.
+
+`mse_loss` is now implemented purely via tensor ops (`(pred-target)^2` + `mean()`), so the
+loss tensor itself is on GPU in `gpu-autograd` mode; training code typically reads it back
+via `.numpy()` for logging.
+
+Notes:
+
+- Parameters and gradients stay on GPU; **loss is read back to CPU for logging**.
+- If Vulkan is unavailable or shader compilation fails, it will fall back to NumPy and print:
+	`GPU training backend: NumPy fallback`.
+- Broadcasting is still limited; common 2D + 1D row-vector forms like `(N,M) + (M,)` and `(N,M) * (M,)` are supported.
 
 ## Benchmarks
 
@@ -48,6 +135,8 @@ If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
 
 ## Current Limitations
 
-- Autograd is CPU-only. Calling `backward()` on a GPU tensor is not implemented.
-- The GPU path currently targets a small set of ops; more kernels and/or additional
-  fusions are needed for end-to-end training on GPU.
+- GPU autograd is still **incomplete** (only a subset of ops are supported).
+- GPU reductions now support `sum()` and `mean()`, but other reductions/broadcast patterns
+	are still limited.
+- The Vulkan backend only implements a small set of ops/kernels; expanding model coverage will
+	require more kernels (and ideally more fusion).

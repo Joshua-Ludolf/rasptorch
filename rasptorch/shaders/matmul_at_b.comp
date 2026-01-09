@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufA { float a[]; } bufa; // A: [m,k]
+layout(set = 0, binding = 1, std430) readonly buffer BufB { float b[]; } bufb; // B: [m,n]
+layout(set = 0, binding = 2, std430) writeonly buffer BufO { float o[]; } bufo; // O: [k,n]
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+// Compute O = A^T @ B
+// A: [m,k] row-major, B: [m,n], O: [k,n]
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // row in O (k)
+    uint col = gl_GlobalInvocationID.x; // col in O (n)
+    if (row >= pc.k || col >= pc.n) return;
+
+    float sum = 0.0;
+    for (uint i = 0u; i < pc.m; i++) {
+        float av = bufa.a[i * pc.k + row]; // A[i,row]
+        float bv = bufb.b[i * pc.n + col]; // B[i,col]
+        sum += av * bv;
+    }
+
+    bufo.o[row * pc.n + col] = sum;
+}

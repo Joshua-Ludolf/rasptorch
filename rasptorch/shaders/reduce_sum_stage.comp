@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufIn { float x[]; } bufin;
+layout(set = 0, binding = 1, std430) writeonly buffer BufOut { float y[]; } bufout;
+
+layout(push_constant) uniform Push {
+    uint n;
+} pc;
+
+shared float sdata[256];
+
+// One stage of reduction.
+// Each workgroup reduces up to 512 elements into one output element.
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_WorkGroupID.x;
+
+    uint base = gid * 512u;
+    uint i0 = base + lid;
+    uint i1 = base + lid + 256u;
+
+    float sum = 0.0;
+    if (i0 < pc.n) sum += bufin.x[i0];
+    if (i1 < pc.n) sum += bufin.x[i1];
+
+    sdata[lid] = sum;
+    barrier();
+
+    // Reduce within the workgroup.
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) {
+            sdata[lid] += sdata[lid + s];
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        bufout.y[gid] = sdata[0];
+    }
+}

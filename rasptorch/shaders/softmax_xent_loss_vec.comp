@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufLogits { float logits[]; } bufl;
+layout(set = 0, binding = 1, std430) readonly buffer BufTarget { float target[]; } buft;
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float out[]; } bufo; // [N]
+
+layout(push_constant) uniform Push {
+    uint N;
+    uint C;
+} pc;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.N) return;
+
+    // max logit for numerical stability
+    float m = -3.402823e38;
+    uint base = n * pc.C;
+    for (uint c = 0u; c < pc.C; c++) {
+        float v = bufl.logits[base + c];
+        m = max(m, v);
+    }
+
+    float sumexp = 0.0;
+    for (uint c = 0u; c < pc.C; c++) {
+        sumexp += exp(bufl.logits[base + c] - m);
+    }
+
+    float logsumexp = log(sumexp) + m;
+
+    float loss = 0.0;
+    for (uint c = 0u; c < pc.C; c++) {
+        float y = buft.target[base + c];
+        float logp = bufl.logits[base + c] - logsumexp;
+        loss += -y * logp;
+    }
+
+    bufo.out[n] = loss;
+}
