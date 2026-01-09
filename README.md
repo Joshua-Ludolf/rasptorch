@@ -37,13 +37,14 @@ focused test + benchmark suite for the Vulkan backend.
 
 ## Installation
 
-From PyPI (CPU-only dependencies):
+From PyPI:
 
 - `pip install rasptorch`
 
-If you want the optional Python Vulkan bindings (still requires working Vulkan drivers on your system):
+Notes for GPU mode:
 
-- `pip install "rasptorch[gpu]"`
+- Requires working Vulkan drivers on your system.
+- Requires `glslc` (shader compiler) available on PATH.
 
 For local development from this repo:
 
