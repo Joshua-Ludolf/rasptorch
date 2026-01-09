@@ -1,5 +1,3 @@
-[GitHub-flavored Markdown](https://guides.github.com/features/mastering-markdown/)
-
 ## rasptorch
 
 rasptorch is an experimental deep learning library inspired by PyTorch,
