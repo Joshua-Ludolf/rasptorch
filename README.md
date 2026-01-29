@@ -150,6 +150,8 @@ If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
 	are still limited.
 - The Vulkan backend only implements a small set of ops/kernels; expanding model coverage will
 	require more kernels (and ideally more fusion).
+- PyTorch integration is experimental: `rasptorch.torch_bridge` currently supports a small inference subset
+  (Conv2d/Linear/ReLU) and may copy tensors CPU<->GPU.
 
 ## Publishing (maintainers)
 

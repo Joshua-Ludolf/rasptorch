@@ -2,6 +2,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from .tensor import Tensor, Parameter
 from . import nn, functional, data, train
+from . import torch_bridge
 
 try:
 	__version__ = version("rasptorch")
@@ -16,4 +17,5 @@ __all__ = [
 	"functional",
 	"data",
 	"train",
+	"torch_bridge",
 ]
