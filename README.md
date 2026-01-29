@@ -123,11 +123,9 @@ Notes:
 - Metrics like accuracy call `.numpy()` on logits, which triggers a GPU readback.
 - There is not yet a `no_grad()` context; evaluation still builds graphs.
 
-`mse_loss` is now implemented purely via tensor ops (`(pred-target)^2` + `mean()`), so the
+- `mse_loss` is now implemented purely via tensor ops (`(pred-target)^2` + `mean()`), so the
 loss tensor itself is on GPU in `gpu-autograd` mode; training code typically reads it back
 via `.numpy()` for logging.
-
-Notes:
 
 - Parameters and gradients stay on GPU; **loss is read back to CPU for logging**.
 - `uv run main.py --device gpu` now **requires Vulkan**. If Vulkan init or shader compilation fails, it raises a clear error instead of silently falling back.
