@@ -1,4 +1,4 @@
 cffi==2.0.0
 numpy==2.4.0
-pycparser==2.23
+pycparser==3.0
 vulkan==1.3.275.1
