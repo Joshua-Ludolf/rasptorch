@@ -32,6 +32,7 @@ focused test + benchmark suite for the Vulkan backend.
 
 ## Quickstart
 
+- Ensure you have `uv` installed in your python enviroment. See https://docs.astral.sh/uv/#installation to get started with it.
 
 ## Installation
 
