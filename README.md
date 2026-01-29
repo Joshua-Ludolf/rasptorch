@@ -45,6 +45,18 @@ Notes for GPU mode:
 - Requires working Vulkan drivers on your system.
 - Requires `glslc` (shader compiler) available on PATH.
 
+Quick GPU validation:
+
+- `uv run gpu_demo.py --smoke-only`
+  - Initializes Vulkan strictly and runs fast correctness checks for core kernels.
+  - If this fails, `uv run main.py --device gpu` will also fail.
+
+Quick model saving check:
+
+- `uv run main.py --device cpu --epochs 1 --save model.pth`
+  - If `torch` is installed: `python -c "import torch; print(torch.load('model.pth').keys())"`
+  - If not: `python -c "import pickle; print(pickle.load(open('model.pth','rb')).keys())"`
+
 For local development from this repo:
 
 - `pip install -e .`
@@ -65,6 +77,12 @@ The Vulkan training path lives in `rasptorch/gpu_training.py` and currently supp
 Run it via:
 
 - `uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.1`
+
+Saving weights (PyTorch-style `.pth`):
+
+- `uv run main.py --device gpu --epochs 50 --save model.pth`
+- If `torch` is installed, this is a real `torch.save(...)` file loadable via `torch.load("model.pth")`.
+- If `torch` is not installed, rasptorch falls back to writing a pickle payload (same keys, **not** `torch.load` compatible).
 
 ## GPU Autograd (WIP)
 

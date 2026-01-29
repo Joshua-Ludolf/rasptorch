@@ -13,17 +13,35 @@ class Module:
         self.training: bool = True
 
     def parameters(self) -> Iterable[Parameter]:
-        for value in self.__dict__.values():
+        for _, p in self.named_parameters():
+            yield p
+
+    def named_parameters(self, prefix: str = "") -> Iterable[tuple[str, Parameter]]:
+        """Yield (name, Parameter) pairs, similar to torch.nn.Module.named_parameters."""
+
+        for name, value in self.__dict__.items():
+            if name.startswith("_"):
+                continue
+            full = f"{prefix}.{name}" if prefix else name
             if isinstance(value, Parameter):
-                yield value
+                yield full, value
             elif isinstance(value, Module):
-                yield from value.parameters()
+                yield from value.named_parameters(full)
             elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, Module):
-                        yield from item.parameters()
-                    elif isinstance(item, Parameter):
-                        yield item
+                for i, item in enumerate(value):
+                    sub = f"{full}.{i}"
+                    if isinstance(item, Parameter):
+                        yield sub, item
+                    elif isinstance(item, Module):
+                        yield from item.named_parameters(sub)
+
+    def state_dict(self) -> dict[str, np.ndarray]:
+        """Return a CPU numpy-based state_dict (suitable for torch.save)."""
+
+        out: dict[str, np.ndarray] = {}
+        for name, p in self.named_parameters():
+            out[name] = np.asarray(p.numpy(), dtype=np.float32).copy()
+        return out
 
     def zero_grad(self) -> None:
         for p in self.parameters():

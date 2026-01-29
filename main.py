@@ -15,6 +15,8 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--save", type=str, default="", help="Save trained weights to a .pth file")
     args = parser.parse_args()
 
     # Generate synthetic data: y = 2x^2 + 1 (nonlinear)
@@ -29,6 +31,8 @@ def main() -> None:
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 lr=args.lr,
+                log_every=args.log_every,
+                save_path=(args.save or None),
             )
         except RuntimeError as e:
             print("Vulkan GPU mode failed:")
@@ -84,6 +88,22 @@ def main() -> None:
             print(f"Epoch {epoch}: loss={avg_loss:.6f}")
 
     model.eval()
+
+    if args.save:
+        payload = {"arch": type(model).__name__, "state_dict": model.state_dict()}
+        try:
+            import torch  # type: ignore
+
+            torch.save(payload, args.save)
+        except ModuleNotFoundError:
+            # Fallback: still write a file, but it won't be torch.load()-compatible.
+            import pickle
+
+            with open(args.save, "wb") as f:
+                pickle.dump(payload, f)
+            print("Warning: 'torch' not installed; wrote a pickle file (not torch.load compatible).")
+        print(f"Saved model to: {args.save}")
+
     print("Training done.")
 
 

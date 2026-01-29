@@ -8,6 +8,9 @@ from .data import DataLoader, TensorDataset
 
 class GpuMLP:
     def __init__(self, in_features: int, hidden: int, out_features: int, *, seed: int = 0) -> None:
+        self.in_features = int(in_features)
+        self.hidden = int(hidden)
+        self.out_features = int(out_features)
         rng = np.random.default_rng(seed)
 
         # Store weights in matmul-friendly layout:
@@ -24,6 +27,33 @@ class GpuMLP:
         self.b1 = vk.to_gpu(b1)
         self.w2 = vk.to_gpu(w2)
         self.b2 = vk.to_gpu(b2)
+
+    def state_dict(self) -> dict[str, np.ndarray]:
+        return {
+            "w1": vk.to_cpu(self.w1),
+            "b1": vk.to_cpu(self.b1),
+            "w2": vk.to_cpu(self.w2),
+            "b2": vk.to_cpu(self.b2),
+        }
+
+    def save(self, path: str) -> None:
+        payload = {
+            "arch": "GpuMLP",
+            "in_features": self.in_features,
+            "hidden": self.hidden,
+            "out_features": self.out_features,
+            "state_dict": self.state_dict(),
+        }
+        try:
+            import torch  # type: ignore
+
+            torch.save(payload, path)
+        except ModuleNotFoundError:
+            import pickle
+
+            with open(path, "wb") as f:
+                pickle.dump(payload, f)
+            print("Warning: 'torch' not installed; wrote a pickle file (not torch.load compatible).")
 
     def close(self) -> None:
         # Free parameter buffers.
@@ -98,6 +128,7 @@ def train_mlp_regression_gpu(
     hidden: int = 16,
     seed: int = 0,
     log_every: int = 10,
+    save_path: str | None = None,
 ) -> None:
     """Train a 2-layer MLP on GPU using explicit Vulkan backward kernels.
 
@@ -126,5 +157,9 @@ def train_mlp_regression_gpu(
             avg_loss = epoch_loss / max(1, num_batches)
             if epoch % log_every == 0:
                 print(f"Epoch {epoch}: loss={avg_loss:.6f}")
+
+        if save_path:
+            model.save(save_path)
+            print(f"Saved model to: {save_path}")
     finally:
         model.close()

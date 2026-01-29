@@ -1,3 +1,4 @@
+import argparse
 import numpy as np
 import time
 
@@ -39,6 +40,115 @@ def _bench(fn, warmup: int, iters: int) -> list[int]:
     return times
 
 
+def _assert_close(name: str, got: np.ndarray, expected: np.ndarray, *, rtol: float = 1e-4, atol: float = 1e-5) -> None:
+    got = np.asarray(got)
+    expected = np.asarray(expected)
+    if got.shape != expected.shape:
+        raise AssertionError(f"{name}: shape mismatch {got.shape} vs {expected.shape}")
+    if not np.allclose(got, expected, rtol=rtol, atol=atol):
+        max_abs = float(np.max(np.abs(got - expected)))
+        raise AssertionError(f"{name}: values differ (max_abs={max_abs})")
+
+
+def run_smoke_tests() -> None:
+    """Fast correctness smoke tests for the Vulkan kernels used by demos/training."""
+
+    rng = np.random.default_rng(0)
+
+    # Elementwise: (x*y + x).relu()
+    x = rng.standard_normal((33, 17), dtype=np.float32)
+    y = rng.standard_normal((33, 17), dtype=np.float32)
+    a = vk.to_gpu(x)
+    b = vk.to_gpu(y)
+    try:
+        tmp = vk.mul(a, b)
+        tmp2 = vk.add(tmp, a)
+        out = vk.relu(tmp2)
+        try:
+            _assert_close("elemwise", vk.to_cpu(out), np.maximum(x * y + x, 0.0))
+        finally:
+            vk.free(tmp)
+            vk.free(tmp2)
+            vk.free(out)
+    finally:
+        vk.free(a)
+        vk.free(b)
+
+    # Matmul
+    a_np = rng.standard_normal((17, 19), dtype=np.float32)
+    b_np = rng.standard_normal((19, 23), dtype=np.float32)
+    a = vk.to_gpu(a_np)
+    b = vk.to_gpu(b_np)
+    try:
+        out = vk.matmul(a, b)
+        try:
+            _assert_close("matmul", vk.to_cpu(out), a_np @ b_np, rtol=2e-3, atol=1e-3)
+        finally:
+            vk.free(out)
+    finally:
+        vk.free(a)
+        vk.free(b)
+
+    # Transpose2d
+    t_np = rng.standard_normal((7, 5), dtype=np.float32)
+    t = vk.to_gpu(t_np)
+    try:
+        out = vk.transpose2d(t)
+        try:
+            _assert_close("transpose2d", vk.to_cpu(out), t_np.T)
+        finally:
+            vk.free(out)
+    finally:
+        vk.free(t)
+
+    # Training kernels: add_rowvec + reduce_sum_rows + relu_backward + mse_grad
+    m = rng.standard_normal((11, 13), dtype=np.float32)
+    rv = rng.standard_normal((13,), dtype=np.float32)
+    m_buf = vk.to_gpu(m)
+    rv_buf = vk.to_gpu(rv)
+    try:
+        out = vk.add_rowvec(m_buf, rv_buf)
+        try:
+            _assert_close("add_rowvec", vk.to_cpu(out), m + rv)
+        finally:
+            vk.free(out)
+
+        rs = vk.reduce_sum_rows(m_buf)
+        try:
+            _assert_close("reduce_sum_rows", vk.to_cpu(rs), m.sum(axis=0))
+        finally:
+            vk.free(rs)
+
+        grad_out_np = rng.standard_normal(m.shape, dtype=np.float32)
+        grad_out = vk.to_gpu(grad_out_np)
+        try:
+            gi = vk.relu_backward(grad_out, m_buf)
+            try:
+                _assert_close("relu_backward", vk.to_cpu(gi), grad_out_np * (m > 0))
+            finally:
+                vk.free(gi)
+        finally:
+            vk.free(grad_out)
+
+        pred = rng.standard_normal((9, 4), dtype=np.float32)
+        target = rng.standard_normal((9, 4), dtype=np.float32)
+        pred_b = vk.to_gpu(pred)
+        tgt_b = vk.to_gpu(target)
+        try:
+            mg = vk.mse_grad(pred_b, tgt_b)
+            try:
+                _assert_close("mse_grad", vk.to_cpu(mg), 2.0 * (pred - target) / pred.size)
+            finally:
+                vk.free(mg)
+        finally:
+            vk.free(pred_b)
+            vk.free(tgt_b)
+
+    finally:
+        vk.free(m_buf)
+        vk.free(rv_buf)
+
+
 def run_benchmarks() -> None:
     # Keep these modest so it runs quickly on a Pi.
     warmup = 5
@@ -62,30 +172,42 @@ def run_benchmarks() -> None:
     t1 = time.perf_counter_ns()
     upload_ms = (t1 - t0) / 1e6
 
-    def gpu_elemwise_with_readback() -> np.ndarray:
-        # Full path: GPU compute + CPU readback per iteration.
-        return (x_gpu * y_gpu + x_gpu).relu().numpy()
-
-    # Compute-only: no per-iter .numpy() call (download once after the benchmark).
-    z_hold: Tensor | None = None
-
-    def gpu_elemwise_compute_only() -> None:
-        nonlocal z_hold
-        z_hold = (x_gpu * y_gpu + x_gpu).relu()
-
-    # Fused backend: single dispatch for (x*y + x) then ReLU.
-    fused_hold: Tensor | None = None
-
-    def gpu_elemwise_fused_compute_only() -> None:
-        nonlocal fused_hold
-        fused_hold = Tensor._from_vkbuf(vk.mul_add_relu(x_gpu._as_vkbuf(), y_gpu._as_vkbuf()))
-
-    def gpu_elemwise_fused_with_readback() -> np.ndarray:
-        return Tensor._from_vkbuf(vk.mul_add_relu(x_gpu._as_vkbuf(), y_gpu._as_vkbuf())).numpy()
-
-    # Fused backend with preallocated output (no per-iter allocations).
     a_buf = x_gpu._as_vkbuf()
     b_buf = y_gpu._as_vkbuf()
+
+    def gpu_elemwise_with_readback() -> np.ndarray:
+        # Full path: GPU compute + CPU readback per iteration.
+        tmp = vk.mul(a_buf, b_buf)
+        tmp2 = vk.add(tmp, a_buf)
+        out = vk.relu(tmp2)
+        try:
+            return vk.to_cpu(out)
+        finally:
+            vk.free(tmp)
+            vk.free(tmp2)
+            vk.free(out)
+
+    # Compute-only: allocate/free each iteration to avoid leaks (includes alloc overhead).
+    out_hold: vk.VulkanBuffer | None = None
+
+    def gpu_elemwise_compute_only() -> None:
+        nonlocal out_hold
+        if out_hold is not None:
+            vk.free(out_hold)
+        tmp = vk.mul(a_buf, b_buf)
+        tmp2 = vk.add(tmp, a_buf)
+        out_hold = vk.relu(tmp2)
+        vk.free(tmp)
+        vk.free(tmp2)
+
+    def gpu_elemwise_fused_with_readback() -> np.ndarray:
+        out = vk.mul_add_relu(a_buf, b_buf)
+        try:
+            return vk.to_cpu(out)
+        finally:
+            vk.free(out)
+
+    # Fused backend with preallocated output (no per-iter allocations).
     out_buf = vk.empty(a_buf.shape)
 
     def gpu_elemwise_fused_compute_only_no_alloc() -> None:
@@ -95,12 +217,11 @@ def run_benchmarks() -> None:
     gpu_rw_times = _bench(gpu_elemwise_with_readback, warmup, iters)
     gpu_co_times = _bench(gpu_elemwise_compute_only, warmup, iters)
     gpu_fused_rw_times = _bench(gpu_elemwise_fused_with_readback, warmup, iters)
-    gpu_fused_co_times = _bench(gpu_elemwise_fused_compute_only, warmup, iters)
     gpu_fused_no_alloc_times = _bench(gpu_elemwise_fused_compute_only_no_alloc, warmup, iters)
 
     # One-time download timing (after compute-only benchmark)
     t0 = time.perf_counter_ns()
-    _ = (z_hold.numpy() if z_hold is not None else None)
+    _ = (vk.to_cpu(out_hold) if out_hold is not None else None)
     t1 = time.perf_counter_ns()
     download_ms = (t1 - t0) / 1e6
 
@@ -108,15 +229,11 @@ def run_benchmarks() -> None:
     gpu_rw_s = _stats_ms(gpu_rw_times)
     gpu_co_s = _stats_ms(gpu_co_times)
     gpu_fused_rw_s = _stats_ms(gpu_fused_rw_times)
-    gpu_fused_co_s = _stats_ms(gpu_fused_co_times)
     gpu_fused_no_alloc_s = _stats_ms(gpu_fused_no_alloc_times)
     speedup_rw = cpu_s["mean_ms"] / gpu_rw_s["mean_ms"] if gpu_rw_s["mean_ms"] > 0 else float("inf")
     speedup_co = cpu_s["mean_ms"] / gpu_co_s["mean_ms"] if gpu_co_s["mean_ms"] > 0 else float("inf")
     speedup_fused_rw = (
         cpu_s["mean_ms"] / gpu_fused_rw_s["mean_ms"] if gpu_fused_rw_s["mean_ms"] > 0 else float("inf")
-    )
-    speedup_fused_co = (
-        cpu_s["mean_ms"] / gpu_fused_co_s["mean_ms"] if gpu_fused_co_s["mean_ms"] > 0 else float("inf")
     )
     speedup_fused_no_alloc = (
         cpu_s["mean_ms"] / gpu_fused_no_alloc_s["mean_ms"]
@@ -135,8 +252,6 @@ def run_benchmarks() -> None:
     print(f"speedup (mean, compute-only): {speedup_co:.2f}x")
     print(_fmt_stats("GPU (Vulkan backend) fused compute+readback", gpu_fused_rw_s))
     print(f"speedup (mean, fused): {speedup_fused_rw:.2f}x")
-    print(_fmt_stats("GPU (Vulkan backend) fused compute-only", gpu_fused_co_s))
-    print(f"speedup (mean, fused compute-only): {speedup_fused_co:.2f}x")
     print(_fmt_stats("GPU (Vulkan backend) fused compute-only (no alloc)", gpu_fused_no_alloc_s))
     print(f"speedup (mean, fused no-alloc): {speedup_fused_no_alloc:.2f}x")
 
@@ -156,18 +271,25 @@ def run_benchmarks() -> None:
     t1 = time.perf_counter_ns()
     upload_ms = (t1 - t0) / 1e6
 
-    def gpu_matmul_with_readback() -> np.ndarray:
-        return (a_gpu @ b_gpu).numpy()
-
-    c_hold: Tensor | None = None
-
-    def gpu_matmul_compute_only() -> None:
-        nonlocal c_hold
-        c_hold = a_gpu @ b_gpu
-
-    # Matmul with preallocated output (no per-iter allocations).
     a_buf = a_gpu._as_vkbuf()
     b_buf = b_gpu._as_vkbuf()
+
+    def gpu_matmul_with_readback() -> np.ndarray:
+        out = vk.matmul(a_buf, b_buf)
+        try:
+            return vk.to_cpu(out)
+        finally:
+            vk.free(out)
+
+    out_hold: vk.VulkanBuffer | None = None
+
+    def gpu_matmul_compute_only() -> None:
+        nonlocal out_hold
+        if out_hold is not None:
+            vk.free(out_hold)
+        out_hold = vk.matmul(a_buf, b_buf)
+
+    # Matmul with preallocated output (no per-iter allocations).
     c_buf = vk.empty((m, p))
 
     def gpu_matmul_compute_only_no_alloc() -> None:
@@ -179,7 +301,7 @@ def run_benchmarks() -> None:
     gpu_no_alloc_times = _bench(gpu_matmul_compute_only_no_alloc, warmup, iters)
 
     t0 = time.perf_counter_ns()
-    _ = (c_hold.numpy() if c_hold is not None else None)
+    _ = (vk.to_cpu(out_hold) if out_hold is not None else None)
     t1 = time.perf_counter_ns()
     download_ms = (t1 - t0) / 1e6
 
@@ -207,7 +329,7 @@ def run_benchmarks() -> None:
 
 
 def run_gpu_demo() -> None:
-    # Simple elementwise ops on the "gpu" device (currently backed by NumPy).
+    # Simple elementwise ops on the "gpu" device.
     x_cpu = Tensor(np.linspace(-1, 1, 8, dtype="float32").reshape(-1, 1))
     y_cpu = Tensor(np.ones((8, 1), dtype="float32") * 3)
 
@@ -234,5 +356,27 @@ def run_gpu_demo() -> None:
 
 
 if __name__ == "__main__":
-    run_gpu_demo()
-    run_benchmarks()
+    p = argparse.ArgumentParser(description="rasptorch GPU demo/bench")
+    p.add_argument("--smoke-only", action="store_true", help="Run correctness smoke tests only")
+    p.add_argument("--bench-only", action="store_true", help="Run benchmarks only")
+    args = p.parse_args()
+
+    try:
+        vk.init(strict=True)
+    except RuntimeError as e:
+        print("Vulkan init failed:")
+        print(f"  {e}")
+        print(
+            "Tip: ensure Vulkan is installed and working, the Python 'vulkan' package is available, "
+            "and 'glslc' (shader compiler) is installed on the system."
+        )
+        raise SystemExit(1) from e
+
+    if not args.bench_only:
+        print("=== Smoke tests ===")
+        run_smoke_tests()
+        print("PASS")
+
+    if not args.smoke_only:
+        run_gpu_demo()
+        run_benchmarks()

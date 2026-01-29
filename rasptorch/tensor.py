@@ -593,11 +593,27 @@ class Tensor:
 
     # Utilities
     def numpy(self) -> np.ndarray:
-        """Return the underlying NumPy array (view)."""
+        """Return the underlying NumPy array.
+
+        Note: For GPU tensors this triggers a device->host readback.
+        """
         if self._vkbuf is not None:
             # Download a CPU copy for inspection, but keep the tensor on GPU.
             self.data = vk.to_cpu(self._vkbuf)
         return self.data
+
+    def free(self) -> None:
+        """Free GPU buffers owned by this tensor (no-op for CPU tensors).
+
+        rasptorch does not currently have automatic GPU memory reclamation; demos and
+        benchmarks should call this to avoid leaks.
+        """
+        if self.grad_vkbuf is not None:
+            vk.free(self.grad_vkbuf)
+            self.grad_vkbuf = None
+        if self._vkbuf is not None:
+            vk.free(self._vkbuf)
+            self._vkbuf = None
 
     def add_rowvec(self, b: "Tensor") -> "Tensor":
         """Broadcast-add a 1D row vector to a 2D matrix (GPU-optimized)."""
