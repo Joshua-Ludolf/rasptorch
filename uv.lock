@@ -511,6 +511,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
+    { name = "vulkan" },
 ]
 
 [package.optional-dependencies]
@@ -529,6 +530,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "torch", marker = "extra == 'torch'" },
+    { name = "vulkan", specifier = ">=1.3.275.1" },
     { name = "vulkan", marker = "extra == 'gpu'", specifier = ">=1.3.0" },
 ]
 provides-extras = ["gpu", "torch", "dev"]
