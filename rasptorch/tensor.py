@@ -38,7 +38,13 @@ class Tensor:
             self.data: np.ndarray = np.empty(self._vkbuf.shape, dtype=np.float32)
             device = "gpu"
         else:
-            self.data: np.ndarray = np.array(data, dtype=np.float32)
+            arr = np.array(data, dtype=np.float32)
+            if device == "gpu":
+                self._vkbuf = vk.to_gpu(arr)
+                self.data = np.empty(self._vkbuf.shape, dtype=np.float32)
+                device = "gpu"
+            else:
+                self.data = arr
 
         # CPU grads live in .grad (ndarray). GPU grads live in .grad_vkbuf.
         self.grad: Optional[np.ndarray] = None
@@ -69,7 +75,24 @@ class Tensor:
     def _as_vkbuf(self) -> "vk.VulkanBuffer":
         if self._vkbuf is not None:
             return self._vkbuf
-        return vk.to_gpu(self.data)
+        # Implicit upload: if a CPU tensor participates in a GPU op, promote it to a GPU tensor.
+        new_vkbuf = vk.to_gpu(self.data)
+        new_grad_vkbuf: "vk.VulkanBuffer | None" = None
+        try:
+            if self.grad is not None:
+                new_grad_vkbuf = vk.to_gpu(self.grad)
+            self._vkbuf = new_vkbuf
+            self.grad_vkbuf = new_grad_vkbuf
+            if new_grad_vkbuf is not None:
+                self.grad = None
+            self.data = np.empty(self._vkbuf.shape, dtype=np.float32)
+            self.device = "gpu"
+            return self._vkbuf
+        except Exception:
+            if new_grad_vkbuf is not None:
+                vk.free(new_grad_vkbuf)
+            vk.free(new_vkbuf)
+            raise
 
     # ------------------------------------------------------------------
     # Basic tensor utilities
@@ -695,11 +718,7 @@ class Tensor:
 
     # Device handling
     def to(self, device: str) -> "Tensor":
-        """Return a copy of this Tensor on the given device.
-
-        Currently only "cpu" is implemented; other devices are placeholders
-        for future Raspberry Pi GPU experimentation.
-        """
+        """Return a copy of this Tensor on the given device."""
         if device == self.device:
             return self
 

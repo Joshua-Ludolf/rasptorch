@@ -1149,6 +1149,72 @@ def disabled_reason() -> Optional[str]:
     return _VULKAN_DISABLED_REASON or "Vulkan bindings unavailable"
 
 
+def self_test(*, strict: bool = True) -> dict[str, object]:
+    """Run a fast backend self-test.
+
+    - Compiles shaders if needed (via `glslc`).
+    - Runs a small subset of correctness checks.
+
+    When strict=True (default), this raises if Vulkan is unavailable.
+    """
+
+    init(strict=strict)
+    if not _HAS_VULKAN:
+        if strict:
+            raise RuntimeError(disabled_reason() or "Vulkan unavailable")
+        return {"available": False, "reason": disabled_reason()}
+
+    rng = np.random.default_rng(0)
+
+    # Elementwise: (x*y + x).relu()
+    x = rng.standard_normal((33, 17), dtype=np.float32)
+    y = rng.standard_normal((33, 17), dtype=np.float32)
+    a = to_gpu(x)
+    b = to_gpu(y)
+    try:
+        tmp = mul(a, b)
+        tmp2 = add(tmp, a)
+        out = relu(tmp2)
+        try:
+            got = to_cpu(out)
+        finally:
+            free(tmp)
+            free(tmp2)
+            free(out)
+    finally:
+        free(a)
+        free(b)
+    if not np.allclose(got, np.maximum(x * y + x, 0.0), rtol=2e-3, atol=1e-3):
+        raise AssertionError("self_test: elemwise mismatch")
+
+    # Matmul
+    a_np = rng.standard_normal((17, 19), dtype=np.float32)
+    b_np = rng.standard_normal((19, 23), dtype=np.float32)
+    aa = to_gpu(a_np)
+    bb = to_gpu(b_np)
+    try:
+        out = matmul(aa, bb)
+        try:
+            got = to_cpu(out)
+        finally:
+            free(out)
+    finally:
+        free(aa)
+        free(bb)
+    if not np.allclose(got, a_np @ b_np, rtol=2e-3, atol=1e-3):
+        raise AssertionError("self_test: matmul mismatch")
+
+    # Basic device info
+    info: dict[str, object] = {"available": True}
+    try:
+        ctx = _ctx()
+        info["queue_family_index"] = ctx.queue_family_index
+    except Exception:
+        pass
+
+    return info
+
+
 def to_gpu(data: np.ndarray) -> VulkanBuffer:
     """Upload a float32 NumPy array into a Vulkan storage buffer."""
 

@@ -6,8 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
 	"numpy>=1.26",
-	"torch>=2.10.0",
-	"vulkan>=1.3.0",
 ]
 
 license = { file = "LICENSE" }
@@ -25,6 +23,13 @@ classifiers = [
 	"Programming Language :: Python :: 3.11",
 	"Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.optional-dependencies]
+# Optional dependencies kept as extras so CPU-only installs and CI stay lightweight.
+# On Pi 5, you likely want: `pip install rasptorch[gpu]`.
+gpu = ["vulkan>=1.3.0"]
+torch = ["torch"]
+dev = ["pytest"]
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]

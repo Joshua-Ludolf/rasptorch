@@ -36,9 +36,21 @@ focused test + benchmark suite for the Vulkan backend.
 
 ## Installation
 
-From PyPI:
+From PyPI (CPU-only):
 
 - `pip install rasptorch`
+
+GPU (Pi 5 Vulkan):
+
+- `pip install "rasptorch[gpu]"`
+
+Optional (for saving/loading `.pth` via real `torch.save`/`torch.load`):
+
+- `pip install "rasptorch[torch]"`
+
+Dev/test:
+
+- `pip install -e ".[dev]"`
 
 Notes for GPU mode:
 
