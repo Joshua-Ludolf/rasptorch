@@ -97,6 +97,10 @@ class _VulkanContext:
         self._fence: Optional[VkFence] = None
         self._ds_cache: dict[object, VkDescriptorSet] = {}
 
+        # Optional command buffer batching to reduce submit+wait overhead.
+        self._batch_depth: int = 0
+        self._cmd_recording: bool = False
+
         self.p_add: Optional[_Pipeline] = None
         self.p_mul: Optional[_Pipeline] = None
         self.p_relu: Optional[_Pipeline] = None
@@ -949,6 +953,10 @@ class _VulkanContext:
                     "vkCmdUpdateBuffer fallback only supports 4-byte aligned sizes"
                 )
 
+            if self._cmd_recording:
+                # Don't clobber an in-flight batch command buffer.
+                self.flush()
+
             vkResetCommandBuffer(self.command_buffer, 0)
             begin = VkCommandBufferBeginInfo(
                 sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -987,6 +995,10 @@ class _VulkanContext:
                 raise RuntimeError(
                     "vkCmdUpdateBuffer fallback only supports 4-byte aligned sizes"
                 )
+
+            if self._cmd_recording:
+                # Don't clobber an in-flight batch command buffer.
+                self.flush()
 
             vkResetCommandBuffer(self.command_buffer, 0)
             begin = VkCommandBufferBeginInfo(
@@ -1047,6 +1059,54 @@ class _VulkanContext:
     # ------------------------------
     # Dispatch
     # ------------------------------
+
+    def _begin_commands(self) -> None:
+        assert self.command_buffer is not None
+        vkResetCommandBuffer(self.command_buffer, 0)
+        begin = VkCommandBufferBeginInfo(
+            sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )
+        vkBeginCommandBuffer(self.command_buffer, begin)
+
+    def _end_commands(self) -> None:
+        """End+submit unless a batch is active."""
+        assert self.command_buffer is not None
+        if self._batch_depth > 0:
+            return
+        vkEndCommandBuffer(self.command_buffer)
+        self._submit_and_wait()
+
+    def begin_batch(self) -> None:
+        """Start batching commands into a single submit+wait."""
+        self._batch_depth += 1
+        if self._batch_depth == 1:
+            self._begin_commands()
+            self._cmd_recording = True
+
+    def flush(self) -> None:
+        """Submit+wait any batched commands recorded so far."""
+        assert self.command_buffer is not None
+        if not self._cmd_recording:
+            return
+        vkEndCommandBuffer(self.command_buffer)
+        self._submit_and_wait()
+        self._cmd_recording = False
+
+    def end_batch(self) -> None:
+        """End batching; submits when the nesting depth reaches zero."""
+        if self._batch_depth <= 0:
+            raise RuntimeError("end_batch called without begin_batch")
+        self._batch_depth -= 1
+        if self._batch_depth == 0:
+            self.flush()
+
+    def _maybe_continue_batch(self) -> None:
+        """If batching is active and nothing is recording, begin a new command buffer."""
+        if self._batch_depth > 0 and not self._cmd_recording:
+            self._begin_commands()
+            self._cmd_recording = True
+
     def _alloc_descriptor_set(self, p: _Pipeline) -> VkDescriptorSet:
         assert self.device is not None
 
@@ -1117,6 +1177,33 @@ def _ctx() -> _VulkanContext:
         _CTX = _VulkanContext()
         _CTX.init()
     return _CTX
+
+
+def begin_batch() -> None:
+    """Begin Vulkan command batching (no-op if Vulkan unavailable)."""
+
+    if not _HAS_VULKAN:
+        return
+    ctx = _ctx()
+    ctx.begin_batch()
+
+
+def end_batch() -> None:
+    """End Vulkan command batching (flushes when depth reaches zero)."""
+
+    if not _HAS_VULKAN:
+        return
+    ctx = _ctx()
+    ctx.end_batch()
+
+
+def flush() -> None:
+    """Flush any batched Vulkan commands (submit+wait)."""
+
+    if not _HAS_VULKAN:
+        return
+    ctx = _ctx()
+    ctx.flush()
 
 
 def init(*, strict: bool = False) -> None:
@@ -1288,6 +1375,32 @@ def empty(shape: tuple[int, ...]) -> VulkanBuffer:
     ctx = _ctx()
     buf, mem = ctx.alloc_buffer(nbytes)
     return VulkanBuffer(shape=shape, nbytes=nbytes, buffer=buf, memory=mem, host=None, base=None, refcount=1)
+
+
+def write(dst: VulkanBuffer, data: np.ndarray) -> None:
+    """Upload a float32 NumPy array into an *existing* VulkanBuffer.
+
+    This is the in-place counterpart to `to_gpu(...)` and is used to refill
+    preallocated batch buffers without reallocating device memory.
+    """
+
+    arr = np.asarray(data, dtype=np.float32)
+    if int(arr.nbytes) != int(dst.nbytes):
+        raise ValueError(
+            f"write: nbytes mismatch: data.nbytes={int(arr.nbytes)} dst.nbytes={int(dst.nbytes)} "
+            f"data.shape={tuple(arr.shape)} dst.shape={tuple(dst.shape)}"
+        )
+
+    # Host/fallback buffers (including views) can be updated directly.
+    if dst.host is not None or not _HAS_VULKAN:
+        if dst.host is None:
+            # Safety: if Vulkan is disabled but a host array wasn't allocated, create one.
+            dst.host = np.empty(dst.shape, dtype=np.float32)
+        np.copyto(dst.host, arr.reshape(dst.shape))
+        return
+
+    ctx = _ctx()
+    ctx.write_buffer(dst.buffer, dst.memory, arr)
 
 
 def free(buf: VulkanBuffer) -> None:
@@ -1821,9 +1934,9 @@ def relu(a: VulkanBuffer) -> VulkanBuffer:
     ]
     vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_relu.pipeline)
     vkCmdBindDescriptorSets(
         ctx.command_buffer,
@@ -1850,9 +1963,83 @@ def relu(a: VulkanBuffer) -> VulkanBuffer:
     )
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._end_commands()
+    return out
 
-    ctx._submit_and_wait()
+
+def relu_out(a: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """ReLU writing into an existing output buffer."""
+
+    if out.shape != a.shape:
+        raise ValueError(f"relu_out shape mismatch: a={a.shape} out={out.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, None) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return relu(a)
+        aa = a.host if a.host is not None else np.zeros(a.shape, dtype=np.float32)
+        out.host[...] = np.maximum(aa, 0)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_relu is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_relu)
+    infos = [
+        VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_relu.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_relu.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+
+    n = int(np.prod(a.shape))
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[1]", [n])
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_relu.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        4,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
     return out
 
 
@@ -2099,9 +2286,9 @@ def matmul_out(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuf
     ]
     vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul.pipeline)
     vkCmdBindDescriptorSets(
         ctx.command_buffer,
@@ -2128,9 +2315,7 @@ def matmul_out(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuf
     group_count_x = (int(n) + 15) // 16
     group_count_y = (int(m) + 15) // 16
     vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
-
-    ctx._submit_and_wait()
+    ctx._end_commands()
     return out
 
 
@@ -2194,9 +2379,9 @@ def add_rowvec(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
 
     pc = _vk.ffi.new("uint32_t[2]", [int(n), int(cols)])
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(
         ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_add_rowvec.pipeline
     )
@@ -2220,9 +2405,98 @@ def add_rowvec(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     )
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._end_commands()
+    return out
 
-    ctx._submit_and_wait()
+
+def add_rowvec_out(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Add row-vector b to every row of a, writing into out."""
+
+    if len(a.shape) != 2 or len(b.shape) != 1 or len(out.shape) != 2:
+        raise ValueError("add_rowvec_out expects a:[rows,cols], b:[cols], out:[rows,cols]")
+    rows, cols = a.shape
+    if b.shape[0] != cols or out.shape != a.shape:
+        raise ValueError(f"add_rowvec_out shape mismatch: a={a.shape} b={b.shape} out={out.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, b) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return add_rowvec(a, b)
+        aa = a.host if a.host is not None else np.zeros(a.shape, dtype=np.float32)
+        bb = b.host if b.host is not None else np.zeros(b.shape, dtype=np.float32)
+        out.host[...] = aa + bb
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_add_rowvec is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_add_rowvec)
+    infos = [
+        VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+        VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    n = int(rows * cols)
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[2]", [int(n), int(cols)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_add_rowvec.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_add_rowvec.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_add_rowvec.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
     return out
 
 
@@ -3123,9 +3397,9 @@ def relu_backward(grad_out: VulkanBuffer, x: VulkanBuffer) -> VulkanBuffer:
 
     pc = _vk.ffi.new("uint32_t *", n)
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(
         ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_relu_backward.pipeline
     )
@@ -3149,9 +3423,97 @@ def relu_backward(grad_out: VulkanBuffer, x: VulkanBuffer) -> VulkanBuffer:
     )
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._end_commands()
+    return out
 
-    ctx._submit_and_wait()
+
+def relu_backward_out(grad_out: VulkanBuffer, x: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """ReLU backward writing into an existing output buffer."""
+
+    if grad_out.shape != x.shape or out.shape != x.shape:
+        raise ValueError(
+            f"relu_backward_out shape mismatch: grad_out={grad_out.shape} x={x.shape} out={out.shape}"
+        )
+
+    if not _ensure_vulkan_or_numpy(grad_out, x) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return relu_backward(grad_out, x)
+        gg = grad_out.host if grad_out.host is not None else np.zeros(grad_out.shape, np.float32)
+        xx = x.host if x.host is not None else np.zeros(x.shape, np.float32)
+        out.host[...] = gg * (xx > 0)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_relu_backward is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_relu_backward)
+    infos = [
+        VkDescriptorBufferInfo(buffer=grad_out.buffer, offset=0, range=grad_out.nbytes),
+        VkDescriptorBufferInfo(buffer=x.buffer, offset=0, range=x.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    n = int(np.prod(x.shape))
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t *", n)
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_relu_backward.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_relu_backward.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_relu_backward.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        4,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
     return out
 
 
@@ -3202,9 +3564,9 @@ def reduce_sum_rows(a: VulkanBuffer) -> VulkanBuffer:
 
     pc = _vk.ffi.new("uint32_t[2]", [int(rows), int(cols)])
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(
         ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_reduce_sum_rows.pipeline
     )
@@ -3228,9 +3590,87 @@ def reduce_sum_rows(a: VulkanBuffer) -> VulkanBuffer:
     )
     group_count_x = (int(cols) + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._end_commands()
+    return out
 
-    ctx._submit_and_wait()
+
+def reduce_sum_rows_out(a: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Sum a matrix over rows into an existing output buffer."""
+
+    if len(a.shape) != 2 or len(out.shape) != 1:
+        raise ValueError("reduce_sum_rows_out expects a:[rows,cols] and out:[cols]")
+    rows, cols = a.shape
+    if out.shape != (cols,):
+        raise ValueError(f"reduce_sum_rows_out shape mismatch: a={a.shape} out={out.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, None) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return reduce_sum_rows(a)
+        aa = a.host if a.host is not None else np.zeros(a.shape, np.float32)
+        out.host[...] = aa.sum(axis=0)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_reduce_sum_rows is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_reduce_sum_rows)
+    infos = [
+        VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[2]", [int(rows), int(cols)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_reduce_sum_rows.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_reduce_sum_rows.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_reduce_sum_rows.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(cols) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
     return out
 
 
@@ -3565,9 +4005,9 @@ def mse_grad(pred: VulkanBuffer, target: VulkanBuffer) -> VulkanBuffer:
 
     pc = _vk.ffi.new("char[]", struct.pack("<If", int(n), float(inv_n)))
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_mse_grad.pipeline)
     vkCmdBindDescriptorSets(
         ctx.command_buffer,
@@ -3589,8 +4029,98 @@ def mse_grad(pred: VulkanBuffer, target: VulkanBuffer) -> VulkanBuffer:
     )
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
-    ctx._submit_and_wait()
+    ctx._end_commands()
+    return out
+
+
+def mse_grad_out(pred: VulkanBuffer, target: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """MSE gradient writing into an existing output buffer."""
+
+    if pred.shape != target.shape or out.shape != pred.shape:
+        raise ValueError(
+            f"mse_grad_out shape mismatch: pred={pred.shape} target={target.shape} out={out.shape}"
+        )
+
+    if not _ensure_vulkan_or_numpy(pred, target) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return mse_grad(pred, target)
+        pp = pred.host if pred.host is not None else np.zeros(pred.shape, np.float32)
+        tt = target.host if target.host is not None else np.zeros(target.shape, np.float32)
+        n = pp.size
+        out.host[...] = 2.0 * (pp - tt) / max(1, n)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_mse_grad is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_mse_grad)
+    infos = [
+        VkDescriptorBufferInfo(buffer=pred.buffer, offset=0, range=pred.nbytes),
+        VkDescriptorBufferInfo(buffer=target.buffer, offset=0, range=target.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    n = int(np.prod(pred.shape))
+    inv_n = 1.0 / float(max(1, n))
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<If", int(n), float(inv_n)))
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_mse_grad.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_mse_grad.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_mse_grad.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
     return out
 
 
@@ -3643,9 +4173,9 @@ def sgd_update_inplace(param: VulkanBuffer, grad: VulkanBuffer, lr: float) -> No
 
     pc = _vk.ffi.new("char[]", struct.pack("<If", int(n), float(lr)))
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(
         ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_sgd_update.pipeline
     )
@@ -3669,8 +4199,7 @@ def sgd_update_inplace(param: VulkanBuffer, grad: VulkanBuffer, lr: float) -> No
     )
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
-    ctx._submit_and_wait()
+    ctx._end_commands()
 
 
 def matmul_at_b(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
@@ -3733,9 +4262,9 @@ def matmul_at_b(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
 
     pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(
         ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_at_b.pipeline
     )
@@ -3760,9 +4289,99 @@ def matmul_at_b(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     group_count_x = (int(n) + 15) // 16
     group_count_y = (int(k) + 15) // 16
     vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._end_commands()
+    return out
 
-    ctx._submit_and_wait()
+
+def matmul_at_b_out(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Compute A^T @ B writing into an existing output buffer."""
+
+    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+        raise ValueError("matmul_at_b_out expects 2D matrices")
+    m, k = a.shape
+    m2, n = b.shape
+    if m != m2 or out.shape != (k, n):
+        raise ValueError(f"matmul_at_b_out shape mismatch: a={a.shape} b={b.shape} out={out.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, b) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return matmul_at_b(a, b)
+        aa = a.host if a.host is not None else np.zeros(a.shape, np.float32)
+        bb = b.host if b.host is not None else np.zeros(b.shape, np.float32)
+        out.host[...] = aa.T @ bb
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_matmul_at_b is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_matmul_at_b)
+    infos = [
+        VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+        VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_at_b.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_matmul_at_b.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_matmul_at_b.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        12,
+        pc,
+    )
+    group_count_x = (int(n) + 15) // 16
+    group_count_y = (int(k) + 15) // 16
+    vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
+    ctx._end_commands()
     return out
 
 
@@ -3826,9 +4445,9 @@ def matmul_a_bt(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
 
     pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
 
-    vkResetCommandBuffer(ctx.command_buffer, 0)
-    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
-    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
     vkCmdBindPipeline(
         ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_a_bt.pipeline
     )
@@ -3853,9 +4472,99 @@ def matmul_a_bt(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     group_count_x = (int(n) + 15) // 16
     group_count_y = (int(m) + 15) // 16
     vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
-    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._end_commands()
+    return out
 
-    ctx._submit_and_wait()
+
+def matmul_a_bt_out(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Compute A @ B^T writing into an existing output buffer."""
+
+    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+        raise ValueError("matmul_a_bt_out expects 2D matrices")
+    m, k = a.shape
+    n, k2 = b.shape
+    if k != k2 or out.shape != (m, n):
+        raise ValueError(f"matmul_a_bt_out shape mismatch: a={a.shape} b={b.shape} out={out.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, b) or not _ensure_vulkan_or_numpy(out, None):
+        if out.host is None:
+            return matmul_a_bt(a, b)
+        aa = a.host if a.host is not None else np.zeros(a.shape, np.float32)
+        bb = b.host if b.host is not None else np.zeros(b.shape, np.float32)
+        out.host[...] = aa @ bb.T
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_matmul_a_bt is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_matmul_a_bt)
+    infos = [
+        VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+        VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_a_bt.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_matmul_a_bt.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_matmul_a_bt.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        12,
+        pc,
+    )
+    group_count_x = (int(n) + 15) // 16
+    group_count_y = (int(m) + 15) // 16
+    vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
+    ctx._end_commands()
     return out
 
 

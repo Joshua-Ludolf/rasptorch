@@ -28,6 +28,36 @@ class GpuMLP:
         self.w2 = vk.to_gpu(w2)
         self.b2 = vk.to_gpu(b2)
 
+        # Cache per-batch buffers to avoid per-iteration alloc/free churn.
+        self._batch_cache: dict[int, dict[str, vk.VulkanBuffer]] = {}
+
+        # Gradient buffers (shapes independent of batch).
+        self._grad_w2 = vk.empty((self.hidden, self.out_features))
+        self._grad_b2 = vk.empty((self.out_features,))
+        self._grad_w1 = vk.empty((self.in_features, self.hidden))
+        self._grad_b1 = vk.empty((self.hidden,))
+
+    def _get_batch_buffers(self, batch: int) -> dict[str, vk.VulkanBuffer]:
+        batch = int(batch)
+        bufs = self._batch_cache.get(batch)
+        if bufs is not None:
+            return bufs
+
+        bufs = {
+            "x": vk.empty((batch, self.in_features)),
+            "y_true": vk.empty((batch, self.out_features)),
+            "z1": vk.empty((batch, self.hidden)),
+            "z1b": vk.empty((batch, self.hidden)),
+            "a1": vk.empty((batch, self.hidden)),
+            "z2": vk.empty((batch, self.out_features)),
+            "y_pred": vk.empty((batch, self.out_features)),
+            "dY": vk.empty((batch, self.out_features)),
+            "dA1": vk.empty((batch, self.hidden)),
+            "dZ1": vk.empty((batch, self.hidden)),
+        }
+        self._batch_cache[batch] = bufs
+        return bufs
+
     def state_dict(self) -> dict[str, np.ndarray]:
         return {
             "w1": vk.to_cpu(self.w1),
@@ -62,58 +92,59 @@ class GpuMLP:
         vk.free(self.w2)
         vk.free(self.b2)
 
-    def train_step(self, x_np: np.ndarray, y_np: np.ndarray, *, lr: float) -> float:
-        # Upload batch.
-        x = vk.to_gpu(np.asarray(x_np, dtype=np.float32))
-        y_true = vk.to_gpu(np.asarray(y_np, dtype=np.float32))
+        # Free cached batch buffers.
+        for bufs in self._batch_cache.values():
+            for buf in bufs.values():
+                vk.free(buf)
+        self._batch_cache.clear()
 
+        # Free reusable gradient buffers.
+        vk.free(self._grad_w2)
+        vk.free(self._grad_b2)
+        vk.free(self._grad_w1)
+        vk.free(self._grad_b1)
+
+    def train_step(self, x_np: np.ndarray, y_np: np.ndarray, *, lr: float) -> float:
+        x_np = np.asarray(x_np, dtype=np.float32)
+        y_np = np.asarray(y_np, dtype=np.float32)
+        bufs = self._get_batch_buffers(x_np.shape[0])
+
+        # Upload batch into preallocated buffers.
+        vk.write(bufs["x"], x_np)
+        vk.write(bufs["y_true"], y_np)
+
+        vk.begin_batch()
         # Forward
-        z1 = vk.matmul(x, self.w1)
-        z1b = vk.add_rowvec(z1, self.b1)
-        a1 = vk.relu(z1b)
-        z2 = vk.matmul(a1, self.w2)
-        y_pred = vk.add_rowvec(z2, self.b2)
+        vk.matmul_out(bufs["x"], self.w1, bufs["z1"])
+        vk.add_rowvec_out(bufs["z1"], self.b1, bufs["z1b"])
+        vk.relu_out(bufs["z1b"], bufs["a1"])
+        vk.matmul_out(bufs["a1"], self.w2, bufs["z2"])
+        vk.add_rowvec_out(bufs["z2"], self.b2, bufs["y_pred"])
+        vk.end_batch()
 
         # Loss (CPU readback for logging only)
-        pred_cpu = vk.to_cpu(y_pred)
+        pred_cpu = vk.to_cpu(bufs["y_pred"])
         loss = float(np.mean((pred_cpu - y_np) ** 2))
 
+        vk.begin_batch()
         # Backward (explicit kernels)
-        dY = vk.mse_grad(y_pred, y_true)  # [batch, out]
+        vk.mse_grad_out(bufs["y_pred"], bufs["y_true"], bufs["dY"])  # [batch, out]
 
-        grad_w2 = vk.matmul_at_b(a1, dY)  # [hidden, out]
-        grad_b2 = vk.reduce_sum_rows(dY)  # [out]
+        vk.matmul_at_b_out(bufs["a1"], bufs["dY"], self._grad_w2)  # [hidden, out]
+        vk.reduce_sum_rows_out(bufs["dY"], self._grad_b2)  # [out]
 
-        dA1 = vk.matmul_a_bt(dY, self.w2)  # [batch, hidden]
-        dZ1 = vk.relu_backward(dA1, z1b)  # [batch, hidden]
+        vk.matmul_a_bt_out(bufs["dY"], self.w2, bufs["dA1"])  # [batch, hidden]
+        vk.relu_backward_out(bufs["dA1"], bufs["z1b"], bufs["dZ1"])  # [batch, hidden]
 
-        grad_w1 = vk.matmul_at_b(x, dZ1)  # [in, hidden]
-        grad_b1 = vk.reduce_sum_rows(dZ1)  # [hidden]
+        vk.matmul_at_b_out(bufs["x"], bufs["dZ1"], self._grad_w1)  # [in, hidden]
+        vk.reduce_sum_rows_out(bufs["dZ1"], self._grad_b1)  # [hidden]
 
         # SGD update (in-place)
-        vk.sgd_update_inplace(self.w2, grad_w2, lr)
-        vk.sgd_update_inplace(self.b2, grad_b2, lr)
-        vk.sgd_update_inplace(self.w1, grad_w1, lr)
-        vk.sgd_update_inplace(self.b1, grad_b1, lr)
-
-        # Free intermediates
-        for buf in [
-            x,
-            y_true,
-            z1,
-            z1b,
-            a1,
-            z2,
-            y_pred,
-            dY,
-            grad_w2,
-            grad_b2,
-            dA1,
-            dZ1,
-            grad_w1,
-            grad_b1,
-        ]:
-            vk.free(buf)
+        vk.sgd_update_inplace(self.w2, self._grad_w2, lr)
+        vk.sgd_update_inplace(self.b2, self._grad_b2, lr)
+        vk.sgd_update_inplace(self.w1, self._grad_w1, lr)
+        vk.sgd_update_inplace(self.b1, self._grad_b1, lr)
+        vk.end_batch()
 
         return loss
 
