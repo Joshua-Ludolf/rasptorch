@@ -1,15 +1,15 @@
 [project]
 name = "rasptorch"
-version = "0.1.0"
+version = "1.2.0"
 description = "Experimental PyTorch-like autograd engine with an optional Vulkan compute backend (Raspberry Pi 5-focused)."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
 	"numpy>=1.26",
-	"vulkan>=1.3.275.1",
 ]
 
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
 	{ name = "Joshua Ludolf" },
 ]
@@ -18,7 +18,6 @@ classifiers = [
 	"Development Status :: 3 - Alpha",
 	"Intended Audience :: Developers",
 	"Intended Audience :: Science/Research",
-	"License :: OSI Approved :: MIT License",
 	"Programming Language :: Python :: 3",
 	"Programming Language :: Python :: 3 :: Only",
 	"Programming Language :: Python :: 3.11",
@@ -30,7 +29,7 @@ classifiers = [
 # On Pi 5, you likely want: `pip install rasptorch[gpu]`.
 gpu = ["vulkan>=1.3.0"]
 torch = ["torch"]
-dev = ["pytest"]
+dev = ["pytest", "build", "twine>=6.2.0"]
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]

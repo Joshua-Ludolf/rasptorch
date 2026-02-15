@@ -7,7 +7,7 @@ from . import torch_bridge
 try:
 	__version__ = version("rasptorch")
 except PackageNotFoundError:  # pragma: no cover
-	__version__ = "0.0.0"
+	__version__ = "1.1.0"
 
 __all__ = [
 	"Tensor",

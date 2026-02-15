@@ -1,3 +1,8 @@
 include README.md
 include LICENSE
+include essentials_demo.py
+include cnn_demo.py
+include gpu_demo.py
+include torch_bridge_demo.py
+include main.py
 recursive-include rasptorch/shaders *.spv *.comp
