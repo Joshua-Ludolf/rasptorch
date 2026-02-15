@@ -9,4 +9,4 @@
 
 ## Reporting a Vulnerability
 
-Create an Issue `Bug Report` and label it with `security concern`
+Create an Issue `Bug Report` and label it with `bug` if issues with python code. If vulnerability in dependencies/build files, create same `Bug Report` issue but label it with `security concern`.
