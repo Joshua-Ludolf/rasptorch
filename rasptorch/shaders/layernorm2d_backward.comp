@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufX { float x[]; } bufx;        // [N,C]
+layout(set = 0, binding = 1, std430) readonly buffer BufGrad { float go[]; } bufgo;  // [N,C] grad wrt xhat
+layout(set = 0, binding = 2, std430) writeonly buffer BufOut { float gx[]; } bufgx;  // [N,C] grad wrt x
+
+layout(push_constant) uniform Push {
+    uint N;
+    uint C;
+} pc;
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.N) return;
+
+    uint base = n * pc.C;
+
+    float mean = 0.0;
+    for (uint c = 0u; c < pc.C; c++) {
+        mean += bufx.x[base + c];
+    }
+    mean /= max(1.0, float(pc.C));
+
+    float var = 0.0;
+    for (uint c = 0u; c < pc.C; c++) {
+        float d = bufx.x[base + c] - mean;
+        var += d * d;
+    }
+    var /= max(1.0, float(pc.C));
+
+    float invstd = inversesqrt(var + 1e-5);
+
+    float sum_g = 0.0;
+    float sum_gxhat = 0.0;
+    for (uint c = 0u; c < pc.C; c++) {
+        float g = bufgo.go[base + c];
+        float xhat = (bufx.x[base + c] - mean) * invstd;
+        sum_g += g;
+        sum_gxhat += g * xhat;
+    }
+
+    float C = max(1.0, float(pc.C));
+    float scale = invstd / C;
+
+    for (uint c = 0u; c < pc.C; c++) {
+        float g = bufgo.go[base + c];
+        float xhat = (bufx.x[base + c] - mean) * invstd;
+        bufgx.gx[base + c] = scale * (C * g - sum_g - xhat * sum_gxhat);
+    }
+}

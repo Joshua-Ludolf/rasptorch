@@ -4,12 +4,19 @@ import pytest
 from rasptorch import vulkan_backend as vk
 
 
-def test_vulkan_smoke_if_available() -> None:
-    # Skip gracefully on non-Pi/CI where Vulkan bindings or drivers are absent.
+def test_vulkan_backend_smoke() -> None:
+    """Backend smoke test.
+
+    This test always runs:
+    - If Vulkan is available, it uses strict init and exercises real GPU kernels.
+    - If Vulkan is unavailable, it exercises the NumPy fallback path via the same API.
+    """
+
     try:
         vk.init(strict=True)
     except Exception:
-        pytest.skip(vk.disabled_reason() or "Vulkan unavailable")
+        # Don't skip on non-Vulkan environments; the backend has a NumPy fallback.
+        vk.init(strict=False)
 
     rng = np.random.default_rng(0)
 
@@ -116,3 +123,96 @@ def test_vulkan_smoke_if_available() -> None:
     finally:
         vk.free(m_buf)
         vk.free(rv_buf)
+
+    # NN essentials: softmax/log_softmax (+ backward) and layernorm2d
+    logits = rng.standard_normal((9, 7), dtype=np.float32)
+    go_np = rng.standard_normal((9, 7), dtype=np.float32)
+    lg = vk.to_gpu(logits)
+    go = vk.to_gpu(go_np)
+    try:
+        y = vk.softmax2d(lg)
+        try:
+            got = vk.to_cpu(y)
+        finally:
+            vk.free(y)
+
+        z = logits - logits.max(axis=1, keepdims=True)
+        y_np = np.exp(z) / np.exp(z).sum(axis=1, keepdims=True)
+        assert np.allclose(got, y_np, rtol=2e-3, atol=2e-3)
+
+        # softmax backward
+        yb = vk.to_gpu(y_np.astype(np.float32))
+        try:
+            dx = vk.softmax2d_backward(yb, go)
+            try:
+                got = vk.to_cpu(dx)
+            finally:
+                vk.free(dx)
+        finally:
+            vk.free(yb)
+
+        dot = (go_np * y_np).sum(axis=1, keepdims=True)
+        dx_np = y_np * (go_np - dot)
+        assert np.allclose(got, dx_np, rtol=2e-3, atol=2e-3)
+
+        # log_softmax forward
+        lp = vk.log_softmax2d(lg)
+        try:
+            got = vk.to_cpu(lp)
+        finally:
+            vk.free(lp)
+
+        m = logits.max(axis=1, keepdims=True)
+        zz = logits - m
+        lse = np.log(np.exp(zz).sum(axis=1, keepdims=True)) + m
+        lp_np = logits - lse
+        assert np.allclose(got, lp_np, rtol=2e-3, atol=2e-3)
+
+        # log_softmax backward
+        lpb = vk.to_gpu(lp_np.astype(np.float32))
+        try:
+            dx = vk.log_softmax2d_backward(lpb, go)
+            try:
+                got = vk.to_cpu(dx)
+            finally:
+                vk.free(dx)
+        finally:
+            vk.free(lpb)
+
+        s = np.exp(lp_np)
+        sumg = go_np.sum(axis=1, keepdims=True)
+        dx_np = go_np - s * sumg
+        assert np.allclose(got, dx_np, rtol=2e-3, atol=2e-3)
+
+        # layernorm2d forward
+        ln = vk.layernorm2d(lg)
+        try:
+            got = vk.to_cpu(ln)
+        finally:
+            vk.free(ln)
+
+        mean = got.mean(axis=1)
+        var = got.var(axis=1)
+        assert np.allclose(mean, 0.0, atol=1e-2)
+        assert np.allclose(var, 1.0, atol=5e-2)
+
+        # layernorm2d backward (grad wrt normalized output)
+        dx = vk.layernorm2d_backward(lg, go)
+        try:
+            got = vk.to_cpu(dx)
+        finally:
+            vk.free(dx)
+
+        mean = logits.mean(axis=1, keepdims=True)
+        var = ((logits - mean) ** 2).mean(axis=1, keepdims=True)
+        invstd = 1.0 / np.sqrt(var + 1e-5)
+        xhat = (logits - mean) * invstd
+        sum1 = go_np.sum(axis=1, keepdims=True)
+        sum2 = (go_np * xhat).sum(axis=1, keepdims=True)
+        C = logits.shape[1]
+        dx_np = (invstd / max(1, C)) * (go_np * C - sum1 - xhat * sum2)
+        assert np.allclose(got, dx_np, rtol=2e-3, atol=2e-3)
+
+    finally:
+        vk.free(lg)
+        vk.free(go)

@@ -138,6 +138,14 @@ class _VulkanContext:
         self.p_softmax_xent_backward: Optional[_Pipeline] = None
         self.p_sgd_momentum_update: Optional[_Pipeline] = None
 
+        # NN essentials
+        self.p_softmax2d: Optional[_Pipeline] = None
+        self.p_softmax2d_backward: Optional[_Pipeline] = None
+        self.p_log_softmax2d: Optional[_Pipeline] = None
+        self.p_log_softmax2d_backward: Optional[_Pipeline] = None
+        self.p_layernorm2d: Optional[_Pipeline] = None
+        self.p_layernorm2d_backward: Optional[_Pipeline] = None
+
     # ------------------------------
     # Init
     # ------------------------------
@@ -250,6 +258,14 @@ class _VulkanContext:
         self.p_softmax_xent_loss_vec = self._create_pipeline_vec3_u32u32("softmax_xent_loss_vec")
         self.p_softmax_xent_backward = self._create_pipeline_vec3_u32u32("softmax_xent_backward")
         self.p_sgd_momentum_update = self._create_pipeline_vec3_pc16("sgd_momentum_update")
+
+        # NN essentials
+        self.p_softmax2d = self._create_pipeline_vec2_u32u32("softmax2d")
+        self.p_softmax2d_backward = self._create_pipeline_vec3_u32u32("softmax2d_backward")
+        self.p_log_softmax2d = self._create_pipeline_vec2_u32u32("log_softmax2d")
+        self.p_log_softmax2d_backward = self._create_pipeline_vec3_u32u32("log_softmax2d_backward")
+        self.p_layernorm2d = self._create_pipeline_vec2_u32u32("layernorm2d")
+        self.p_layernorm2d_backward = self._create_pipeline_vec3_u32u32("layernorm2d_backward")
 
     def _create_pipeline_vec3_pc16(self, name: str) -> _Pipeline:
         """Compute pipeline with 3 storage buffers and a 16-byte push constant range."""
@@ -3216,6 +3232,570 @@ def softmax_xent_backward(logits: VulkanBuffer, target: VulkanBuffer) -> VulkanB
     vkCmdPushConstants(
         ctx.command_buffer,
         ctx.p_softmax_xent_backward.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(N) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._submit_and_wait()
+    return out
+
+
+def softmax2d(logits: VulkanBuffer) -> VulkanBuffer:
+    """Row-wise softmax for 2D logits.
+
+    logits: [N,C] -> out: [N,C]
+    """
+
+    if len(logits.shape) != 2:
+        raise ValueError("softmax2d expects logits with shape [N,C]")
+    N, C = logits.shape
+
+    if not _ensure_vulkan_or_numpy(logits, None):
+        l = logits.host if logits.host is not None else np.zeros(logits.shape, np.float32)
+        m = l.max(axis=1, keepdims=True)
+        z = l - m
+        e = np.exp(z)
+        s = e / e.sum(axis=1, keepdims=True)
+        return _fallback_buf(s.astype(np.float32))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_softmax2d is not None
+
+    out = empty(logits.shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_softmax2d)
+
+    infos = [
+        VkDescriptorBufferInfo(buffer=logits.buffer, offset=0, range=logits.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<II", int(N), int(C)))
+
+    vkResetCommandBuffer(ctx.command_buffer, 0)
+    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_softmax2d.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_softmax2d.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_softmax2d.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(N) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._submit_and_wait()
+    return out
+
+
+def softmax2d_backward(y: VulkanBuffer, grad_out: VulkanBuffer) -> VulkanBuffer:
+    """Backward for row-wise softmax.
+
+    y: [N,C] (softmax output), grad_out: [N,C] -> grad_in: [N,C]
+    """
+
+    if len(y.shape) != 2 or y.shape != grad_out.shape:
+        raise ValueError(f"softmax2d_backward expects y and grad_out both [N,C]; got {y.shape} and {grad_out.shape}")
+    N, C = y.shape
+
+    if not _ensure_vulkan_or_numpy(y, grad_out):
+        yy = y.host if y.host is not None else np.zeros(y.shape, np.float32)
+        go = grad_out.host if grad_out.host is not None else np.zeros(grad_out.shape, np.float32)
+        dot = (go * yy).sum(axis=1, keepdims=True)
+        dx = yy * (go - dot)
+        return _fallback_buf(dx.astype(np.float32))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_softmax2d_backward is not None
+
+    out = empty(y.shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_softmax2d_backward)
+
+    infos = [
+        VkDescriptorBufferInfo(buffer=y.buffer, offset=0, range=y.nbytes),
+        VkDescriptorBufferInfo(buffer=grad_out.buffer, offset=0, range=grad_out.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<II", int(N), int(C)))
+
+    vkResetCommandBuffer(ctx.command_buffer, 0)
+    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    vkCmdBindPipeline(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_softmax2d_backward.pipeline,
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_softmax2d_backward.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_softmax2d_backward.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(N) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._submit_and_wait()
+    return out
+
+
+def log_softmax2d(logits: VulkanBuffer) -> VulkanBuffer:
+    """Row-wise log_softmax for 2D logits.
+
+    logits: [N,C] -> out: [N,C]
+    """
+
+    if len(logits.shape) != 2:
+        raise ValueError("log_softmax2d expects logits with shape [N,C]")
+    N, C = logits.shape
+
+    if not _ensure_vulkan_or_numpy(logits, None):
+        l = logits.host if logits.host is not None else np.zeros(logits.shape, np.float32)
+        m = l.max(axis=1, keepdims=True)
+        z = l - m
+        lse = np.log(np.exp(z).sum(axis=1, keepdims=True)) + m
+        out_np = l - lse
+        return _fallback_buf(out_np.astype(np.float32))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_log_softmax2d is not None
+
+    out = empty(logits.shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_log_softmax2d)
+
+    infos = [
+        VkDescriptorBufferInfo(buffer=logits.buffer, offset=0, range=logits.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<II", int(N), int(C)))
+
+    vkResetCommandBuffer(ctx.command_buffer, 0)
+    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    vkCmdBindPipeline(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_log_softmax2d.pipeline,
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_log_softmax2d.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_log_softmax2d.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(N) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._submit_and_wait()
+    return out
+
+
+def log_softmax2d_backward(logp: VulkanBuffer, grad_out: VulkanBuffer) -> VulkanBuffer:
+    """Backward for row-wise log_softmax.
+
+    logp: [N,C] (log_softmax output), grad_out: [N,C] -> grad_in: [N,C]
+    """
+
+    if len(logp.shape) != 2 or logp.shape != grad_out.shape:
+        raise ValueError(
+            f"log_softmax2d_backward expects logp and grad_out both [N,C]; got {logp.shape} and {grad_out.shape}"
+        )
+    N, C = logp.shape
+
+    if not _ensure_vulkan_or_numpy(logp, grad_out):
+        lp = logp.host if logp.host is not None else np.zeros(logp.shape, np.float32)
+        go = grad_out.host if grad_out.host is not None else np.zeros(grad_out.shape, np.float32)
+        s = np.exp(lp)
+        sumg = go.sum(axis=1, keepdims=True)
+        dx = go - s * sumg
+        return _fallback_buf(dx.astype(np.float32))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_log_softmax2d_backward is not None
+
+    out = empty(logp.shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_log_softmax2d_backward)
+
+    infos = [
+        VkDescriptorBufferInfo(buffer=logp.buffer, offset=0, range=logp.nbytes),
+        VkDescriptorBufferInfo(buffer=grad_out.buffer, offset=0, range=grad_out.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<II", int(N), int(C)))
+
+    vkResetCommandBuffer(ctx.command_buffer, 0)
+    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    vkCmdBindPipeline(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_log_softmax2d_backward.pipeline,
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_log_softmax2d_backward.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_log_softmax2d_backward.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(N) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._submit_and_wait()
+    return out
+
+
+def layernorm2d(x: VulkanBuffer) -> VulkanBuffer:
+    """LayerNorm for 2D input over the last dimension (eps=1e-5).
+
+    x: [N,C] -> out: [N,C]
+    """
+
+    if len(x.shape) != 2:
+        raise ValueError("layernorm2d expects x with shape [N,C]")
+    N, C = x.shape
+
+    if not _ensure_vulkan_or_numpy(x, None):
+        xx = x.host if x.host is not None else np.zeros(x.shape, np.float32)
+        mean = xx.mean(axis=1, keepdims=True)
+        var = ((xx - mean) ** 2).mean(axis=1, keepdims=True)
+        out_np = (xx - mean) / np.sqrt(var + 1e-5)
+        return _fallback_buf(out_np.astype(np.float32))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_layernorm2d is not None
+
+    out = empty(x.shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_layernorm2d)
+
+    infos = [
+        VkDescriptorBufferInfo(buffer=x.buffer, offset=0, range=x.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<II", int(N), int(C)))
+
+    vkResetCommandBuffer(ctx.command_buffer, 0)
+    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    vkCmdBindPipeline(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_layernorm2d.pipeline,
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_layernorm2d.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_layernorm2d.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        8,
+        pc,
+    )
+    group_count_x = (int(N) + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    vkEndCommandBuffer(ctx.command_buffer)
+    ctx._submit_and_wait()
+    return out
+
+
+def layernorm2d_backward(x: VulkanBuffer, grad_out: VulkanBuffer) -> VulkanBuffer:
+    """Backward for layernorm2d (eps=1e-5).
+
+    Inputs:
+    - x: [N,C]
+    - grad_out: [N,C] gradient w.r.t normalized output (xhat)
+    Output:
+    - grad_x: [N,C]
+    """
+
+    if len(x.shape) != 2 or len(grad_out.shape) != 2:
+        raise ValueError("layernorm2d_backward expects x and grad_out with shape [N,C]")
+    if x.shape != grad_out.shape:
+        raise ValueError(f"layernorm2d_backward shape mismatch: {x.shape} vs {grad_out.shape}")
+    N, C = x.shape
+
+    if not _ensure_vulkan_or_numpy(x, grad_out):
+        xx = x.host if x.host is not None else np.zeros(x.shape, np.float32)
+        gg = grad_out.host if grad_out.host is not None else np.zeros(x.shape, np.float32)
+
+        mean = xx.mean(axis=1, keepdims=True)
+        var = ((xx - mean) ** 2).mean(axis=1, keepdims=True)
+        invstd = 1.0 / np.sqrt(var + 1e-5)
+        xhat = (xx - mean) * invstd
+
+        sum1 = gg.sum(axis=1, keepdims=True)
+        sum2 = (gg * xhat).sum(axis=1, keepdims=True)
+        cc = max(1.0, float(C))
+        dx = (invstd / cc) * (gg * cc - sum1 - xhat * sum2)
+        return _fallback_buf(dx.astype(np.float32))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    assert ctx.p_layernorm2d_backward is not None
+
+    out = empty(x.shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_layernorm2d_backward)
+
+    infos = [
+        VkDescriptorBufferInfo(buffer=x.buffer, offset=0, range=x.nbytes),
+        VkDescriptorBufferInfo(buffer=grad_out.buffer, offset=0, range=grad_out.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=2,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[2]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    import vulkan as _vk  # type: ignore
+    import struct
+
+    pc = _vk.ffi.new("char[]", struct.pack("<II", int(N), int(C)))
+
+    vkResetCommandBuffer(ctx.command_buffer, 0)
+    begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+    vkBeginCommandBuffer(ctx.command_buffer, begin)
+    vkCmdBindPipeline(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_layernorm2d_backward.pipeline,
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_layernorm2d_backward.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_layernorm2d_backward.pipeline_layout,
         VK_SHADER_STAGE_COMPUTE_BIT,
         0,
         8,

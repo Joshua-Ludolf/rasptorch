@@ -8,7 +8,7 @@ import numpy as np
 
 from .nn import Module
 from .optim import Optimizer
-from .tensor import Tensor
+from .tensor import Tensor, no_grad
 
 
 Array = np.ndarray
@@ -191,28 +191,29 @@ def evaluate(
     t0 = time.perf_counter()
     seen = 0
 
-    for batch in loader:
-        if isinstance(batch, tuple) and len(batch) == 2:
-            xb, yb = batch
-        else:
-            raise ValueError("Expected loader to yield (x, y) batches")
+    with no_grad():
+        for batch in loader:
+            if isinstance(batch, tuple) and len(batch) == 2:
+                xb, yb = batch
+            else:
+                raise ValueError("Expected loader to yield (x, y) batches")
 
-        x = _to_device_tensor(xb, device)
-        if target_transform is None:
-            y_t = _to_device_tensor(yb, device)
-        else:
-            y_t = target_transform(yb)
+            x = _to_device_tensor(xb, device)
+            if target_transform is None:
+                y_t = _to_device_tensor(yb, device)
+            else:
+                y_t = target_transform(yb)
 
-        logits = model(x)
-        loss = loss_fn(logits, y_t)
+            logits = model(x)
+            loss = loss_fn(logits, y_t)
 
-        bs = int(np.asarray(yb).shape[0])
-        loss_val = float(loss.numpy().reshape(-1)[0])
-        loss_meter.update(loss_val, bs)
-        for m in metric_objs:
-            m.update(logits, np.asarray(yb))
+            bs = int(np.asarray(yb).shape[0])
+            loss_val = float(loss.numpy().reshape(-1)[0])
+            loss_meter.update(loss_val, bs)
+            for m in metric_objs:
+                m.update(logits, np.asarray(yb))
 
-        seen += bs
+            seen += bs
 
     dt = time.perf_counter() - t0
     ips = seen / max(1e-9, dt)
@@ -248,7 +249,7 @@ def fit(
 
     Notes:
     - Metrics that depend on logits call `.numpy()` and may cause GPU readbacks.
-    - There is no `no_grad()` yet; evaluation still builds graphs.
+    - `evaluate(...)` runs under `no_grad()`.
     """
 
     if epochs <= 0:

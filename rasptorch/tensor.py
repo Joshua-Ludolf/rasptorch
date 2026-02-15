@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Optional, Set
 
 import numpy as np
@@ -12,6 +13,42 @@ ArrayLike = Any
 
 def _is_number(x: object) -> bool:
     return isinstance(x, (int, float, np.floating, np.integer))
+
+
+_grad_enabled: bool = True
+
+
+def is_grad_enabled() -> bool:
+    return _grad_enabled
+
+
+@contextmanager
+def set_grad_enabled(mode: bool):
+    """Context manager to enable/disable autograd graph tracking."""
+
+    global _grad_enabled
+    prev = _grad_enabled
+    _grad_enabled = bool(mode)
+    try:
+        yield
+    finally:
+        _grad_enabled = prev
+
+
+@contextmanager
+def no_grad():
+    """Disable autograd graph tracking within the context (like torch.no_grad)."""
+
+    with set_grad_enabled(False):
+        yield
+
+
+@contextmanager
+def enable_grad():
+    """Enable autograd graph tracking within the context (like torch.enable_grad)."""
+
+    with set_grad_enabled(True):
+        yield
 
 
 class Tensor:
@@ -100,6 +137,21 @@ class Tensor:
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"Tensor(data={self.data!r}, requires_grad={self.requires_grad})"
 
+    def detach(self) -> "Tensor":
+        """Return a Tensor that shares storage but is detached from autograd."""
+
+        if self._vkbuf is not None:
+            return Tensor._from_vkbuf(self._vkbuf, requires_grad=False)
+        return Tensor(self.data.copy(), requires_grad=False, device=self.device)
+
+    def requires_grad_(self, requires_grad: bool = True) -> "Tensor":
+        """In-place requires_grad flag set (leaf tensors only)."""
+
+        if self._prev:
+            raise RuntimeError("requires_grad_ can only be called on leaf tensors")
+        self.requires_grad = bool(requires_grad)
+        return self
+
     @property
     def shape(self) -> tuple[int, ...]:
         if self._vkbuf is not None:
@@ -109,32 +161,32 @@ class Tensor:
     @property
     def T(self) -> "Tensor":
         """Transpose view (2D only for now)."""
+        track = is_grad_enabled() and self.requires_grad
         if self.device == "gpu":
             vk_out = vk.transpose2d(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-            out._prev = {self}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "transpose"
         else:
-            out = Tensor(self.data.T, _children=(self,), _op="transpose", device=self.device)
+            out = Tensor(self.data.T, requires_grad=track, _children=(self,) if track else None, _op="transpose", device=self.device)
 
-        def _backward() -> None:
-            if not self.requires_grad:
-                return
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                self._accum_grad_vk(vk.transpose2d(out.grad_vkbuf))
-            else:
-                if out.grad is None:
-                    return
-                grad = out.grad.T
-                if self.grad is None:
-                    self.grad = grad
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.transpose2d(out.grad_vkbuf))
                 else:
-                    self.grad = self.grad + grad
+                    if out.grad is None:
+                        return
+                    grad = out.grad.T
+                    if self.grad is None:
+                        self.grad = grad
+                    else:
+                        self.grad = self.grad + grad
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     def view(self, *shape: int) -> "Tensor":
@@ -146,29 +198,30 @@ class Tensor:
         if int(np.prod(new_shape)) != int(np.prod(self.shape)):
             raise ValueError(f"view cannot change number of elements: {self.shape} -> {new_shape}")
 
+        track = is_grad_enabled() and self.requires_grad
+
         if self.device == "gpu":
             vk_out = vk.view(self._as_vkbuf(), new_shape)
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-            out._prev = {self}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "view"
         else:
-            out = Tensor(self.data.reshape(new_shape), _children=(self,), _op="view", device=self.device)
+            out = Tensor(self.data.reshape(new_shape), requires_grad=track, _children=(self,) if track else None, _op="view", device=self.device)
 
-        def _backward() -> None:
-            if not self.requires_grad:
-                return
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                self._accum_grad_vk(vk.view(out.grad_vkbuf, self.shape))
-            else:
-                if out.grad is None:
-                    return
-                g = out.grad.reshape(self.shape)
-                self.grad = g if self.grad is None else (self.grad + g)
+        if track:
+            out._prev = {self}
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.view(out.grad_vkbuf, self.shape))
+                else:
+                    if out.grad is None:
+                        return
+                    g = out.grad.reshape(self.shape)
+                    self.grad = g if self.grad is None else (self.grad + g)
+
+            out._backward = _backward
         return out
 
     def reshape(self, *shape: int) -> "Tensor":
@@ -218,28 +271,28 @@ class Tensor:
     def __add__(self, other: ArrayLike) -> "Tensor":
         if _is_number(other):
             s = float(other)
+            track = is_grad_enabled() and self.requires_grad
             if self.device == "gpu":
                 vk_out = vk.add_scalar(self._as_vkbuf(), s)
-                out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-                out._prev = {self}
+                out = Tensor._from_vkbuf(vk_out, requires_grad=track)
                 out._op = "+scalar"
             else:
-                out = Tensor(self.data + s, _children=(self,), _op="+scalar", device=self.device)
+                out = Tensor(self.data + s, requires_grad=track, _children=(self,) if track else None, _op="+scalar", device=self.device)
 
-            def _backward() -> None:
-                if not self.requires_grad:
-                    return
-                if out.device == "gpu":
-                    if out.grad_vkbuf is None:
-                        return
-                    self._accum_grad_vk(out.grad_vkbuf)
-                else:
-                    if out.grad is None:
-                        return
-                    self.grad = out.grad.copy() if self.grad is None else (self.grad + out.grad)
+            if track:
+                out._prev = {self}
 
-            out._backward = _backward
-            out.requires_grad = self.requires_grad
+                def _backward() -> None:
+                    if out.device == "gpu":
+                        if out.grad_vkbuf is None:
+                            return
+                        self._accum_grad_vk(out.grad_vkbuf)
+                    else:
+                        if out.grad is None:
+                            return
+                        self.grad = out.grad.copy() if self.grad is None else (self.grad + out.grad)
+
+                out._backward = _backward
             return out
 
         other_t = self._ensure_tensor(other)
@@ -247,39 +300,42 @@ class Tensor:
         # Route through add_rowvec so gradients for the row-vector are correct.
         if len(self.shape) == 2 and len(other_t.shape) == 1 and other_t.shape[0] == self.shape[1]:
             return self.add_rowvec(other_t)
+
+        track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
         if self.device == "gpu" or other_t.device == "gpu":
             vk_out = vk.add(self._as_vkbuf(), other_t._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad or other_t.requires_grad)
-            out._prev = {self, other_t}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "+"
         else:
             out_data = self.data + other_t.data
-            out = Tensor(out_data, _children=(self, other_t), _op="+", device=self.device)
+            out = Tensor(out_data, requires_grad=track, _children=(self, other_t) if track else None, _op="+", device=self.device)
 
-        def _backward() -> None:
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                if self.requires_grad:
-                    self._accum_grad_vk(out.grad_vkbuf)
-                if other_t.requires_grad:
-                    other_t._accum_grad_vk(out.grad_vkbuf)
-            else:
-                if out.grad is None:
-                    return
-                if self.requires_grad:
-                    if self.grad is None:
-                        self.grad = out.grad.copy()
-                    else:
-                        self.grad = self.grad + out.grad
-                if other_t.requires_grad:
-                    if other_t.grad is None:
-                        other_t.grad = out.grad.copy()
-                    else:
-                        other_t.grad = other_t.grad + out.grad
+        if track:
+            out._prev = {self, other_t}
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad or other_t.requires_grad
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    if self.requires_grad:
+                        self._accum_grad_vk(out.grad_vkbuf)
+                    if other_t.requires_grad:
+                        other_t._accum_grad_vk(out.grad_vkbuf)
+                else:
+                    if out.grad is None:
+                        return
+                    if self.requires_grad:
+                        if self.grad is None:
+                            self.grad = out.grad.copy()
+                        else:
+                            self.grad = self.grad + out.grad
+                    if other_t.requires_grad:
+                        if other_t.grad is None:
+                            other_t.grad = out.grad.copy()
+                        else:
+                            other_t.grad = other_t.grad + out.grad
+
+            out._backward = _backward
         return out
 
     def __radd__(self, other: ArrayLike) -> "Tensor":
@@ -309,26 +365,27 @@ class Tensor:
                 return self * (1.0 / s)
 
         other_t = self._ensure_tensor(other)
-        out = Tensor(self.data / other_t.data, _children=(self, other_t), _op="/")
+        track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
+        out = Tensor(self.data / other_t.data, requires_grad=track, _children=(self, other_t) if track else None, _op="/", device=self.device)
 
-        def _backward() -> None:
-            if out.grad is None:
-                return
-            if self.requires_grad:
-                grad_self = out.grad / other_t.data
-                if self.grad is None:
-                    self.grad = grad_self
-                else:
-                    self.grad = self.grad + grad_self
-            if other_t.requires_grad:
-                grad_other = -out.grad * self.data / (other_t.data ** 2)
-                if other_t.grad is None:
-                    other_t.grad = grad_other
-                else:
-                    other_t.grad = other_t.grad + grad_other
+        if track:
+            def _backward() -> None:
+                if out.grad is None:
+                    return
+                if self.requires_grad:
+                    grad_self = out.grad / other_t.data
+                    if self.grad is None:
+                        self.grad = grad_self
+                    else:
+                        self.grad = self.grad + grad_self
+                if other_t.requires_grad:
+                    grad_other = -out.grad * self.data / (other_t.data ** 2)
+                    if other_t.grad is None:
+                        other_t.grad = grad_other
+                    else:
+                        other_t.grad = other_t.grad + grad_other
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad or other_t.requires_grad
+            out._backward = _backward
         return out
 
     def __rtruediv__(self, other: ArrayLike) -> "Tensor":
@@ -336,60 +393,60 @@ class Tensor:
 
     # Negation
     def __neg__(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
         if self.device == "gpu":
             vk_out = vk.neg(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-            out._prev = {self}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "neg"
         else:
-            out = Tensor(-self.data, _children=(self,), _op="neg", device=self.device)
+            out = Tensor(-self.data, requires_grad=track, _children=(self,) if track else None, _op="neg", device=self.device)
 
-        def _backward() -> None:
-            if not self.requires_grad:
-                return
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                self._accum_grad_vk(vk.neg(out.grad_vkbuf))
-            else:
-                if out.grad is None:
-                    return
-                if self.grad is None:
-                    self.grad = -out.grad.copy()
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.neg(out.grad_vkbuf))
                 else:
-                    self.grad = self.grad - out.grad
+                    if out.grad is None:
+                        return
+                    if self.grad is None:
+                        self.grad = -out.grad.copy()
+                    else:
+                        self.grad = self.grad - out.grad
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     # Multiplication (elementwise)
     def __mul__(self, other: ArrayLike) -> "Tensor":
         if _is_number(other):
             s = float(other)
+            track = is_grad_enabled() and self.requires_grad
             if self.device == "gpu":
                 vk_out = vk.mul_scalar(self._as_vkbuf(), s)
-                out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-                out._prev = {self}
+                out = Tensor._from_vkbuf(vk_out, requires_grad=track)
                 out._op = "*scalar"
             else:
-                out = Tensor(self.data * s, _children=(self,), _op="*scalar", device=self.device)
+                out = Tensor(self.data * s, requires_grad=track, _children=(self,) if track else None, _op="*scalar", device=self.device)
 
-            def _backward() -> None:
-                if not self.requires_grad:
-                    return
-                if out.device == "gpu":
-                    if out.grad_vkbuf is None:
-                        return
-                    self._accum_grad_vk(vk.mul_scalar(out.grad_vkbuf, s))
-                else:
-                    if out.grad is None:
-                        return
-                    grad_self = out.grad * s
-                    self.grad = grad_self if self.grad is None else (self.grad + grad_self)
+            if track:
+                out._prev = {self}
 
-            out._backward = _backward
-            out.requires_grad = self.requires_grad
+                def _backward() -> None:
+                    if out.device == "gpu":
+                        if out.grad_vkbuf is None:
+                            return
+                        self._accum_grad_vk(vk.mul_scalar(out.grad_vkbuf, s))
+                    else:
+                        if out.grad is None:
+                            return
+                        grad_self = out.grad * s
+                        self.grad = grad_self if self.grad is None else (self.grad + grad_self)
+
+                out._backward = _backward
             return out
 
         other_t = self._ensure_tensor(other)
@@ -397,41 +454,44 @@ class Tensor:
         # Route through mul_rowvec so gradients for the row-vector are correct.
         if len(self.shape) == 2 and len(other_t.shape) == 1 and other_t.shape[0] == self.shape[1]:
             return self.mul_rowvec(other_t)
+
+        track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
         if self.device == "gpu" or other_t.device == "gpu":
             vk_out = vk.mul(self._as_vkbuf(), other_t._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad or other_t.requires_grad)
-            out._prev = {self, other_t}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "*"
         else:
             out_data = self.data * other_t.data
-            out = Tensor(out_data, _children=(self, other_t), _op="*", device=self.device)
+            out = Tensor(out_data, requires_grad=track, _children=(self, other_t) if track else None, _op="*", device=self.device)
 
-        def _backward() -> None:
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                if self.requires_grad:
-                    self._accum_grad_vk(vk.mul(other_t._as_vkbuf(), out.grad_vkbuf))
-                if other_t.requires_grad:
-                    other_t._accum_grad_vk(vk.mul(self._as_vkbuf(), out.grad_vkbuf))
-            else:
-                if out.grad is None:
-                    return
-                if self.requires_grad:
-                    grad_self = other_t.data * out.grad
-                    if self.grad is None:
-                        self.grad = grad_self
-                    else:
-                        self.grad = self.grad + grad_self
-                if other_t.requires_grad:
-                    grad_other = self.data * out.grad
-                    if other_t.grad is None:
-                        other_t.grad = grad_other
-                    else:
-                        other_t.grad = other_t.grad + grad_other
+        if track:
+            out._prev = {self, other_t}
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad or other_t.requires_grad
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    if self.requires_grad:
+                        self._accum_grad_vk(vk.mul(other_t._as_vkbuf(), out.grad_vkbuf))
+                    if other_t.requires_grad:
+                        other_t._accum_grad_vk(vk.mul(self._as_vkbuf(), out.grad_vkbuf))
+                else:
+                    if out.grad is None:
+                        return
+                    if self.requires_grad:
+                        grad_self = other_t.data * out.grad
+                        if self.grad is None:
+                            self.grad = grad_self
+                        else:
+                            self.grad = self.grad + grad_self
+                    if other_t.requires_grad:
+                        grad_other = self.data * out.grad
+                        if other_t.grad is None:
+                            other_t.grad = grad_other
+                        else:
+                            other_t.grad = other_t.grad + grad_other
+
+            out._backward = _backward
         return out
 
     def __rmul__(self, other: ArrayLike) -> "Tensor":
@@ -440,178 +500,182 @@ class Tensor:
     # Matrix multiplication
     def __matmul__(self, other: ArrayLike) -> "Tensor":
         other_t = self._ensure_tensor(other)
+        track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
         if self.device == "gpu" or other_t.device == "gpu":
             vk_out = vk.matmul(self._as_vkbuf(), other_t._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad or other_t.requires_grad)
-            out._prev = {self, other_t}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "matmul"
         else:
             out_data = self.data @ other_t.data
-            out = Tensor(out_data, _children=(self, other_t), _op="matmul", device=self.device)
+            out = Tensor(out_data, requires_grad=track, _children=(self, other_t) if track else None, _op="matmul", device=self.device)
 
-        def _backward() -> None:
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                # dA = dC @ B^T
-                # dB = A^T @ dC
-                if self.requires_grad:
-                    b_t = vk.transpose2d(other_t._as_vkbuf())
-                    self._accum_grad_vk(vk.matmul(out.grad_vkbuf, b_t))
-                    vk.free(b_t)
-                if other_t.requires_grad:
-                    a_t = vk.transpose2d(self._as_vkbuf())
-                    other_t._accum_grad_vk(vk.matmul(a_t, out.grad_vkbuf))
-                    vk.free(a_t)
-            else:
-                if out.grad is None:
-                    return
-                if self.requires_grad:
-                    grad_self = out.grad @ other_t.data.T
-                    if self.grad is None:
-                        self.grad = grad_self
-                    else:
-                        self.grad = self.grad + grad_self
-                if other_t.requires_grad:
-                    grad_other = self.data.T @ out.grad
-                    if other_t.grad is None:
-                        other_t.grad = grad_other
-                    else:
-                        other_t.grad = other_t.grad + grad_other
+        if track:
+            out._prev = {self, other_t}
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad or other_t.requires_grad
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    # dA = dC @ B^T
+                    # dB = A^T @ dC
+                    if self.requires_grad:
+                        b_t = vk.transpose2d(other_t._as_vkbuf())
+                        self._accum_grad_vk(vk.matmul(out.grad_vkbuf, b_t))
+                        vk.free(b_t)
+                    if other_t.requires_grad:
+                        a_t = vk.transpose2d(self._as_vkbuf())
+                        other_t._accum_grad_vk(vk.matmul(a_t, out.grad_vkbuf))
+                        vk.free(a_t)
+                else:
+                    if out.grad is None:
+                        return
+                    if self.requires_grad:
+                        grad_self = out.grad @ other_t.data.T
+                        if self.grad is None:
+                            self.grad = grad_self
+                        else:
+                            self.grad = self.grad + grad_self
+                    if other_t.requires_grad:
+                        grad_other = self.data.T @ out.grad
+                        if other_t.grad is None:
+                            other_t.grad = grad_other
+                        else:
+                            other_t.grad = other_t.grad + grad_other
+
+            out._backward = _backward
         return out
 
     # Reductions
     def sum(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
         if self.device == "gpu":
             vk_out = vk.reduce_sum(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-            out._prev = {self}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "sum"
         else:
-            out = Tensor(self.data.sum(), _children=(self,), _op="sum", device=self.device)
+            out = Tensor(self.data.sum(), requires_grad=track, _children=(self,) if track else None, _op="sum", device=self.device)
 
-        def _backward() -> None:
-            if not self.requires_grad:
-                return
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                # Broadcast scalar grad to input shape.
-                out_buf = vk.empty(self.shape)
-                self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0))
-            else:
-                if out.grad is None:
-                    return
-                grad_broadcast = np.ones_like(self.data, dtype=self.data.dtype) * out.grad
-                if self.grad is None:
-                    self.grad = grad_broadcast
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    # Broadcast scalar grad to input shape.
+                    out_buf = vk.empty(self.shape)
+                    self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0))
                 else:
-                    self.grad = self.grad + grad_broadcast
+                    if out.grad is None:
+                        return
+                    grad_broadcast = np.ones_like(self.data, dtype=self.data.dtype) * out.grad
+                    if self.grad is None:
+                        self.grad = grad_broadcast
+                    else:
+                        self.grad = self.grad + grad_broadcast
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     def mean(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
         if self.device == "gpu":
             vk_out = vk.mean(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-            out._prev = {self}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "mean"
         else:
-            out = Tensor(self.data.mean(), _children=(self,), _op="mean", device=self.device)
+            out = Tensor(self.data.mean(), requires_grad=track, _children=(self,) if track else None, _op="mean", device=self.device)
 
-        def _backward() -> None:
-            if not self.requires_grad:
-                return
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                n = float(np.prod(self.shape))
-                out_buf = vk.empty(self.shape)
-                self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0 / max(1.0, n)))
-            else:
-                if out.grad is None:
-                    return
-                grad_broadcast = (
-                    np.ones_like(self.data, dtype=self.data.dtype) * out.grad / self.data.size
-                )
-                if self.grad is None:
-                    self.grad = grad_broadcast
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    n = float(np.prod(self.shape))
+                    out_buf = vk.empty(self.shape)
+                    self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0 / max(1.0, n)))
                 else:
-                    self.grad = self.grad + grad_broadcast
+                    if out.grad is None:
+                        return
+                    grad_broadcast = (
+                        np.ones_like(self.data, dtype=self.data.dtype) * out.grad / self.data.size
+                    )
+                    if self.grad is None:
+                        self.grad = grad_broadcast
+                    else:
+                        self.grad = self.grad + grad_broadcast
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     # Non-linearities
     def relu(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
         if self.device == "gpu":
             vk_out = vk.relu(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad)
-            out._prev = {self}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "relu"
         else:
             out_data = np.maximum(self.data, 0)
-            out = Tensor(out_data, _children=(self,), _op="relu", device=self.device)
+            out = Tensor(out_data, requires_grad=track, _children=(self,) if track else None, _op="relu", device=self.device)
 
-        def _backward() -> None:
-            if not self.requires_grad:
-                return
-            if out.device == "gpu":
-                if out.grad_vkbuf is None:
-                    return
-                self._accum_grad_vk(vk.relu_backward(out.grad_vkbuf, self._as_vkbuf()))
-            else:
-                if out.grad is None:
-                    return
-                grad = out.grad * (self.data > 0)
-                if self.grad is None:
-                    self.grad = grad
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.relu_backward(out.grad_vkbuf, self._as_vkbuf()))
                 else:
-                    self.grad = self.grad + grad
+                    if out.grad is None:
+                        return
+                    grad = out.grad * (self.data > 0)
+                    if self.grad is None:
+                        self.grad = grad
+                    else:
+                        self.grad = self.grad + grad
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     # Other activations
     def sigmoid(self) -> "Tensor":
         sig = 1 / (1 + np.exp(-self.data))
-        out = Tensor(sig, _children=(self,), _op="sigmoid", device=self.device)
+        track = is_grad_enabled() and self.requires_grad
+        out = Tensor(sig, requires_grad=track, _children=(self,) if track else None, _op="sigmoid", device=self.device)
 
-        def _backward() -> None:
-            if out.grad is None or not self.requires_grad:
-                return
-            grad = out.grad * sig * (1 - sig)
-            if self.grad is None:
-                self.grad = grad
-            else:
-                self.grad = self.grad + grad
+        if track:
+            def _backward() -> None:
+                if out.grad is None:
+                    return
+                grad = out.grad * sig * (1 - sig)
+                if self.grad is None:
+                    self.grad = grad
+                else:
+                    self.grad = self.grad + grad
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     def tanh(self) -> "Tensor":
         t = np.tanh(self.data)
-        out = Tensor(t, _children=(self,), _op="tanh", device=self.device)
+        track = is_grad_enabled() and self.requires_grad
+        out = Tensor(t, requires_grad=track, _children=(self,) if track else None, _op="tanh", device=self.device)
 
-        def _backward() -> None:
-            if out.grad is None or not self.requires_grad:
-                return
-            grad = out.grad * (1 - t ** 2)
-            if self.grad is None:
-                self.grad = grad
-            else:
-                self.grad = self.grad + grad
+        if track:
+            def _backward() -> None:
+                if out.grad is None:
+                    return
+                grad = out.grad * (1 - t ** 2)
+                if self.grad is None:
+                    self.grad = grad
+                else:
+                    self.grad = self.grad + grad
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad
+            out._backward = _backward
         return out
 
     # Utilities
@@ -641,79 +705,87 @@ class Tensor:
     def add_rowvec(self, b: "Tensor") -> "Tensor":
         """Broadcast-add a 1D row vector to a 2D matrix (GPU-optimized)."""
 
+        track = is_grad_enabled() and (self.requires_grad or b.requires_grad)
+
         if self.device == "gpu" or b.device == "gpu":
             vk_out = vk.add_rowvec(self._as_vkbuf(), b._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad or b.requires_grad)
-            out._prev = {self, b}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "add_rowvec"
 
-            def _backward() -> None:
-                if out.grad_vkbuf is None:
-                    return
-                if self.requires_grad:
-                    self._accum_grad_vk(out.grad_vkbuf)
-                if b.requires_grad:
-                    b._accum_grad_vk(vk.reduce_sum_rows(out.grad_vkbuf))
+            if track:
+                out._prev = {self, b}
 
-            out._backward = _backward
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    if self.requires_grad:
+                        self._accum_grad_vk(out.grad_vkbuf)
+                    if b.requires_grad:
+                        b._accum_grad_vk(vk.reduce_sum_rows(out.grad_vkbuf))
+
+                out._backward = _backward
             return out
 
         # CPU fallback
         out_data = self.data + b.data
-        out = Tensor(out_data, _children=(self, b), _op="add_rowvec", device=self.device)
+        out = Tensor(out_data, requires_grad=track, _children=(self, b) if track else None, _op="add_rowvec", device=self.device)
 
-        def _backward() -> None:
-            if out.grad is None:
-                return
-            if self.requires_grad:
-                self.grad = out.grad.copy() if self.grad is None else (self.grad + out.grad)
-            if b.requires_grad:
-                gb = out.grad.sum(axis=0)
-                b.grad = gb if b.grad is None else (b.grad + gb)
+        if track:
+            def _backward() -> None:
+                if out.grad is None:
+                    return
+                if self.requires_grad:
+                    self.grad = out.grad.copy() if self.grad is None else (self.grad + out.grad)
+                if b.requires_grad:
+                    gb = out.grad.sum(axis=0)
+                    b.grad = gb if b.grad is None else (b.grad + gb)
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad or b.requires_grad
+            out._backward = _backward
         return out
 
     def mul_rowvec(self, b: "Tensor") -> "Tensor":
         """Broadcast-multiply a 1D row vector with a 2D matrix (CPU+GPU)."""
 
+        track = is_grad_enabled() and (self.requires_grad or b.requires_grad)
+
         if self.device == "gpu" or b.device == "gpu":
             vk_out = vk.mul_rowvec(self._as_vkbuf(), b._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=self.requires_grad or b.requires_grad)
-            out._prev = {self, b}
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "mul_rowvec"
 
-            def _backward() -> None:
-                if out.grad_vkbuf is None:
-                    return
-                if self.requires_grad:
-                    self._accum_grad_vk(vk.mul_rowvec(out.grad_vkbuf, b._as_vkbuf()))
-                if b.requires_grad:
-                    tmp = vk.mul(out.grad_vkbuf, self._as_vkbuf())
-                    gb = vk.reduce_sum_rows(tmp)
-                    vk.free(tmp)
-                    b._accum_grad_vk(gb)
+            if track:
+                out._prev = {self, b}
 
-            out._backward = _backward
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    if self.requires_grad:
+                        self._accum_grad_vk(vk.mul_rowvec(out.grad_vkbuf, b._as_vkbuf()))
+                    if b.requires_grad:
+                        tmp = vk.mul(out.grad_vkbuf, self._as_vkbuf())
+                        gb = vk.reduce_sum_rows(tmp)
+                        vk.free(tmp)
+                        b._accum_grad_vk(gb)
+
+                out._backward = _backward
             return out
 
         # CPU fallback
         out_data = self.data * b.data
-        out = Tensor(out_data, _children=(self, b), _op="mul_rowvec", device=self.device)
+        out = Tensor(out_data, requires_grad=track, _children=(self, b) if track else None, _op="mul_rowvec", device=self.device)
 
-        def _backward() -> None:
-            if out.grad is None:
-                return
-            if self.requires_grad:
-                ga = out.grad * b.data
-                self.grad = ga if self.grad is None else (self.grad + ga)
-            if b.requires_grad:
-                gb = (out.grad * self.data).sum(axis=0)
-                b.grad = gb if b.grad is None else (b.grad + gb)
+        if track:
+            def _backward() -> None:
+                if out.grad is None:
+                    return
+                if self.requires_grad:
+                    ga = out.grad * b.data
+                    self.grad = ga if self.grad is None else (self.grad + ga)
+                if b.requires_grad:
+                    gb = (out.grad * self.data).sum(axis=0)
+                    b.grad = gb if b.grad is None else (b.grad + gb)
 
-        out._backward = _backward
-        out.requires_grad = self.requires_grad or b.requires_grad
+            out._backward = _backward
         return out
 
     # Device handling

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Iterable, List
+from typing import Iterable, List, Sequence
 
 import numpy as np
 
 from . import vulkan_backend as vk
-from .tensor import Parameter, Tensor
+from .tensor import Parameter, Tensor, is_grad_enabled
 
 
 class Module:
@@ -109,6 +109,11 @@ class Linear(Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
+        track = is_grad_enabled() and (
+            x.requires_grad
+            or self.weight.requires_grad
+            or (self.bias is not None and self.bias.requires_grad)
+        )
         # GPU path: explicit Vulkan kernels (keeps grads on GPU).
         if x.device == "gpu" or self.weight.device == "gpu" or (self.bias is not None and self.bias.device == "gpu"):
             # weight stored as [out,in] so forward uses x @ weight.T
@@ -118,33 +123,33 @@ class Linear(Module):
                 out = out.add_rowvec(self.bias)
 
             out._op = "linear"
-            out._prev = {x}  # params handled in closure
 
-            def _backward() -> None:
-                if out.grad_vkbuf is None:
-                    return
-                grad_out = out.grad_vkbuf
+            if track:
+                out.requires_grad = True
+                out._prev = {x}  # params handled in closure
 
-                # dX = dY @ W   where W is [out,in]
-                if x.requires_grad:
-                    x._accum_grad_vk(vk.matmul(grad_out, self.weight._as_vkbuf()))
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    grad_out = out.grad_vkbuf
 
-                # dW = dY^T @ X
-                if self.weight.requires_grad:
-                    go_t = vk.transpose2d(grad_out)
-                    self.weight._accum_grad_vk(vk.matmul(go_t, x._as_vkbuf()))
-                    vk.free(go_t)
+                    # dX = dY @ W   where W is [out,in]
+                    if x.requires_grad:
+                        x._accum_grad_vk(vk.matmul(grad_out, self.weight._as_vkbuf()))
 
-                # dB = sum_rows(dY)
-                if self.bias is not None and self.bias.requires_grad:
-                    self.bias._accum_grad_vk(vk.reduce_sum_rows(grad_out))
+                    # dW = dY^T @ X
+                    if self.weight.requires_grad:
+                        go_t = vk.transpose2d(grad_out)
+                        self.weight._accum_grad_vk(vk.matmul(go_t, x._as_vkbuf()))
+                        vk.free(go_t)
 
-            out._backward = _backward
-            out.requires_grad = (
-                x.requires_grad
-                or self.weight.requires_grad
-                or (self.bias is not None and self.bias.requires_grad)
-            )
+                    # dB = sum_rows(dY)
+                    if self.bias is not None and self.bias.requires_grad:
+                        self.bias._accum_grad_vk(vk.reduce_sum_rows(grad_out))
+
+                out._backward = _backward
+            else:
+                out.requires_grad = False
             return out
 
         # CPU path: manual linear layer using raw arrays.
@@ -152,10 +157,7 @@ class Linear(Module):
         if self.bias is not None:
             out_data = out_data + self.bias.data
 
-        requires_grad = (
-            x.requires_grad or self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)
-        )
-        out = Tensor(out_data, requires_grad=requires_grad, device=x.device)
+        out = Tensor(out_data, requires_grad=track, device=x.device)
 
         def _backward() -> None:
             if out.grad is None:
@@ -186,9 +188,10 @@ class Linear(Module):
                 else:
                     self.bias.grad = self.bias.grad + grad_b
 
-        out._backward = _backward
         out._op = "linear"
-        out._prev = {x}  # we treat params separately in the closure
+        if track:
+            out._prev = {x}  # we treat params separately in the closure
+            out._backward = _backward
         return out
 
 
@@ -254,6 +257,11 @@ class Conv2d(Module):
 
         # GPU path
         if x.device == "gpu" or self.weight.device == "gpu" or (self.bias is not None and self.bias.device == "gpu"):
+            track = is_grad_enabled() and (
+                x.requires_grad
+                or self.weight.requires_grad
+                or (self.bias is not None and self.bias.requires_grad)
+            )
             xbuf = x._as_vkbuf()
             # im2col: [N*OH*OW, C*kh*kw]
             xcol = vk.im2col_nchw(xbuf, kh=kh, kw=kw, stride_h=sh, stride_w=sw, pad_h=ph, pad_w=pw)
@@ -274,55 +282,56 @@ class Conv2d(Module):
             y = vk.mat2nchw(y2d, out_shape=(int(N), int(self.out_channels), int(OH), int(OW)))
             vk.free(y2d)
 
-            out = Tensor._from_vkbuf(y, requires_grad=(x.requires_grad or self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)))
+            out = Tensor._from_vkbuf(y, requires_grad=track)
             out._op = "conv2d"
-            out._prev = {x}
 
-            def _backward() -> None:
-                if out.grad_vkbuf is None:
-                    return
+            if track:
+                out._prev = {x}
 
-                dY_nchw = out.grad_vkbuf  # [N,out,OH,OW]
-                dY2d = vk.nchw2mat(dY_nchw)  # [N*OH*OW, out]
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
 
-                # Bias grad
-                if self.bias is not None and self.bias.requires_grad:
-                    self.bias._accum_grad_vk(vk.reduce_sum_rows(dY2d))
+                    dY_nchw = out.grad_vkbuf  # [N,out,OH,OW]
+                    dY2d = vk.nchw2mat(dY_nchw)  # [N*OH*OW, out]
 
-                # Weight grad: dW(out,K) = dY^T(out,R) @ Xcol(R,K)
-                if self.weight.requires_grad:
-                    dY2d_t = vk.transpose2d(dY2d)  # [out, R]
-                    dW2d = vk.matmul(dY2d_t, xcol)  # [out, K]
-                    vk.free(dY2d_t)
-                    dW4 = vk.view(dW2d, self.weight.shape)
-                    self.weight._accum_grad_vk(dW4)
-                    vk.free(dW2d)
+                    # Bias grad
+                    if self.bias is not None and self.bias.requires_grad:
+                        self.bias._accum_grad_vk(vk.reduce_sum_rows(dY2d))
 
-                # Input grad: dXcol(R,K) = dY(R,out) @ W(out,K)
-                if x.requires_grad:
-                    w2d_local = vk.view(self.weight._as_vkbuf(), (self.out_channels, K))
-                    dXcol = vk.matmul(dY2d, w2d_local)  # [R,K]
-                    vk.free(w2d_local)
-                    dX = vk.col2im_nchw(
-                        dXcol,
-                        out_shape=(int(N), int(self.in_channels), int(H), int(W)),
-                        kh=kh,
-                        kw=kw,
-                        stride_h=sh,
-                        stride_w=sw,
-                        pad_h=ph,
-                        pad_w=pw,
-                    )
-                    vk.free(dXcol)
-                    x._accum_grad_vk(dX)
+                    # Weight grad: dW(out,K) = dY^T(out,R) @ Xcol(R,K)
+                    if self.weight.requires_grad:
+                        dY2d_t = vk.transpose2d(dY2d)  # [out, R]
+                        dW2d = vk.matmul(dY2d_t, xcol)  # [out, K]
+                        vk.free(dY2d_t)
+                        dW4 = vk.view(dW2d, self.weight.shape)
+                        self.weight._accum_grad_vk(dW4)
+                        vk.free(dW2d)
 
-                vk.free(dY2d)
-                vk.free(xcol)
+                    # Input grad: dXcol(R,K) = dY(R,out) @ W(out,K)
+                    if x.requires_grad:
+                        w2d_local = vk.view(self.weight._as_vkbuf(), (self.out_channels, K))
+                        dXcol = vk.matmul(dY2d, w2d_local)  # [R,K]
+                        vk.free(w2d_local)
+                        dX = vk.col2im_nchw(
+                            dXcol,
+                            out_shape=(int(N), int(self.in_channels), int(H), int(W)),
+                            kh=kh,
+                            kw=kw,
+                            stride_h=sh,
+                            stride_w=sw,
+                            pad_h=ph,
+                            pad_w=pw,
+                        )
+                        vk.free(dXcol)
+                        x._accum_grad_vk(dX)
 
-            out._backward = _backward
+                    vk.free(dY2d)
+                    vk.free(xcol)
 
-            # In inference-only cases, don't leak the saved im2col buffer.
-            if not out.requires_grad:
+                out._backward = _backward
+            else:
+                # In inference/no_grad cases, don't leak the saved im2col buffer.
                 vk.free(xcol)
             return out
 
@@ -357,10 +366,15 @@ class Conv2d(Module):
             y2d_np = y2d_np + bb
         y_np = y2d_np.reshape(N, OH, OW, self.out_channels).transpose(0, 3, 1, 2)
 
-        requires_grad = x.requires_grad or self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)
-        out = Tensor(y_np, requires_grad=requires_grad, device=x.device)
+        track = is_grad_enabled() and (
+            x.requires_grad
+            or self.weight.requires_grad
+            or (self.bias is not None and self.bias.requires_grad)
+        )
+        out = Tensor(y_np, requires_grad=track, device=x.device)
         out._op = "conv2d"
-        out._prev = {x}
+        if track:
+            out._prev = {x}
 
         def _backward() -> None:
             if out.grad is None:
@@ -396,7 +410,8 @@ class Conv2d(Module):
                             row += 1
                 x.grad = dX_np if x.grad is None else (x.grad + dX_np)
 
-        out._backward = _backward
+        if track:
+            out._backward = _backward
         return out
 
 
@@ -422,6 +437,177 @@ class Sigmoid(Module):
 class Tanh(Module):
     def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
         return x.tanh()
+
+
+class Dropout(Module):
+    """Dropout layer.
+
+    During training:
+      out = x * mask / (1-p)
+    During eval:
+      out = x
+    """
+
+    def __init__(self, p: float = 0.5) -> None:
+        super().__init__()
+        p = float(p)
+        if p < 0.0 or p >= 1.0:
+            raise ValueError("Dropout p must be in [0, 1)")
+        self.p = p
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        if not self.training or self.p == 0.0:
+            return x
+        keep = 1.0 - float(self.p)
+        mask = (np.random.random_sample(x.shape) < keep).astype(np.float32) / max(keep, 1e-12)
+        m = Tensor(mask).to(x.device)
+        return x * m
+
+
+class LayerNorm(Module):
+    """LayerNorm over the last N dimensions.
+
+    This matches the common PyTorch usage: normalize over the last dimensions
+    specified by normalized_shape.
+    """
+
+    def __init__(
+        self,
+        normalized_shape: int | Sequence[int],
+        *,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+    ) -> None:
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            norm_shape = (int(normalized_shape),)
+        else:
+            norm_shape = tuple(int(s) for s in normalized_shape)
+        if any(s <= 0 for s in norm_shape):
+            raise ValueError("normalized_shape entries must be > 0")
+        self.normalized_shape = norm_shape
+        self.eps = float(eps)
+        self.elementwise_affine = bool(elementwise_affine)
+
+        if self.elementwise_affine:
+            self.weight = Parameter(np.ones(self.normalized_shape, dtype=np.float32))
+            self.bias = Parameter(np.zeros(self.normalized_shape, dtype=np.float32))
+        else:
+            self.weight = None
+            self.bias = None
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        if x.device == "gpu":
+            if len(self.normalized_shape) != 1:
+                raise NotImplementedError("LayerNorm GPU path currently supports 1D normalized_shape only")
+            if len(x.shape) != 2:
+                raise NotImplementedError("LayerNorm GPU path currently supports 2D inputs only")
+            if tuple(x.shape[-1:]) != tuple(self.normalized_shape):
+                raise ValueError(
+                    f"LayerNorm normalized_shape mismatch: expected trailing {self.normalized_shape}, got {tuple(x.shape)}"
+                )
+            if abs(self.eps - 1e-5) > 1e-12:
+                raise NotImplementedError("LayerNorm GPU path currently supports eps=1e-5 only")
+
+            track = is_grad_enabled() and (
+                x.requires_grad
+                or (self.weight is not None and self.weight.requires_grad)
+                or (self.bias is not None and self.bias.requires_grad)
+            )
+
+            xhat_buf = vk.layernorm2d(x._as_vkbuf())
+            xhat_track = is_grad_enabled() and x.requires_grad
+            xhat = Tensor._from_vkbuf(xhat_buf, requires_grad=xhat_track)
+            xhat._op = "layer_norm"
+
+            if xhat_track:
+                xhat._prev = {x}
+
+                def _backward() -> None:
+                    if xhat.grad_vkbuf is None:
+                        return
+                    dx = vk.layernorm2d_backward(x._as_vkbuf(), xhat.grad_vkbuf)
+                    x._accum_grad_vk(dx)
+
+                xhat._backward = _backward
+
+            out = xhat
+            if self.weight is not None:
+                out = out.mul_rowvec(self.weight)
+            if self.bias is not None:
+                out = out.add_rowvec(self.bias)
+            out.requires_grad = track
+            return out
+
+        # CPU path
+
+        if len(x.shape) < len(self.normalized_shape):
+            raise ValueError(f"LayerNorm input rank {len(x.shape)} < normalized_shape rank {len(self.normalized_shape)}")
+        if tuple(x.shape[-len(self.normalized_shape) :]) != tuple(self.normalized_shape):
+            raise ValueError(
+                f"LayerNorm normalized_shape mismatch: expected trailing {self.normalized_shape}, got {tuple(x.shape)}"
+            )
+
+        track = is_grad_enabled() and (
+            x.requires_grad
+            or (self.weight is not None and self.weight.requires_grad)
+            or (self.bias is not None and self.bias.requires_grad)
+        )
+
+        x_np = x.numpy()
+        axes = tuple(range(len(x.shape) - len(self.normalized_shape), len(x.shape)))
+        mean = x_np.mean(axis=axes, keepdims=True)
+        var = ((x_np - mean) ** 2).mean(axis=axes, keepdims=True)
+        invstd = 1.0 / np.sqrt(var + self.eps)
+        xhat = (x_np - mean) * invstd
+
+        if self.weight is not None:
+            w = self.weight.numpy().reshape((1,) * (xhat.ndim - len(self.normalized_shape)) + self.normalized_shape)
+            y = xhat * w
+        else:
+            w = None
+            y = xhat
+
+        if self.bias is not None:
+            b = self.bias.numpy().reshape((1,) * (xhat.ndim - len(self.normalized_shape)) + self.normalized_shape)
+            y = y + b
+
+        out = Tensor(y.astype(np.float32, copy=False), requires_grad=track, device="cpu")
+        out._op = "layer_norm"
+        if not track:
+            return out
+
+        out._prev = {x}
+
+        # Precompute for backward
+        N = float(np.prod(self.normalized_shape))
+
+        def _backward() -> None:
+            if out.grad is None:
+                return
+            dy = out.grad
+
+            # grads for affine
+            dxhat = dy
+            if self.weight is not None:
+                w_b = w  # broadcasted
+                if self.weight.requires_grad:
+                    dgamma = (dy * xhat).sum(axis=axes, keepdims=False)
+                    self.weight.grad = dgamma if self.weight.grad is None else (self.weight.grad + dgamma)
+                dxhat = dy * w_b
+            if self.bias is not None and self.bias.requires_grad:
+                dbeta = dy.sum(axis=axes, keepdims=False)
+                self.bias.grad = dbeta if self.bias.grad is None else (self.bias.grad + dbeta)
+
+            if x.requires_grad:
+                # dx = (1/N)*invstd*(N*dxhat - sum(dxhat) - xhat*sum(dxhat*xhat))
+                sum1 = dxhat.sum(axis=axes, keepdims=True)
+                sum2 = (dxhat * xhat).sum(axis=axes, keepdims=True)
+                dx = (invstd / max(N, 1.0)) * (dxhat * N - sum1 - xhat * sum2)
+                x.grad = dx if x.grad is None else (x.grad + dx)
+
+        out._backward = _backward
+        return out
 
 
 class Sequential(Module):
