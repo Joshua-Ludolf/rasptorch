@@ -34,6 +34,16 @@ Performance notes:
 See `main.py` for a simple training example and `gpu_demo.py` for a
 focused correctness + benchmark suite for the Vulkan backend.
 
+## Demos
+
+- Essentials demo (softmax/log_softmax, LayerNorm, Dropout, `no_grad`, `detach`):
+  - CPU: `uv run essentials_demo.py --device cpu`
+  - GPU-autograd (Vulkan): `uv run essentials_demo.py --device gpu`
+
+Note: the Vulkan-backed GPU path requires working Vulkan drivers and `glslc` (shader compiler)
+on your `PATH`. If Vulkan or `glslc` is unavailable, `--device gpu` falls back to the NumPy
+backend and prints the reason (for example: `glslc not found`).
+
 ## Modes
 
 There are three execution modes exposed via `main.py --device ...`:

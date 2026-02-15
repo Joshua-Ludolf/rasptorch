@@ -581,6 +581,7 @@ class LayerNorm(Module):
 
         # Precompute for backward
         N = float(np.prod(self.normalized_shape))
+        param_axes = tuple(range(0, xhat.ndim - len(self.normalized_shape)))
 
         def _backward() -> None:
             if out.grad is None:
@@ -592,11 +593,11 @@ class LayerNorm(Module):
             if self.weight is not None:
                 w_b = w  # broadcasted
                 if self.weight.requires_grad:
-                    dgamma = (dy * xhat).sum(axis=axes, keepdims=False)
+                    dgamma = (dy * xhat).sum(axis=param_axes, keepdims=False)
                     self.weight.grad = dgamma if self.weight.grad is None else (self.weight.grad + dgamma)
                 dxhat = dy * w_b
             if self.bias is not None and self.bias.requires_grad:
-                dbeta = dy.sum(axis=axes, keepdims=False)
+                dbeta = dy.sum(axis=param_axes, keepdims=False)
                 self.bias.grad = dbeta if self.bias.grad is None else (self.bias.grad + dbeta)
 
             if x.requires_grad:
