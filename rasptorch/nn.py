@@ -4,8 +4,104 @@ from typing import Iterable, List, Sequence
 
 import numpy as np
 
+from . import init as init_ops
 from . import vulkan_backend as vk
 from .tensor import Parameter, Tensor, is_grad_enabled
+
+
+def _make_tensor_from_np(value: np.ndarray, *, device: str, requires_grad: bool, op: str) -> Tensor:
+    arr = np.asarray(value, dtype=np.float32)
+    if device == "gpu":
+        out = Tensor._from_vkbuf(vk.to_gpu(arr), requires_grad=requires_grad)
+        out._op = op
+        return out
+    return Tensor(arr, requires_grad=requires_grad, device="cpu", _op=op)
+
+
+def _grad_from_output(out: Tensor) -> np.ndarray | None:
+    if out.device == "gpu":
+        if out.grad_vkbuf is None:
+            return None
+        return np.asarray(vk.to_cpu(out.grad_vkbuf), dtype=np.float32)
+    if out.grad is None:
+        return None
+    return np.asarray(out.grad, dtype=np.float32)
+
+
+def _accum_tensor_grad(tensor: Tensor, grad: np.ndarray) -> None:
+    if not tensor.requires_grad:
+        return
+    grad_np = np.asarray(grad, dtype=np.float32)
+    if tensor.device == "gpu":
+        tensor._accum_grad_vk(vk.to_gpu(grad_np))
+    else:
+        tensor.grad = grad_np if tensor.grad is None else (tensor.grad + grad_np)
+
+
+def _batchnorm_forward(module: Module, x: Tensor, reduce_axes: tuple[int, ...], op_name: str) -> Tensor:
+    x_np = np.asarray(x.numpy(), dtype=np.float32)
+    stat_shape = [1] * x_np.ndim
+    stat_shape[1] = x_np.shape[1]
+
+    if module.training:
+        mean = x_np.mean(axis=reduce_axes, keepdims=True)
+        var = ((x_np - mean) ** 2).mean(axis=reduce_axes, keepdims=True)
+        if getattr(module, "track_running_stats", True):
+            momentum = float(module.momentum)
+            module.running_mean = (1.0 - momentum) * module.running_mean + momentum * mean.reshape(-1)
+            module.running_var = (1.0 - momentum) * module.running_var + momentum * var.reshape(-1)
+    else:
+        mean = module.running_mean.reshape(stat_shape)
+        var = module.running_var.reshape(stat_shape)
+
+    invstd = 1.0 / np.sqrt(var + float(module.eps))
+    xhat = (x_np - mean) * invstd
+
+    if module.weight is not None:
+        w_b = module.weight.numpy().reshape(stat_shape)
+        y_np = xhat * w_b
+    else:
+        w_b = None
+        y_np = xhat
+    if module.bias is not None:
+        b_b = module.bias.numpy().reshape(stat_shape)
+        y_np = y_np + b_b
+
+    track = is_grad_enabled() and (
+        x.requires_grad
+        or (module.weight is not None and module.weight.requires_grad)
+        or (module.bias is not None and module.bias.requires_grad)
+    )
+    out = _make_tensor_from_np(y_np, device=x.device, requires_grad=track, op=op_name)
+    if not track:
+        return out
+
+    out._prev = {x}
+    norm_size = float(np.prod([x_np.shape[axis] for axis in reduce_axes]))
+
+    def _backward() -> None:
+        grad_out = _grad_from_output(out)
+        if grad_out is None:
+            return
+
+        dxhat = grad_out
+        if module.weight is not None:
+            if module.weight.requires_grad:
+                dgamma = (grad_out * xhat).sum(axis=reduce_axes, keepdims=False)
+                _accum_tensor_grad(module.weight, dgamma)
+            dxhat = grad_out * w_b
+        if module.bias is not None and module.bias.requires_grad:
+            dbeta = grad_out.sum(axis=reduce_axes, keepdims=False)
+            _accum_tensor_grad(module.bias, dbeta)
+
+        if x.requires_grad:
+            sum1 = dxhat.sum(axis=reduce_axes, keepdims=True)
+            sum2 = (dxhat * xhat).sum(axis=reduce_axes, keepdims=True)
+            dx = (invstd / max(norm_size, 1.0)) * (norm_size * dxhat - sum1 - xhat * sum2)
+            _accum_tensor_grad(x, dx)
+
+    out._backward = _backward
+    return out
 
 
 class Module:
@@ -100,9 +196,8 @@ class Module:
 class Linear(Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
         super().__init__()
-        limit = np.sqrt(2.0 / in_features)
-        weight_data = np.random.randn(out_features, in_features).astype("float32") * limit
-        self.weight = Parameter(weight_data)
+        self.weight = Parameter(np.empty((out_features, in_features), dtype=np.float32))
+        init_ops.kaiming_normal_(self.weight, nonlinearity="relu")
         if bias:
             self.bias = Parameter(np.zeros(out_features, dtype="float32"))
         else:
@@ -234,10 +329,8 @@ class Conv2d(Module):
         self.stride = (sh, sw)
         self.padding = (ph, pw)
 
-        fan_in = self.in_channels * kh * kw
-        limit = np.sqrt(2.0 / fan_in)
-        w = np.random.randn(self.out_channels, self.in_channels, kh, kw).astype("float32") * limit
-        self.weight = Parameter(w)
+        self.weight = Parameter(np.empty((self.out_channels, self.in_channels, kh, kw), dtype=np.float32))
+        init_ops.kaiming_normal_(self.weight, nonlinearity="relu")
         self.bias = Parameter(np.zeros(self.out_channels, dtype="float32")) if bias else None
 
     def forward(self, x: Tensor) -> Tensor:
@@ -439,6 +532,34 @@ class Tanh(Module):
         return x.tanh()
 
 
+class GELU(Module):
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        return x.gelu()
+
+
+class SiLU(Module):
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        return x.silu()
+
+
+class LeakyReLU(Module):
+    def __init__(self, negative_slope: float = 0.01) -> None:
+        super().__init__()
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        return x.leaky_relu(self.negative_slope)
+
+
+class ELU(Module):
+    def __init__(self, alpha: float = 1.0) -> None:
+        super().__init__()
+        self.alpha = float(alpha)
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        return x.elu(self.alpha)
+
+
 class Dropout(Module):
     """Dropout layer.
 
@@ -620,3 +741,306 @@ class Sequential(Module):
         for layer in self.layers:
             x = layer(x)
         return x
+
+
+class BatchNorm1d(Module):
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.momentum = float(momentum)
+        self.track_running_stats = bool(track_running_stats)
+        self.running_mean = np.zeros((self.num_features,), dtype=np.float32)
+        self.running_var = np.ones((self.num_features,), dtype=np.float32)
+        self.weight = Parameter(np.ones((self.num_features,), dtype=np.float32)) if affine else None
+        self.bias = Parameter(np.zeros((self.num_features,), dtype=np.float32)) if affine else None
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        if len(x.shape) == 2:
+            reduce_axes = (0,)
+        elif len(x.shape) == 3:
+            reduce_axes = (0, 2)
+        else:
+            raise ValueError(f"BatchNorm1d expects shape [N,C] or [N,C,L], got {x.shape}")
+        if x.shape[1] != self.num_features:
+            raise ValueError(f"BatchNorm1d expected channel dimension {self.num_features}, got {x.shape[1]}")
+        return _batchnorm_forward(self, x, reduce_axes, "batch_norm1d")
+
+
+class BatchNorm2d(Module):
+    def __init__(
+        self,
+        num_features: int,
+        *,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_features = int(num_features)
+        self.eps = float(eps)
+        self.momentum = float(momentum)
+        self.track_running_stats = bool(track_running_stats)
+        self.running_mean = np.zeros((self.num_features,), dtype=np.float32)
+        self.running_var = np.ones((self.num_features,), dtype=np.float32)
+        self.weight = Parameter(np.ones((self.num_features,), dtype=np.float32)) if affine else None
+        self.bias = Parameter(np.zeros((self.num_features,), dtype=np.float32)) if affine else None
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        if len(x.shape) != 4:
+            raise ValueError(f"BatchNorm2d expects shape [N,C,H,W], got {x.shape}")
+        if x.shape[1] != self.num_features:
+            raise ValueError(f"BatchNorm2d expected channel dimension {self.num_features}, got {x.shape[1]}")
+        return _batchnorm_forward(self, x, (0, 2, 3), "batch_norm2d")
+
+
+class Embedding(Module):
+    def __init__(self, num_embeddings: int, embedding_dim: int, device: str = "cpu") -> None:
+        super().__init__()
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self.weight = Parameter(np.empty((self.num_embeddings, self.embedding_dim), dtype=np.float32)).to(device)
+        init_ops.normal_(self.weight, mean=0.0, std=1.0)
+
+    def forward(self, indices: Tensor | np.ndarray | Sequence[int]) -> Tensor:  # type: ignore[override]
+        if isinstance(indices, Tensor):
+            idx = np.asarray(indices.numpy(), dtype=np.int64)
+            out_device = self.weight.device if self.weight.device == "gpu" or indices.device == "gpu" else "cpu"
+        else:
+            idx = np.asarray(indices, dtype=np.int64)
+            out_device = self.weight.device
+
+        if idx.size > 0 and (idx.min() < 0 or idx.max() >= self.num_embeddings):
+            raise ValueError(f"Embedding indices out of range [0,{self.num_embeddings})")
+
+        y_np = self.weight.numpy()[idx]
+        track = is_grad_enabled() and self.weight.requires_grad
+        out = _make_tensor_from_np(y_np, device=out_device, requires_grad=track, op="embedding")
+
+        if track:
+            flat_idx = idx.reshape(-1)
+
+            def _backward() -> None:
+                grad_out = _grad_from_output(out)
+                if grad_out is None:
+                    return
+                grad_weight = np.zeros_like(self.weight.numpy(), dtype=np.float32)
+                np.add.at(grad_weight, flat_idx, grad_out.reshape(-1, self.embedding_dim))
+                _accum_tensor_grad(self.weight, grad_weight)
+
+            out._backward = _backward
+
+        return out
+
+
+class MultiheadAttention(Module):
+    def __init__(self, embed_dim: int, num_heads: int, batch_first: bool = True) -> None:
+        super().__init__()
+        if embed_dim <= 0 or num_heads <= 0 or embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be > 0, num_heads must be > 0, and embed_dim must be divisible by num_heads")
+        if not batch_first:
+            raise NotImplementedError("MultiheadAttention currently supports batch_first=True only")
+
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.embed_dim // self.num_heads
+        self.batch_first = True
+
+        self.q_weight = Parameter(np.empty((self.embed_dim, self.embed_dim), dtype=np.float32))
+        self.k_weight = Parameter(np.empty((self.embed_dim, self.embed_dim), dtype=np.float32))
+        self.v_weight = Parameter(np.empty((self.embed_dim, self.embed_dim), dtype=np.float32))
+        self.out_weight = Parameter(np.empty((self.embed_dim, self.embed_dim), dtype=np.float32))
+        self.q_bias = Parameter(np.zeros((self.embed_dim,), dtype=np.float32))
+        self.k_bias = Parameter(np.zeros((self.embed_dim,), dtype=np.float32))
+        self.v_bias = Parameter(np.zeros((self.embed_dim,), dtype=np.float32))
+        self.out_bias = Parameter(np.zeros((self.embed_dim,), dtype=np.float32))
+
+        init_ops.xavier_uniform_(self.q_weight)
+        init_ops.xavier_uniform_(self.k_weight)
+        init_ops.xavier_uniform_(self.v_weight)
+        init_ops.xavier_uniform_(self.out_weight)
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        need_weights: bool = False,
+    ):
+        if len(query.shape) != 3 or len(key.shape) != 3 or len(value.shape) != 3:
+            raise ValueError("MultiheadAttention expects query, key, value with shape [B,T,E]")
+        if query.shape[0] != key.shape[0] or query.shape[0] != value.shape[0]:
+            raise ValueError("MultiheadAttention expects matching batch sizes")
+        if key.shape[1] != value.shape[1]:
+            raise ValueError("MultiheadAttention expects key and value sequence lengths to match")
+        if query.shape[2] != self.embed_dim or key.shape[2] != self.embed_dim or value.shape[2] != self.embed_dim:
+            raise ValueError(f"MultiheadAttention expects embed_dim={self.embed_dim}")
+
+        q_np = np.asarray(query.numpy(), dtype=np.float32)
+        k_np = np.asarray(key.numpy(), dtype=np.float32)
+        v_np = np.asarray(value.numpy(), dtype=np.float32)
+        bsz, tgt_len, _ = q_np.shape
+        src_len = k_np.shape[1]
+        scale = float(np.sqrt(self.head_dim))
+
+        q_lin = q_np @ self.q_weight.numpy().T + self.q_bias.numpy()
+        k_lin = k_np @ self.k_weight.numpy().T + self.k_bias.numpy()
+        v_lin = v_np @ self.v_weight.numpy().T + self.v_bias.numpy()
+
+        q_heads = q_lin.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k_heads = k_lin.reshape(bsz, src_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v_heads = v_lin.reshape(bsz, src_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        scores = np.matmul(q_heads, np.swapaxes(k_heads, -1, -2)) / scale
+        scores_max = scores.max(axis=-1, keepdims=True)
+        attn = np.exp(scores - scores_max)
+        attn = attn / np.maximum(attn.sum(axis=-1, keepdims=True), 1e-20)
+        context = np.matmul(attn, v_heads)
+        context_merged = context.transpose(0, 2, 1, 3).reshape(bsz, tgt_len, self.embed_dim)
+        out_np = context_merged @ self.out_weight.numpy().T + self.out_bias.numpy()
+
+        device = "gpu" if any(t.device == "gpu" for t in (query, key, value, self.q_weight)) else "cpu"
+        track = is_grad_enabled() and any(
+            t.requires_grad for t in (query, key, value, self.q_weight, self.k_weight, self.v_weight, self.out_weight, self.q_bias, self.k_bias, self.v_bias, self.out_bias)
+        )
+        out = _make_tensor_from_np(out_np, device=device, requires_grad=track, op="multihead_attention")
+
+        if track:
+            out._prev = {query, key, value}
+
+            def _backward() -> None:
+                grad_out = _grad_from_output(out)
+                if grad_out is None:
+                    return
+
+                grad_out_2d = grad_out.reshape(bsz * tgt_len, self.embed_dim)
+                context_2d = context_merged.reshape(bsz * tgt_len, self.embed_dim)
+                _accum_tensor_grad(self.out_weight, grad_out_2d.T @ context_2d)
+                _accum_tensor_grad(self.out_bias, grad_out_2d.sum(axis=0))
+
+                d_context_merged = grad_out_2d @ self.out_weight.numpy()
+                d_context = d_context_merged.reshape(bsz, tgt_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+                d_attn = np.matmul(d_context, np.swapaxes(v_heads, -1, -2))
+                d_v_heads = np.matmul(np.swapaxes(attn, -1, -2), d_context)
+
+                d_scores = attn * (d_attn - (d_attn * attn).sum(axis=-1, keepdims=True))
+                d_scores = d_scores / scale
+                d_q_heads = np.matmul(d_scores, k_heads)
+                d_k_heads = np.matmul(np.swapaxes(d_scores, -1, -2), q_heads)
+
+                d_q_lin = d_q_heads.transpose(0, 2, 1, 3).reshape(bsz, tgt_len, self.embed_dim)
+                d_k_lin = d_k_heads.transpose(0, 2, 1, 3).reshape(bsz, src_len, self.embed_dim)
+                d_v_lin = d_v_heads.transpose(0, 2, 1, 3).reshape(bsz, src_len, self.embed_dim)
+
+                q_2d = q_np.reshape(bsz * tgt_len, self.embed_dim)
+                k_2d = k_np.reshape(bsz * src_len, self.embed_dim)
+                v_2d = v_np.reshape(bsz * src_len, self.embed_dim)
+                dq_2d = d_q_lin.reshape(bsz * tgt_len, self.embed_dim)
+                dk_2d = d_k_lin.reshape(bsz * src_len, self.embed_dim)
+                dv_2d = d_v_lin.reshape(bsz * src_len, self.embed_dim)
+
+                _accum_tensor_grad(self.q_weight, dq_2d.T @ q_2d)
+                _accum_tensor_grad(self.k_weight, dk_2d.T @ k_2d)
+                _accum_tensor_grad(self.v_weight, dv_2d.T @ v_2d)
+                _accum_tensor_grad(self.q_bias, dq_2d.sum(axis=0))
+                _accum_tensor_grad(self.k_bias, dk_2d.sum(axis=0))
+                _accum_tensor_grad(self.v_bias, dv_2d.sum(axis=0))
+
+                if query.requires_grad:
+                    _accum_tensor_grad(query, (dq_2d @ self.q_weight.numpy()).reshape(bsz, tgt_len, self.embed_dim))
+                if key.requires_grad:
+                    _accum_tensor_grad(key, (dk_2d @ self.k_weight.numpy()).reshape(bsz, src_len, self.embed_dim))
+                if value.requires_grad:
+                    _accum_tensor_grad(value, (dv_2d @ self.v_weight.numpy()).reshape(bsz, src_len, self.embed_dim))
+
+            out._backward = _backward
+
+        if not need_weights:
+            return out
+        weights = _make_tensor_from_np(attn.mean(axis=1), device=device, requires_grad=False, op="attention_weights")
+        return out, weights
+
+
+class GRU(Module):
+    def __init__(self, input_size: int, hidden_size: int, batch_first: bool = True) -> None:
+        super().__init__()
+        if input_size <= 0 or hidden_size <= 0:
+            raise ValueError("input_size and hidden_size must be > 0")
+        self.input_size = int(input_size)
+        self.hidden_size = int(hidden_size)
+        self.batch_first = bool(batch_first)
+
+        self.weight_ih_l0 = Parameter(np.empty((3 * self.hidden_size, self.input_size), dtype=np.float32))
+        self.weight_hh_l0 = Parameter(np.empty((3 * self.hidden_size, self.hidden_size), dtype=np.float32))
+        self.bias_ih_l0 = Parameter(np.zeros((3 * self.hidden_size,), dtype=np.float32))
+        self.bias_hh_l0 = Parameter(np.zeros((3 * self.hidden_size,), dtype=np.float32))
+        init_ops.xavier_uniform_(self.weight_ih_l0)
+        init_ops.xavier_uniform_(self.weight_hh_l0)
+
+    def forward(self, x: Tensor, h0: Tensor | None = None):
+        if is_grad_enabled() and (
+            x.requires_grad
+            or self.weight_ih_l0.requires_grad
+            or self.weight_hh_l0.requires_grad
+            or self.bias_ih_l0.requires_grad
+            or self.bias_hh_l0.requires_grad
+        ):
+            raise NotImplementedError("GRU autograd is not implemented yet; use it under no_grad() or with detached inputs")
+
+        if len(x.shape) != 3:
+            raise ValueError(f"GRU expects a 3D input, got {x.shape}")
+
+        x_np = np.asarray(x.numpy(), dtype=np.float32)
+        if self.batch_first:
+            batch_size, seq_len, input_size = x_np.shape
+        else:
+            seq_len, batch_size, input_size = x_np.shape
+            x_np = np.transpose(x_np, (1, 0, 2))
+        if input_size != self.input_size:
+            raise ValueError(f"GRU expected input_size {self.input_size}, got {input_size}")
+
+        if h0 is None:
+            h = np.zeros((batch_size, self.hidden_size), dtype=np.float32)
+        else:
+            h0_np = np.asarray(h0.numpy(), dtype=np.float32)
+            if h0_np.shape != (1, batch_size, self.hidden_size):
+                raise ValueError(f"GRU expected h0 shape (1, {batch_size}, {self.hidden_size}), got {h0_np.shape}")
+            h = h0_np[0]
+
+        w_ih = self.weight_ih_l0.numpy()
+        w_hh = self.weight_hh_l0.numpy()
+        b_ih = self.bias_ih_l0.numpy()
+        b_hh = self.bias_hh_l0.numpy()
+
+        outputs = []
+        for t in range(seq_len):
+            xt = x_np[:, t, :]
+            gi = xt @ w_ih.T + b_ih
+            gh = h @ w_hh.T + b_hh
+            i_r, i_z, i_n = np.split(gi, 3, axis=1)
+            h_r, h_z, h_n = np.split(gh, 3, axis=1)
+            r = 1.0 / (1.0 + np.exp(-(i_r + h_r)))
+            z = 1.0 / (1.0 + np.exp(-(i_z + h_z)))
+            n = np.tanh(i_n + r * h_n)
+            h = (1.0 - z) * n + z * h
+            outputs.append(h.copy())
+
+        output_np = np.stack(outputs, axis=1)
+        if not self.batch_first:
+            output_np = np.transpose(output_np, (1, 0, 2))
+        h_n = h.reshape(1, batch_size, self.hidden_size)
+
+        device = x.device if x.device == "gpu" or self.weight_ih_l0.device == "gpu" else "cpu"
+        output = _make_tensor_from_np(output_np, device=device, requires_grad=False, op="gru")
+        hidden = _make_tensor_from_np(h_n, device=device, requires_grad=False, op="gru_hidden")
+        return output, hidden

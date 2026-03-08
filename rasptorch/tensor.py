@@ -610,6 +610,49 @@ class Tensor:
             out._backward = _backward
         return out
 
+    def _unary_numpy_op(
+        self,
+        *,
+        op: str,
+        forward: Callable[[np.ndarray], np.ndarray],
+        backward: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray],
+    ) -> "Tensor":
+        x_np = self.numpy()
+        y_np = np.asarray(forward(x_np), dtype=np.float32)
+        track = is_grad_enabled() and self.requires_grad
+
+        if self.device == "gpu":
+            out = Tensor._from_vkbuf(vk.to_gpu(y_np), requires_grad=track)
+            out._op = op
+        else:
+            out = Tensor(
+                y_np,
+                requires_grad=track,
+                _children=(self,) if track else None,
+                _op=op,
+                device=self.device,
+            )
+
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    grad_out = vk.to_cpu(out.grad_vkbuf)
+                    grad_in = np.asarray(backward(x_np, y_np, grad_out), dtype=np.float32)
+                    self._accum_grad_vk(vk.to_gpu(grad_in))
+                else:
+                    if out.grad is None:
+                        return
+                    grad_in = np.asarray(backward(x_np, y_np, out.grad), dtype=np.float32)
+                    self.grad = grad_in if self.grad is None else (self.grad + grad_in)
+
+            out._backward = _backward
+
+        return out
+
     # Non-linearities
     def relu(self) -> "Tensor":
         track = is_grad_enabled() and self.requires_grad
@@ -643,40 +686,170 @@ class Tensor:
 
     # Other activations
     def sigmoid(self) -> "Tensor":
-        sig = 1 / (1 + np.exp(-self.data))
-        track = is_grad_enabled() and self.requires_grad
-        out = Tensor(sig, requires_grad=track, _children=(self,) if track else None, _op="sigmoid", device=self.device)
+        def _forward(x: np.ndarray) -> np.ndarray:
+            return 1.0 / (1.0 + np.exp(-x))
 
-        if track:
-            def _backward() -> None:
-                if out.grad is None:
-                    return
-                grad = out.grad * sig * (1 - sig)
-                if self.grad is None:
-                    self.grad = grad
-                else:
-                    self.grad = self.grad + grad
+        def _backward(_: np.ndarray, y: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            return grad_out * y * (1.0 - y)
 
-            out._backward = _backward
-        return out
+        return self._unary_numpy_op(op="sigmoid", forward=_forward, backward=_backward)
 
     def tanh(self) -> "Tensor":
-        t = np.tanh(self.data)
+        def _forward(x: np.ndarray) -> np.ndarray:
+            return np.tanh(x)
+
+        def _backward(_: np.ndarray, y: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            return grad_out * (1.0 - y ** 2)
+
+        return self._unary_numpy_op(op="tanh", forward=_forward, backward=_backward)
+
+    def gelu(self) -> "Tensor":
         track = is_grad_enabled() and self.requires_grad
-        out = Tensor(t, requires_grad=track, _children=(self,) if track else None, _op="tanh", device=self.device)
+        if self.device == "gpu":
+            vk_out = vk.gelu(self._as_vkbuf())
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+            out._op = "gelu"
 
-        if track:
-            def _backward() -> None:
-                if out.grad is None:
-                    return
-                grad = out.grad * (1 - t ** 2)
-                if self.grad is None:
-                    self.grad = grad
-                else:
-                    self.grad = self.grad + grad
+            if track:
+                out._prev = {self}
 
-            out._backward = _backward
-        return out
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.gelu_backward(out.grad_vkbuf, self._as_vkbuf()))
+
+                out._backward = _backward
+            return out
+
+        sqrt_2_over_pi = np.float32(np.sqrt(2.0 / np.pi))
+
+        def _forward(x: np.ndarray) -> np.ndarray:
+            inner = sqrt_2_over_pi * (x + np.float32(0.044715) * (x ** 3))
+            return np.float32(0.5) * x * (1.0 + np.tanh(inner))
+
+        def _backward(x: np.ndarray, _: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            inner = sqrt_2_over_pi * (x + np.float32(0.044715) * (x ** 3))
+            tanh_inner = np.tanh(inner)
+            sech2 = 1.0 - tanh_inner ** 2
+            inner_grad = sqrt_2_over_pi * (1.0 + np.float32(0.134145) * (x ** 2))
+            grad = np.float32(0.5) * (1.0 + tanh_inner) + np.float32(0.5) * x * sech2 * inner_grad
+            return grad_out * grad
+
+        return self._unary_numpy_op(op="gelu", forward=_forward, backward=_backward)
+
+    def silu(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
+        if self.device == "gpu":
+            vk_out = vk.silu(self._as_vkbuf())
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+            out._op = "silu"
+
+            if track:
+                out._prev = {self}
+
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.silu_backward(out.grad_vkbuf, self._as_vkbuf()))
+
+                out._backward = _backward
+            return out
+
+        def _forward(x: np.ndarray) -> np.ndarray:
+            sig = 1.0 / (1.0 + np.exp(-x))
+            return x * sig
+
+        def _backward(x: np.ndarray, _: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            sig = 1.0 / (1.0 + np.exp(-x))
+            grad = sig * (1.0 + x * (1.0 - sig))
+            return grad_out * grad
+
+        return self._unary_numpy_op(op="silu", forward=_forward, backward=_backward)
+
+    def leaky_relu(self, alpha: float = 0.01) -> "Tensor":
+        alpha = float(alpha)
+
+        track = is_grad_enabled() and self.requires_grad
+        if self.device == "gpu":
+            vk_out = vk.leaky_relu(self._as_vkbuf(), alpha)
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+            out._op = "leaky_relu"
+
+            if track:
+                out._prev = {self}
+
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.leaky_relu_backward(out.grad_vkbuf, self._as_vkbuf(), alpha))
+
+                out._backward = _backward
+            return out
+
+        def _forward(x: np.ndarray) -> np.ndarray:
+            return np.where(x > 0.0, x, alpha * x)
+
+        def _backward(x: np.ndarray, _: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            return grad_out * np.where(x > 0.0, 1.0, alpha)
+
+        return self._unary_numpy_op(op="leaky_relu", forward=_forward, backward=_backward)
+
+    def elu(self, alpha: float = 1.0) -> "Tensor":
+        alpha = float(alpha)
+
+        track = is_grad_enabled() and self.requires_grad
+        if self.device == "gpu":
+            vk_out = vk.elu(self._as_vkbuf(), alpha)
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+            out._op = "elu"
+
+            if track:
+                out._prev = {self}
+
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.elu_backward(out.grad_vkbuf, self._as_vkbuf(), alpha))
+
+                out._backward = _backward
+            return out
+
+        def _forward(x: np.ndarray) -> np.ndarray:
+            return np.where(x > 0.0, x, alpha * (np.exp(x) - 1.0))
+
+        def _backward(x: np.ndarray, y: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            grad = np.where(x > 0.0, 1.0, y + alpha)
+            return grad_out * grad
+
+        return self._unary_numpy_op(op="elu", forward=_forward, backward=_backward)
+
+    def abs(self) -> "Tensor":
+        def _forward(x: np.ndarray) -> np.ndarray:
+            return np.abs(x)
+
+        def _backward(x: np.ndarray, _: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            return grad_out * np.sign(x)
+
+        return self._unary_numpy_op(op="abs", forward=_forward, backward=_backward)
+
+    def clamp(self, min_value: float | None = None, max_value: float | None = None) -> "Tensor":
+        if min_value is None and max_value is None:
+            return self
+
+        def _forward(x: np.ndarray) -> np.ndarray:
+            lower = -np.inf if min_value is None else float(min_value)
+            upper = np.inf if max_value is None else float(max_value)
+            return np.clip(x, lower, upper)
+
+        def _backward(x: np.ndarray, _: np.ndarray, grad_out: np.ndarray) -> np.ndarray:
+            mask = np.ones_like(x, dtype=np.float32)
+            if min_value is not None:
+                mask = mask * (x >= float(min_value))
+            if max_value is not None:
+                mask = mask * (x <= float(max_value))
+            return grad_out * mask
+
+        return self._unary_numpy_op(op="clamp", forward=_forward, backward=_backward)
 
     # Utilities
     def numpy(self) -> np.ndarray:
@@ -808,6 +981,15 @@ class Tensor:
             return Tensor._from_vkbuf(vk.to_gpu(self.data), requires_grad=self.requires_grad)
 
         raise NotImplementedError(f"Unknown device: {device}")
+
+    def half(self) -> "Tensor":
+        quantized = np.asarray(self.numpy(), dtype=np.float16).astype(np.float32)
+        out = Tensor(quantized, requires_grad=self.requires_grad, device="cpu")
+        return out.to(self.device)
+
+    def float(self) -> "Tensor":
+        out = Tensor(np.asarray(self.numpy(), dtype=np.float32), requires_grad=self.requires_grad, device="cpu")
+        return out.to(self.device)
 
 
 class Parameter(Tensor):

@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufG { float g[]; } bufg;
+layout(set = 0, binding = 1, std430) readonly buffer BufX { float x[]; } bufx;
+layout(set = 0, binding = 2, std430) writeonly buffer BufO { float o[]; } bufo;
+
+layout(push_constant) uniform Push {
+    uint n;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.n) return;
+    float x = bufx.x[idx];
+    float k = sqrt(2.0 / 3.14159265358979323846);
+    float inner = k * (x + 0.044715 * x * x * x);
+    float t = tanh(inner);
+    float sech2 = 1.0 - t * t;
+    float inner_grad = k * (1.0 + 0.134145 * x * x);
+    float grad = 0.5 * (1.0 + t) + 0.5 * x * sech2 * inner_grad;
+    bufo.o[idx] = bufg.g[idx] * grad;
+}

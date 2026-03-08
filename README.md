@@ -17,12 +17,13 @@ compiled to SPIR-V). It supports a small but useful set of kernels (see
 
 High-level highlights:
 
-- Elementwise ops: `+`, `*`, `-`, `neg`, `relu` (plus scalar variants)
+- Elementwise ops: `+`, `*`, `-`, `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu` (plus scalar variants)
 - Matmul: `@` (tiled/shared-memory shader)
 - Reductions: `sum`, `mean`
 - Common broadcast forms: `(N,M) + (M,)` and `(N,M) * (M,)`
-- Loss: `functional.cross_entropy` (GPU kernel)
-- NN essentials: GPU row-wise `softmax` / `log_softmax`, and 2D `LayerNorm`
+- Losses: `cross_entropy`, `binary_cross_entropy`, `binary_cross_entropy_with_logits`, `nll_loss`, `smooth_l1_loss`, `label_smoothing_cross_entropy`
+- Optimizers and training utilities: `SGD`, `Adam`, `AdamW`, `RMSProp`, LR schedulers, gradient clipping, regularization helpers
+- NN essentials: GPU row-wise `softmax` / `log_softmax`, 2D `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, and GRU forward inference
 
 Performance notes:
 
@@ -41,8 +42,8 @@ focused correctness + benchmark suite for the Vulkan backend.
   - GPU-autograd (Vulkan): `uv run essentials_demo.py --device gpu`
 
 Note: the Vulkan-backed GPU path requires working Vulkan drivers and `glslc` (shader compiler)
-on your `PATH`. If Vulkan or `glslc` is unavailable, `--device gpu` falls back to the NumPy
-backend and prints the reason (for example: `glslc not found`).
+on your `PATH`. Low-level backend helpers can still fall back to NumPy in some environments,
+but `main.py --device gpu` is expected to run with Vulkan (glslc available) and fails clearly if it is not.
 
 ## Modes
 
@@ -50,7 +51,7 @@ There are three execution modes exposed via `main.py --device ...`:
 
 - `cpu`: NumPy autograd engine (PyTorch-like, runs on CPU)
 - `gpu`: explicit Vulkan training path (forward + backward + SGD via purpose-built kernels)
-- `gpu-autograd`: experimental GPU autograd (builds a graph on GPU for a limited set of ops)
+- `gpu-autograd`: experimental GPU autograd (builds a graph on GPU for a growing but still incomplete set of ops)
 
 ## Quickstart
 
@@ -108,6 +109,10 @@ The Vulkan training path lives in `rasptorch/gpu_training.py` and currently supp
 
 `Linear -> ReLU -> Linear` with MSE loss and SGD.
 
+The general `gpu-autograd` path supports substantially more model-building pieces than the
+explicit `gpu` trainer, including adaptive optimizers, additional activations, LayerNorm,
+BatchNorm, Embedding, and MultiheadAttention.
+
 Run it via:
 
 - `uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.1`
@@ -131,12 +136,21 @@ Currently supported (GPU) in autograd:
 
 - `+`, `*`, `-` (scalar and tensor forms), `@` (matmul)
 - scalar ops: `tensor + s`, `tensor * s`, `tensor / s`, plus `s + tensor`, `s * tensor`, `s - tensor`
-- `neg`, `relu`, `sum`, `mean`, `T` (2D transpose)
+- `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu`, `sum`, `mean`, `T` (2D transpose)
 - `functional.softmax` / `functional.log_softmax` (2D row-wise, `dim=-1/1`)
 - `nn.LayerNorm` (2D inputs, 1D `normalized_shape`, `eps=1e-5`)
+- `nn.BatchNorm1d`, `nn.BatchNorm2d`, `nn.Embedding`, `nn.MultiheadAttention`
 - `Linear` backward (GPU grads for `weight`/`bias`)
 - `SGD.step()` updates GPU parameters in-place (SGD + optional momentum/weight decay)
+- `Adam.step()`, `AdamW.step()`, `RMSProp.step()` update GPU parameters in-place
 - `functional.cross_entropy(logits, target_onehot)` (softmax cross-entropy, mean reduction)
+
+Also available across the library:
+
+- LR schedulers: `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `ReduceLROnPlateau`, `WarmupScheduler`
+- Initialization helpers: `kaiming_*`, `xavier_*`, `orthogonal_`, `uniform_`, `normal_`, `zeros_`, `ones_`, `constant_`
+- Gradient utilities: `clip_grad_norm_`, `clip_grad_value_`, `l1_regularization`, `l2_regularization`, `total_variation_loss`
+- AMP surface: `rasptorch.amp.autocast()` and `rasptorch.amp.GradScaler`
 
 Tip: `rasptorch.no_grad()` exists (like PyTorch) to disable graph building during evaluation.
 
@@ -185,6 +199,31 @@ Notes:
 - `uv run main.py --device gpu` now **requires Vulkan**. If Vulkan init or shader compilation fails, it raises a clear error instead of silently falling back.
 - Broadcasting is still limited; common 2D + 1D row-vector forms like `(N,M) + (M,)` and `(N,M) * (M,)` are supported.
 
+## Additional APIs
+
+Optimization:
+
+- `rasptorch.optim`: `SGD`, `Adam`, `AdamW`, `RMSProp`
+- `rasptorch.optim_sched`: `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `ReduceLROnPlateau`, `WarmupScheduler`
+
+Initialization:
+
+- `rasptorch.init`: `kaiming_uniform_`, `kaiming_normal_`, `xavier_uniform_`, `xavier_normal_`, `orthogonal_`, `constant_`, `zeros_`, `ones_`, `uniform_`, `normal_`
+
+Regularization and gradient helpers:
+
+- `rasptorch.utils`: `clip_grad_norm_`, `clip_grad_value_`, `l1_regularization`, `l2_regularization`, `total_variation_loss`
+
+More modules:
+
+- `rasptorch.nn`: `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, `GRU`, `GELU`, `SiLU`, `LeakyReLU`, `ELU`
+
+Mixed precision surface:
+
+- `rasptorch.amp.autocast()`
+- `rasptorch.amp.GradScaler`
+- `Tensor.half()` / `Tensor.float()`
+
 ## Benchmarks
 
 `gpu_demo.py` prints timing stats (min/p50/p95/mean/std) for:
@@ -198,11 +237,11 @@ If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
 
 ## Current Limitations
 
-- GPU autograd is still **incomplete** (only a subset of ops are supported).
-- GPU reductions now support `sum()` and `mean()`, but other reductions/broadcast patterns
-  are still limited.
-- The Vulkan backend only implements a small set of ops/kernels; expanding model coverage will
-  require more kernels (and ideally more fusion).
+- GPU autograd is still **incomplete**. Core MLP/classification paths are covered, but full PyTorch-like operator coverage is not there yet.
+- Some newer APIs use CPU-backed math internally when no dedicated Vulkan/autograd kernel exists yet. The public API works, but not every path is fully GPU-native.
+- `GRU` currently supports forward/inference use; GRU autograd is not implemented yet.
+- The mixed-precision API surface exists, but true fp16 Vulkan storage/compute kernels are not implemented yet. `autocast()` and `GradScaler` are currently preparatory/experimental.
+- GPU reductions now support `sum()` and `mean()`, but other reductions/broadcast patterns are still limited.
 - PyTorch integration is experimental: `rasptorch.torch_bridge` currently supports a small inference subset
   (Conv2d/Linear/ReLU) and may copy tensors CPU<->GPU.
 
