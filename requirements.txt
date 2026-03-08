@@ -25,7 +25,6 @@ pycparser==3.0
 pygments==2.19.2
 pyproject-hooks==1.2.0
 pytest==9.0.2
--e file:///home/josh-ludolf/Documents/rasptorch
 readme-renderer==44.0
 requests==2.32.5
 requests-toolbelt==1.0.0

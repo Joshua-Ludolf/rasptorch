@@ -67,16 +67,18 @@ class GpuMLP:
         }
 
     def save(self, path: str) -> None:
+        state_dict = self.state_dict()
         payload = {
             "arch": "GpuMLP",
             "in_features": self.in_features,
             "hidden": self.hidden,
             "out_features": self.out_features,
-            "state_dict": self.state_dict(),
+            "state_dict": state_dict,
         }
         try:
             import torch  # type: ignore
 
+            payload["state_dict"] = {name: torch.from_numpy(value) for name, value in state_dict.items()}
             torch.save(payload, path)
         except ModuleNotFoundError:
             import pickle
