@@ -73,6 +73,44 @@ def test_vulkan_backend_smoke() -> None:
 
     assert np.array_equal(got, t_np.T)
 
+    # Generic permute + concat/split helpers
+    p_np = rng.standard_normal((2, 3, 4), dtype=np.float32)
+    p = vk.to_gpu(p_np)
+    try:
+        out = vk.permute(p, (2, 0, 1))
+        try:
+            got = vk.to_cpu(out)
+        finally:
+            vk.free(out)
+    finally:
+        vk.free(p)
+    assert np.allclose(got, np.transpose(p_np, (2, 0, 1)), rtol=2e-3, atol=1e-3)
+
+    c1_np = rng.standard_normal((2, 3), dtype=np.float32)
+    c2_np = rng.standard_normal((4, 3), dtype=np.float32)
+    c1 = vk.to_gpu(c1_np)
+    c2 = vk.to_gpu(c2_np)
+    try:
+        out = vk.concat([c1, c2], dim=0)
+        try:
+            got = vk.to_cpu(out)
+        finally:
+            vk.free(out)
+        assert np.allclose(got, np.concatenate([c1_np, c2_np], axis=0), rtol=2e-3, atol=1e-3)
+
+        p0, p1 = vk.split(c2, [1, 3], dim=0)
+        try:
+            got0 = vk.to_cpu(p0)
+            got1 = vk.to_cpu(p1)
+        finally:
+            vk.free(p0)
+            vk.free(p1)
+        assert np.allclose(got0, c2_np[:1], rtol=2e-3, atol=1e-3)
+        assert np.allclose(got1, c2_np[1:], rtol=2e-3, atol=1e-3)
+    finally:
+        vk.free(c1)
+        vk.free(c2)
+
     # Training kernels: add_rowvec + reduce_sum_rows + relu_backward + mse_grad
     m = rng.standard_normal((11, 13), dtype=np.float32)
     rv = rng.standard_normal((13,), dtype=np.float32)

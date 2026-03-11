@@ -7,6 +7,7 @@ import numpy as np
 
 from .tensor import Tensor
 from . import vulkan_backend as vk
+from . import nn as rt_nn
 
 
 def _require_torch():
@@ -237,6 +238,101 @@ def convert_torch_model(model, *, device: str = "gpu"):
                 return torch.relu(x)
 
         return _Wrap()
+
+    if isinstance(model, torch.nn.BatchNorm2d):
+        class _Wrap(torch.nn.Module):
+            def __init__(self, mod):
+                super().__init__()
+                self._rasp = rt_nn.BatchNorm2d(
+                    mod.num_features,
+                    eps=float(mod.eps),
+                    momentum=float(mod.momentum),
+                    affine=bool(mod.affine),
+                    track_running_stats=bool(mod.track_running_stats),
+                )
+                self._rasp.running_mean = mod.running_mean.detach().cpu().numpy().astype(np.float32, copy=True)
+                self._rasp.running_var = mod.running_var.detach().cpu().numpy().astype(np.float32, copy=True)
+                if mod.affine:
+                    assert self._rasp.weight is not None and self._rasp.bias is not None
+                    self._rasp.weight.data[...] = mod.weight.detach().cpu().numpy().astype(np.float32, copy=False)
+                    self._rasp.bias.data[...] = mod.bias.detach().cpu().numpy().astype(np.float32, copy=False)
+                self.train(mod.training)
+
+            def forward(self, x):
+                if device == "gpu":
+                    vk.init(strict=True)
+                self._rasp.train(self.training)
+                out = self._rasp(to_rasptorch(x, device="gpu" if device == "gpu" else "cpu"))
+                return to_torch(out)
+
+        return _Wrap(model)
+
+    if isinstance(model, torch.nn.MaxPool2d):
+        if model.return_indices or model.ceil_mode or model.dilation != 1:
+            raise ValueError("RaspTorch MaxPool2d bridge supports return_indices=False, ceil_mode=False, dilation=1 only")
+
+        class _Wrap(torch.nn.Module):
+            def __init__(self, mod):
+                super().__init__()
+                self._rasp = rt_nn.MaxPool2d(
+                    kernel_size=mod.kernel_size,
+                    stride=mod.stride,
+                    padding=mod.padding,
+                )
+
+            def forward(self, x):
+                if device == "gpu":
+                    vk.init(strict=True)
+                out = self._rasp(to_rasptorch(x, device="gpu" if device == "gpu" else "cpu"))
+                return to_torch(out)
+
+        return _Wrap(model)
+
+    if isinstance(model, torch.nn.Sigmoid):
+        class _Wrap(torch.nn.Module):
+            def forward(self, x):
+                if device == "gpu":
+                    vk.init(strict=True)
+                rx = to_rasptorch(x, device="gpu" if device == "gpu" else "cpu")
+                return to_torch(rx.sigmoid())
+
+        return _Wrap()
+
+    if isinstance(model, torch.nn.Tanh):
+        class _Wrap(torch.nn.Module):
+            def forward(self, x):
+                if device == "gpu":
+                    vk.init(strict=True)
+                rx = to_rasptorch(x, device="gpu" if device == "gpu" else "cpu")
+                return to_torch(rx.tanh())
+
+        return _Wrap()
+
+    if isinstance(model, torch.nn.GELU):
+        class _Wrap(torch.nn.Module):
+            def forward(self, x):
+                if device == "gpu":
+                    vk.init(strict=True)
+                rx = to_rasptorch(x, device="gpu" if device == "gpu" else "cpu")
+                return to_torch(rx.gelu())
+
+        return _Wrap()
+
+    if isinstance(model, torch.nn.Dropout):
+        class _Wrap(torch.nn.Module):
+            def __init__(self, mod):
+                super().__init__()
+                self._rasp = rt_nn.Dropout(p=float(mod.p))
+                self.train(mod.training)
+
+            def forward(self, x):
+                if device == "gpu":
+                    vk.init(strict=True)
+                self._rasp.train(self.training)
+                out = self._rasp(to_rasptorch(x, device="gpu" if device == "gpu" else "cpu"))
+                return to_torch(out)
+
+        return _Wrap(model)
 
     # Fallback: keep module unchanged
     return model

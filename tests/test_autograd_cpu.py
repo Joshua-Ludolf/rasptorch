@@ -1,6 +1,6 @@
 import numpy as np
 
-from rasptorch import Tensor
+from rasptorch import Tensor, cat, stack
 from rasptorch import functional as F
 from rasptorch.nn import Linear
 
@@ -112,3 +112,35 @@ def test_grad_cross_entropy_logits() -> None:
         return float(loss_vec.mean())
 
     np.testing.assert_allclose(logits.grad, _finite_diff_grad(f_logits, logits0), rtol=3e-2, atol=3e-2)
+
+
+def test_grad_permute_flatten_and_unsqueeze() -> None:
+    rng = np.random.default_rng(5)
+    x0 = rng.standard_normal((2, 3, 4), dtype=np.float32)
+    x = Tensor(x0, requires_grad=True)
+    y = x.permute(2, 0, 1).flatten(1).unsqueeze(0).sum()
+    y.backward()
+    np.testing.assert_allclose(x.grad, np.ones_like(x0), rtol=1e-6, atol=1e-6)
+
+
+def test_grad_cat_and_stack() -> None:
+    a0 = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    b0 = np.array([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32)
+
+    a = Tensor(a0, requires_grad=True)
+    b = Tensor(b0, requires_grad=True)
+    y = cat([a, b], dim=0).sum() + stack([a, b], dim=1).sum()
+    y.backward()
+
+    np.testing.assert_allclose(a.grad, np.full_like(a0, 2.0), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(b.grad, np.full_like(b0, 2.0), rtol=1e-6, atol=1e-6)
+
+
+def test_grad_split_and_chunk() -> None:
+    x0 = np.arange(12, dtype=np.float32).reshape(3, 4)
+    x = Tensor(x0, requires_grad=True)
+    a, b = x.split([1, 3], dim=1)
+    c0, c1 = x.chunk(2, dim=0)
+    y = a.sum() + b.sum() + c0.sum() + c1.sum()
+    y.backward()
+    np.testing.assert_allclose(x.grad, np.full_like(x0, 2.0), rtol=1e-6, atol=1e-6)

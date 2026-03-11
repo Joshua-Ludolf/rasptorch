@@ -1,6 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from .tensor import Tensor, Parameter, no_grad, enable_grad, set_grad_enabled, is_grad_enabled
+from .tensor import Tensor, Parameter, cat, stack, no_grad, enable_grad, set_grad_enabled, is_grad_enabled
 from .optim import SGD, Adam, AdamW, RMSProp
 from .optim_sched import StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, ReduceLROnPlateau, WarmupScheduler
 from .amp import autocast, GradScaler
@@ -15,6 +15,8 @@ except PackageNotFoundError:  # pragma: no cover
 __all__ = [
 	"Tensor",
 	"Parameter",
+	"cat",
+	"stack",
 	"no_grad",
 	"enable_grad",
 	"set_grad_enabled",

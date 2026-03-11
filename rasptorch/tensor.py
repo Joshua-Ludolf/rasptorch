@@ -15,6 +15,34 @@ def _is_number(x: object) -> bool:
     return isinstance(x, (int, float, np.floating, np.integer))
 
 
+def _normalize_axes(axis: int | tuple[int, ...] | None, ndim: int) -> tuple[int, ...]:
+    if axis is None:
+        return tuple(range(ndim))
+    axes = (axis,) if isinstance(axis, int) else tuple(axis)
+    normalized = []
+    for ax in axes:
+        ax_int = int(ax)
+        if ax_int < 0:
+            ax_int += ndim
+        if ax_int < 0 or ax_int >= ndim:
+            raise ValueError(f"axis {ax} is out of bounds for tensor with {ndim} dimensions")
+        if ax_int in normalized:
+            raise ValueError(f"duplicate axis {ax}")
+        normalized.append(ax_int)
+    return tuple(normalized)
+
+
+def _normalize_dim(dim: int, ndim: int, *, allow_end: bool = False) -> int:
+    dim_int = int(dim)
+    upper = ndim if allow_end else (ndim - 1)
+    lower = -ndim - (1 if allow_end else 0)
+    if dim_int < lower or dim_int > upper:
+        raise ValueError(f"dim {dim} is out of bounds for tensor with {ndim} dimensions")
+    if dim_int < 0:
+        dim_int += ndim + (1 if allow_end else 0)
+    return dim_int
+
+
 _grad_enabled: bool = True
 
 
@@ -226,6 +254,79 @@ class Tensor:
 
     def reshape(self, *shape: int) -> "Tensor":
         return self.view(*shape)
+
+    def unsqueeze(self, dim: int) -> "Tensor":
+        axis = _normalize_dim(dim, len(self.shape), allow_end=True)
+        out_shape = self.shape[:axis] + (1,) + self.shape[axis:]
+        return self.view(*out_shape)
+
+    def squeeze(self, dim: int | None = None) -> "Tensor":
+        if dim is None:
+            out_shape = tuple(s for s in self.shape if s != 1)
+            if not out_shape:
+                out_shape = ()
+            return self.view(*out_shape)
+
+        axis = _normalize_dim(dim, len(self.shape))
+        if self.shape[axis] != 1:
+            return self
+        out_shape = self.shape[:axis] + self.shape[axis + 1 :]
+        return self.view(*out_shape)
+
+    def permute(self, *dims: int) -> "Tensor":
+        if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
+            dims = tuple(dims[0])  # type: ignore[assignment]
+        if len(dims) != len(self.shape):
+            raise ValueError(f"permute expected {len(self.shape)} dims, got {len(dims)}")
+        axes = tuple(_normalize_dim(dim, len(self.shape)) for dim in dims)
+        if len(set(axes)) != len(axes):
+            raise ValueError("permute dims must be unique")
+
+        track = is_grad_enabled() and self.requires_grad
+        if self.device == "gpu":
+            vk_out = vk.permute(self._as_vkbuf(), axes)
+            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+            out._op = "permute"
+        else:
+            out = Tensor(np.transpose(self.data, axes), requires_grad=track, _children=(self,) if track else None, _op="permute", device=self.device)
+
+        if track:
+            out._prev = {self}
+            inv_axes = tuple(np.argsort(axes))
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    self._accum_grad_vk(vk.permute(out.grad_vkbuf, inv_axes))
+                else:
+                    if out.grad is None:
+                        return
+                    grad_in = np.transpose(out.grad, inv_axes)
+                    self.grad = grad_in if self.grad is None else (self.grad + grad_in)
+
+            out._backward = _backward
+        return out
+
+    def transpose(self, dim0: int, dim1: int) -> "Tensor":
+        ndim = len(self.shape)
+        a = _normalize_dim(dim0, ndim)
+        b = _normalize_dim(dim1, ndim)
+        if a == b:
+            return self
+        order = list(range(ndim))
+        order[a], order[b] = order[b], order[a]
+        return self.permute(order)
+
+    def flatten(self, start_dim: int = 0, end_dim: int = -1) -> "Tensor":
+        ndim = len(self.shape)
+        start = _normalize_dim(start_dim, ndim)
+        end = _normalize_dim(end_dim, ndim)
+        if start > end:
+            raise ValueError(f"flatten expected start_dim <= end_dim, got {start_dim}, {end_dim}")
+        merged = int(np.prod(self.shape[start : end + 1], dtype=np.int64))
+        new_shape = self.shape[:start] + (merged,) + self.shape[end + 1 :]
+        return self.view(*new_shape)
 
     # ------------------------------------------------------------------
     # Autograd core
@@ -546,69 +647,191 @@ class Tensor:
         return out
 
     # Reductions
-    def sum(self) -> "Tensor":
+    def sum(self, axis: int | tuple[int, ...] | None = None) -> "Tensor":
         track = is_grad_enabled() and self.requires_grad
-        if self.device == "gpu":
+        if axis is None and self.device == "gpu":
             vk_out = vk.reduce_sum(self._as_vkbuf())
             out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "sum"
         else:
-            out = Tensor(self.data.sum(), requires_grad=track, _children=(self,) if track else None, _op="sum", device=self.device)
+            out = Tensor(
+                self.numpy().sum(axis=axis),
+                requires_grad=track,
+                _children=(self,) if track else None,
+                _op="sum" if axis is None else "sum_dim",
+                device=self.device,
+            )
 
         if track:
             out._prev = {self}
+            axes = _normalize_axes(axis, len(self.shape))
 
             def _backward() -> None:
                 if out.device == "gpu":
                     if out.grad_vkbuf is None:
                         return
-                    # Broadcast scalar grad to input shape.
-                    out_buf = vk.empty(self.shape)
-                    self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0))
+                    if axis is None:
+                        out_buf = vk.empty(self.shape)
+                        self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0))
+                        return
+                    grad_out = vk.to_cpu(out.grad_vkbuf)
                 else:
                     if out.grad is None:
                         return
-                    grad_broadcast = np.ones_like(self.data, dtype=self.data.dtype) * out.grad
-                    if self.grad is None:
-                        self.grad = grad_broadcast
-                    else:
-                        self.grad = self.grad + grad_broadcast
+                    grad_out = out.grad
+
+                if axis is None:
+                    grad_broadcast = np.ones_like(self.numpy(), dtype=np.float32) * grad_out
+                else:
+                    expanded = grad_out
+                    for ax in sorted(axes):
+                        expanded = np.expand_dims(expanded, axis=ax)
+                    grad_broadcast = np.broadcast_to(expanded, self.shape).astype(np.float32, copy=False)
+                if self.device == "gpu":
+                    self._accum_grad_vk(vk.to_gpu(np.asarray(grad_broadcast, dtype=np.float32)))
+                else:
+                    self.grad = grad_broadcast if self.grad is None else (self.grad + grad_broadcast)
 
             out._backward = _backward
         return out
 
-    def mean(self) -> "Tensor":
+    def mean(self, axis: int | tuple[int, ...] | None = None) -> "Tensor":
         track = is_grad_enabled() and self.requires_grad
-        if self.device == "gpu":
+        if axis is None and self.device == "gpu":
             vk_out = vk.mean(self._as_vkbuf())
             out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "mean"
         else:
-            out = Tensor(self.data.mean(), requires_grad=track, _children=(self,) if track else None, _op="mean", device=self.device)
+            out = Tensor(
+                self.numpy().mean(axis=axis),
+                requires_grad=track,
+                _children=(self,) if track else None,
+                _op="mean" if axis is None else "mean_dim",
+                device=self.device,
+            )
 
         if track:
             out._prev = {self}
+            axes = _normalize_axes(axis, len(self.shape))
+            denom = float(np.prod([self.shape[ax] for ax in axes]))
 
             def _backward() -> None:
                 if out.device == "gpu":
                     if out.grad_vkbuf is None:
                         return
-                    n = float(np.prod(self.shape))
-                    out_buf = vk.empty(self.shape)
-                    self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0 / max(1.0, n)))
+                    if axis is None:
+                        n = float(np.prod(self.shape))
+                        out_buf = vk.empty(self.shape)
+                        self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0 / max(1.0, n)))
+                        return
+                    grad_out = vk.to_cpu(out.grad_vkbuf)
                 else:
                     if out.grad is None:
                         return
-                    grad_broadcast = (
-                        np.ones_like(self.data, dtype=self.data.dtype) * out.grad / self.data.size
-                    )
-                    if self.grad is None:
-                        self.grad = grad_broadcast
-                    else:
-                        self.grad = self.grad + grad_broadcast
+                    grad_out = out.grad
+
+                if axis is None:
+                    grad_broadcast = np.ones_like(self.numpy(), dtype=np.float32) * grad_out / self.data.size
+                else:
+                    expanded = grad_out
+                    for ax in sorted(axes):
+                        expanded = np.expand_dims(expanded, axis=ax)
+                    grad_broadcast = np.broadcast_to(expanded, self.shape).astype(np.float32, copy=False) / max(1.0, denom)
+                if self.device == "gpu":
+                    self._accum_grad_vk(vk.to_gpu(np.asarray(grad_broadcast, dtype=np.float32)))
+                else:
+                    self.grad = grad_broadcast if self.grad is None else (self.grad + grad_broadcast)
 
             out._backward = _backward
         return out
+
+    def max(self, axis: int | None = None) -> "Tensor":
+        x_np = np.asarray(self.numpy(), dtype=np.float32)
+        result = x_np.max(axis=axis)
+        track = is_grad_enabled() and self.requires_grad
+        out = Tensor(result, requires_grad=track, _children=(self,) if track else None, _op="max", device=self.device)
+
+        if track:
+            out._prev = {self}
+            if axis is None:
+                mask = (x_np == result).astype(np.float32)
+                divisor = float(mask.sum())
+            else:
+                expanded = np.expand_dims(result, axis=axis)
+                mask = (x_np == expanded).astype(np.float32)
+                divisor = np.maximum(mask.sum(axis=axis, keepdims=True), 1.0)
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    grad_out = vk.to_cpu(out.grad_vkbuf)
+                else:
+                    if out.grad is None:
+                        return
+                    grad_out = out.grad
+
+                if axis is None:
+                    grad_in = mask * (np.asarray(grad_out, dtype=np.float32) / max(1.0, float(divisor)))
+                else:
+                    grad_in = mask * np.expand_dims(np.asarray(grad_out, dtype=np.float32), axis=axis) / divisor
+                if self.device == "gpu":
+                    self._accum_grad_vk(vk.to_gpu(np.asarray(grad_in, dtype=np.float32)))
+                else:
+                    self.grad = grad_in if self.grad is None else (self.grad + grad_in)
+
+            out._backward = _backward
+        return out
+
+    def min(self, axis: int | None = None) -> "Tensor":
+        x_np = np.asarray(self.numpy(), dtype=np.float32)
+        result = x_np.min(axis=axis)
+        track = is_grad_enabled() and self.requires_grad
+        out = Tensor(result, requires_grad=track, _children=(self,) if track else None, _op="min", device=self.device)
+
+        if track:
+            out._prev = {self}
+            if axis is None:
+                mask = (x_np == result).astype(np.float32)
+                divisor = float(mask.sum())
+            else:
+                expanded = np.expand_dims(result, axis=axis)
+                mask = (x_np == expanded).astype(np.float32)
+                divisor = np.maximum(mask.sum(axis=axis, keepdims=True), 1.0)
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    grad_out = vk.to_cpu(out.grad_vkbuf)
+                else:
+                    if out.grad is None:
+                        return
+                    grad_out = out.grad
+
+                if axis is None:
+                    grad_in = mask * (np.asarray(grad_out, dtype=np.float32) / max(1.0, float(divisor)))
+                else:
+                    grad_in = mask * np.expand_dims(np.asarray(grad_out, dtype=np.float32), axis=axis) / divisor
+                if self.device == "gpu":
+                    self._accum_grad_vk(vk.to_gpu(np.asarray(grad_in, dtype=np.float32)))
+                else:
+                    self.grad = grad_in if self.grad is None else (self.grad + grad_in)
+
+            out._backward = _backward
+        return out
+
+    def argmax(self, axis: int | None = None):
+        result = np.argmax(np.asarray(self.numpy(), dtype=np.float32), axis=axis)
+        if axis is None:
+            return int(result)
+        return np.asarray(result, dtype=np.int64)
+
+    def argmin(self, axis: int | None = None):
+        result = np.argmin(np.asarray(self.numpy(), dtype=np.float32), axis=axis)
+        if axis is None:
+            return int(result)
+        return np.asarray(result, dtype=np.int64)
 
     def _unary_numpy_op(
         self,
@@ -851,6 +1074,93 @@ class Tensor:
 
         return self._unary_numpy_op(op="clamp", forward=_forward, backward=_backward)
 
+    def __getitem__(self, index) -> "Tensor":
+        x_np = np.asarray(self.numpy(), dtype=np.float32)
+        out_np = np.asarray(x_np[index], dtype=np.float32)
+        track = is_grad_enabled() and self.requires_grad
+        out = Tensor(out_np, requires_grad=track, _children=(self,) if track else None, _op="getitem", device=self.device)
+
+        if track:
+            out._prev = {self}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    grad_out = vk.to_cpu(out.grad_vkbuf)
+                else:
+                    if out.grad is None:
+                        return
+                    grad_out = out.grad
+
+                grad_in = np.zeros_like(x_np, dtype=np.float32)
+                np.add.at(grad_in, index, np.asarray(grad_out, dtype=np.float32))
+                if self.device == "gpu":
+                    self._accum_grad_vk(vk.to_gpu(grad_in))
+                else:
+                    self.grad = grad_in if self.grad is None else (self.grad + grad_in)
+
+            out._backward = _backward
+        return out
+
+    def split(self, split_size_or_sections: int | Sequence[int], dim: int = 0) -> tuple["Tensor", ...]:
+        axis = _normalize_dim(dim, len(self.shape))
+        size = self.shape[axis]
+        if isinstance(split_size_or_sections, int):
+            split_size = int(split_size_or_sections)
+            if split_size <= 0:
+                raise ValueError("split_size must be > 0")
+            sections = []
+            start = 0
+            while start < size:
+                stop = min(size, start + split_size)
+                sections.append(stop - start)
+                start = stop
+        else:
+            sections = [int(s) for s in split_size_or_sections]
+            if sum(sections) != size:
+                raise ValueError(f"split sections {sections} do not sum to dimension size {size}")
+            for sec in sections:
+                if sec < 0:
+                    raise ValueError("split sections must be >= 0")
+
+        outputs: list[Tensor] = []
+        if self.device == "gpu":
+            track = is_grad_enabled() and self.requires_grad
+            start = 0
+            vk_parts = vk.split(self._as_vkbuf(), sections, dim=axis)
+            for sec, start_idx, part in zip(sections, np.cumsum([0] + sections[:-1]).tolist(), vk_parts):
+                out = Tensor._from_vkbuf(part, requires_grad=track)
+                out._op = "split"
+                if track:
+                    out._prev = {self}
+
+                    def _backward(out=out, sec=sec, start_idx=start_idx) -> None:
+                        if out.grad_vkbuf is None:
+                            return
+                        self._accum_grad_vk(vk.scatter_slice(out.grad_vkbuf, self.shape, axis, start_idx))
+
+                    out._backward = _backward
+                outputs.append(out)
+            return tuple(outputs)
+
+        start = 0
+        for sec in sections:
+            sl = [slice(None)] * len(self.shape)
+            sl[axis] = slice(start, start + sec)
+            outputs.append(self[tuple(sl)])
+            start += sec
+        return tuple(outputs)
+
+    def chunk(self, chunks: int, dim: int = 0) -> tuple["Tensor", ...]:
+        chunks = int(chunks)
+        if chunks <= 0:
+            raise ValueError("chunks must be > 0")
+        axis = _normalize_dim(dim, len(self.shape))
+        size = self.shape[axis]
+        split_size = int(np.ceil(size / chunks)) if size > 0 else 1
+        return self.split(split_size, dim=axis)
+
     # Utilities
     def numpy(self) -> np.ndarray:
         """Return the underlying NumPy array.
@@ -1010,3 +1320,74 @@ class Parameter(Tensor):
                 return self
             return Parameter(np.empty(self.data.shape, dtype=np.float32), device="gpu", _vkbuf=vk.to_gpu(self.data))
         raise NotImplementedError(f"Unknown device: {device}")
+
+
+def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
+    if not tensors:
+        raise ValueError("cat expects at least one tensor")
+    first = tensors[0]
+    ndim = len(first.shape)
+    axis = _normalize_dim(dim, ndim)
+    base_shape = list(first.shape)
+    for t in tensors[1:]:
+        if len(t.shape) != ndim:
+            raise ValueError("all tensors must have the same rank for cat")
+        for i, (a, b) in enumerate(zip(base_shape, t.shape)):
+            if i != axis and a != b:
+                raise ValueError(f"cat dimension mismatch at dim {i}: {a} != {b}")
+
+    device = "gpu" if any(t.device == "gpu" for t in tensors) else first.device
+    track = is_grad_enabled() and any(t.requires_grad for t in tensors)
+    if device == "gpu":
+        out = Tensor._from_vkbuf(vk.concat([t._as_vkbuf() for t in tensors], dim=axis), requires_grad=track)
+        out._op = "cat"
+    else:
+        arrays = [np.asarray(t.numpy(), dtype=np.float32) for t in tensors]
+        out_np = np.concatenate(arrays, axis=axis)
+        out = Tensor(out_np, requires_grad=track, _children=tuple(tensors) if track else None, _op="cat", device=device)
+
+    if track:
+        out._prev = set(tensors)
+        sizes = [t.shape[axis] for t in tensors]
+
+        def _backward() -> None:
+            if out.device == "gpu":
+                if out.grad_vkbuf is None:
+                    return
+                pieces = vk.split(out.grad_vkbuf, [int(s) for s in sizes], dim=axis)
+                for t, piece in zip(tensors, pieces):
+                    if t.device == "gpu":
+                        t._accum_grad_vk(piece)
+                    else:
+                        grad_piece = vk.to_cpu(piece)
+                        t.grad = grad_piece if t.grad is None else (t.grad + grad_piece)
+                return
+            else:
+                if out.grad is None:
+                    return
+                grad_out = out.grad
+
+            start = 0
+            for t, size in zip(tensors, sizes):
+                sl = [slice(None)] * grad_out.ndim
+                sl[axis] = slice(start, start + size)
+                grad_piece = np.asarray(grad_out[tuple(sl)], dtype=np.float32)
+                if t.device == "gpu":
+                    t._accum_grad_vk(vk.to_gpu(grad_piece))
+                else:
+                    t.grad = grad_piece if t.grad is None else (t.grad + grad_piece)
+                start += size
+
+        out._backward = _backward
+    return out
+
+
+def stack(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
+    if not tensors:
+        raise ValueError("stack expects at least one tensor")
+    first_shape = tensors[0].shape
+    for t in tensors[1:]:
+        if t.shape != first_shape:
+            raise ValueError(f"stack expects equal shapes, got {first_shape} and {t.shape}")
+    axis = _normalize_dim(dim, len(first_shape) + 1, allow_end=True)
+    return cat([t.unsqueeze(axis) for t in tensors], dim=axis)

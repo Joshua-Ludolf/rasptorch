@@ -3,6 +3,7 @@ import pytest
 
 import rasptorch
 from rasptorch import Tensor
+from rasptorch import cat
 from rasptorch import functional as F
 from rasptorch import vulkan_backend as vk
 from rasptorch.nn import LayerNorm
@@ -117,3 +118,34 @@ def test_no_grad_and_detach_on_gpu_block_grads() -> None:
     loss.backward()
     assert w.grad is None
     assert w.grad_vkbuf is None
+
+
+def test_gpu_shape_join_ops_do_not_require_cpu_readback(monkeypatch) -> None:
+    orig_to_cpu = vk.to_cpu
+
+    def _fail_to_cpu(*args, **kwargs):
+        raise AssertionError("unexpected CPU readback")
+
+    monkeypatch.setattr(vk, "to_cpu", _fail_to_cpu)
+    try:
+        x = Tensor(np.arange(24, dtype=np.float32).reshape(2, 3, 4), requires_grad=True).to("gpu")
+        y = x.permute(2, 0, 1)
+        assert y.device == "gpu"
+        assert y.shape == (4, 2, 3)
+
+        a = Tensor(np.arange(6, dtype=np.float32).reshape(2, 3), requires_grad=True).to("gpu")
+        b = Tensor((np.arange(6, dtype=np.float32) + 10).reshape(2, 3), requires_grad=True).to("gpu")
+        z = cat([a, b], dim=0)
+        assert z.device == "gpu"
+        assert z.shape == (4, 3)
+
+        s0, s1 = z.split([1, 3], dim=0)
+        assert s0.device == "gpu" and s1.device == "gpu"
+        loss = y.sum() + z.sum() + s0.sum() + s1.sum()
+        loss.backward()
+
+        assert x.grad_vkbuf is not None
+        assert a.grad_vkbuf is not None
+        assert b.grad_vkbuf is not None
+    finally:
+        monkeypatch.setattr(vk, "to_cpu", orig_to_cpu)

@@ -38,6 +38,15 @@ def _accum_tensor_grad(tensor: Tensor, grad: np.ndarray) -> None:
         tensor.grad = grad_np if tensor.grad is None else (tensor.grad + grad_np)
 
 
+def _pair(value: int | Sequence[int]) -> tuple[int, int]:
+    if isinstance(value, Sequence):
+        if len(value) != 2:
+            raise ValueError("expected int or length-2 sequence")
+        return int(value[0]), int(value[1])
+    v = int(value)
+    return v, v
+
+
 def _batchnorm_forward(module: Module, x: Tensor, reduce_axes: tuple[int, ...], op_name: str) -> Tensor:
     x_np = np.asarray(x.numpy(), dtype=np.float32)
     stat_shape = [1] * x_np.ndim
@@ -585,6 +594,141 @@ class Dropout(Module):
         return x * m
 
 
+class MaxPool2d(Module):
+    def __init__(
+        self,
+        kernel_size: int | Sequence[int],
+        stride: int | Sequence[int] | None = None,
+        padding: int | Sequence[int] = 0,
+    ) -> None:
+        super().__init__()
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(self.kernel_size if stride is None else stride)
+        self.padding = _pair(padding)
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        if len(x.shape) != 4:
+            raise ValueError(f"MaxPool2d expects shape [N,C,H,W], got {x.shape}")
+
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        ph, pw = self.padding
+        if kh <= 0 or kw <= 0 or sh <= 0 or sw <= 0:
+            raise ValueError("kernel_size and stride must be > 0")
+
+        x_np = np.asarray(x.numpy(), dtype=np.float32)
+        x_pad = np.pad(x_np, ((0, 0), (0, 0), (ph, ph), (pw, pw)), mode="constant", constant_values=-np.inf)
+        n, c, hp, wp = x_pad.shape
+        oh = (hp - kh) // sh + 1
+        ow = (wp - kw) // sw + 1
+
+        out_np = np.empty((n, c, oh, ow), dtype=np.float32)
+        max_idx = np.empty((n, c, oh, ow), dtype=np.int64)
+        for i in range(oh):
+            hs = i * sh
+            for j in range(ow):
+                ws = j * sw
+                window = x_pad[:, :, hs : hs + kh, ws : ws + kw].reshape(n, c, kh * kw)
+                idx = np.argmax(window, axis=2)
+                out_np[:, :, i, j] = np.take_along_axis(window, idx[:, :, None], axis=2)[:, :, 0]
+                max_idx[:, :, i, j] = idx
+
+        track = is_grad_enabled() and x.requires_grad
+        out = _make_tensor_from_np(out_np, device=x.device, requires_grad=track, op="max_pool2d")
+        if not track:
+            return out
+
+        out._prev = {x}
+
+        def _backward() -> None:
+            grad_out = _grad_from_output(out)
+            if grad_out is None:
+                return
+
+            dx_pad = np.zeros_like(x_pad, dtype=np.float32)
+            n_idx = np.arange(n)[:, None]
+            c_idx = np.arange(c)[None, :]
+            for i in range(oh):
+                hs = i * sh
+                for j in range(ow):
+                    ws = j * sw
+                    idx = max_idx[:, :, i, j]
+                    np.add.at(
+                        dx_pad,
+                        (n_idx, c_idx, hs + (idx // kw), ws + (idx % kw)),
+                        grad_out[:, :, i, j],
+                    )
+
+            dx = dx_pad[:, :, ph : ph + x.shape[2], pw : pw + x.shape[3]]
+            _accum_tensor_grad(x, dx)
+
+        out._backward = _backward
+        return out
+
+
+class AvgPool2d(Module):
+    def __init__(
+        self,
+        kernel_size: int | Sequence[int],
+        stride: int | Sequence[int] | None = None,
+        padding: int | Sequence[int] = 0,
+    ) -> None:
+        super().__init__()
+        self.kernel_size = _pair(kernel_size)
+        self.stride = _pair(self.kernel_size if stride is None else stride)
+        self.padding = _pair(padding)
+
+    def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
+        if len(x.shape) != 4:
+            raise ValueError(f"AvgPool2d expects shape [N,C,H,W], got {x.shape}")
+
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        ph, pw = self.padding
+        if kh <= 0 or kw <= 0 or sh <= 0 or sw <= 0:
+            raise ValueError("kernel_size and stride must be > 0")
+
+        x_np = np.asarray(x.numpy(), dtype=np.float32)
+        x_pad = np.pad(x_np, ((0, 0), (0, 0), (ph, ph), (pw, pw)), mode="constant", constant_values=0.0)
+        n, c, hp, wp = x_pad.shape
+        oh = (hp - kh) // sh + 1
+        ow = (wp - kw) // sw + 1
+
+        out_np = np.empty((n, c, oh, ow), dtype=np.float32)
+        for i in range(oh):
+            hs = i * sh
+            for j in range(ow):
+                ws = j * sw
+                window = x_pad[:, :, hs : hs + kh, ws : ws + kw]
+                out_np[:, :, i, j] = window.mean(axis=(2, 3))
+
+        track = is_grad_enabled() and x.requires_grad
+        out = _make_tensor_from_np(out_np, device=x.device, requires_grad=track, op="avg_pool2d")
+        if not track:
+            return out
+
+        out._prev = {x}
+        scale = 1.0 / float(kh * kw)
+
+        def _backward() -> None:
+            grad_out = _grad_from_output(out)
+            if grad_out is None:
+                return
+
+            dx_pad = np.zeros_like(x_pad, dtype=np.float32)
+            for i in range(oh):
+                hs = i * sh
+                for j in range(ow):
+                    ws = j * sw
+                    dx_pad[:, :, hs : hs + kh, ws : ws + kw] += grad_out[:, :, i : i + 1, j : j + 1] * scale
+
+            dx = dx_pad[:, :, ph : ph + x.shape[2], pw : pw + x.shape[3]]
+            _accum_tensor_grad(x, dx)
+
+        out._backward = _backward
+        return out
+
+
 class LayerNorm(Module):
     """LayerNorm over the last N dimensions.
 
@@ -618,7 +762,7 @@ class LayerNorm(Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
-        if x.device == "gpu":
+        if x.device == "gpu" and abs(self.eps - 1e-5) <= 1e-12:
             if len(self.normalized_shape) != 1:
                 raise NotImplementedError("LayerNorm GPU path currently supports 1D normalized_shape only")
             if len(x.shape) != 2:
@@ -627,8 +771,6 @@ class LayerNorm(Module):
                 raise ValueError(
                     f"LayerNorm normalized_shape mismatch: expected trailing {self.normalized_shape}, got {tuple(x.shape)}"
                 )
-            if abs(self.eps - 1e-5) > 1e-12:
-                raise NotImplementedError("LayerNorm GPU path currently supports eps=1e-5 only")
 
             track = is_grad_enabled() and (
                 x.requires_grad
@@ -693,8 +835,7 @@ class LayerNorm(Module):
             b = self.bias.numpy().reshape((1,) * (xhat.ndim - len(self.normalized_shape)) + self.normalized_shape)
             y = y + b
 
-        out = Tensor(y.astype(np.float32, copy=False), requires_grad=track, device="cpu")
-        out._op = "layer_norm"
+        out = _make_tensor_from_np(y.astype(np.float32, copy=False), device=x.device, requires_grad=track, op="layer_norm")
         if not track:
             return out
 
@@ -705,9 +846,10 @@ class LayerNorm(Module):
         param_axes = tuple(range(0, xhat.ndim - len(self.normalized_shape)))
 
         def _backward() -> None:
-            if out.grad is None:
+            grad_out = _grad_from_output(out)
+            if grad_out is None:
                 return
-            dy = out.grad
+            dy = grad_out
 
             # grads for affine
             dxhat = dy
@@ -715,18 +857,18 @@ class LayerNorm(Module):
                 w_b = w  # broadcasted
                 if self.weight.requires_grad:
                     dgamma = (dy * xhat).sum(axis=param_axes, keepdims=False)
-                    self.weight.grad = dgamma if self.weight.grad is None else (self.weight.grad + dgamma)
+                    _accum_tensor_grad(self.weight, dgamma)
                 dxhat = dy * w_b
             if self.bias is not None and self.bias.requires_grad:
                 dbeta = dy.sum(axis=param_axes, keepdims=False)
-                self.bias.grad = dbeta if self.bias.grad is None else (self.bias.grad + dbeta)
+                _accum_tensor_grad(self.bias, dbeta)
 
             if x.requires_grad:
                 # dx = (1/N)*invstd*(N*dxhat - sum(dxhat) - xhat*sum(dxhat*xhat))
                 sum1 = dxhat.sum(axis=axes, keepdims=True)
                 sum2 = (dxhat * xhat).sum(axis=axes, keepdims=True)
                 dx = (invstd / max(N, 1.0)) * (dxhat * N - sum1 - xhat * sum2)
-                x.grad = dx if x.grad is None else (x.grad + dx)
+                _accum_tensor_grad(x, dx)
 
         out._backward = _backward
         return out
@@ -988,15 +1130,6 @@ class GRU(Module):
         init_ops.xavier_uniform_(self.weight_hh_l0)
 
     def forward(self, x: Tensor, h0: Tensor | None = None):
-        if is_grad_enabled() and (
-            x.requires_grad
-            or self.weight_ih_l0.requires_grad
-            or self.weight_hh_l0.requires_grad
-            or self.bias_ih_l0.requires_grad
-            or self.bias_hh_l0.requires_grad
-        ):
-            raise NotImplementedError("GRU autograd is not implemented yet; use it under no_grad() or with detached inputs")
-
         if len(x.shape) != 3:
             raise ValueError(f"GRU expects a 3D input, got {x.shape}")
 
@@ -1023,8 +1156,10 @@ class GRU(Module):
         b_hh = self.bias_hh_l0.numpy()
 
         outputs = []
+        cache: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         for t in range(seq_len):
             xt = x_np[:, t, :]
+            h_prev = h.copy()
             gi = xt @ w_ih.T + b_ih
             gh = h @ w_hh.T + b_hh
             i_r, i_z, i_n = np.split(gi, 3, axis=1)
@@ -1034,6 +1169,7 @@ class GRU(Module):
             n = np.tanh(i_n + r * h_n)
             h = (1.0 - z) * n + z * h
             outputs.append(h.copy())
+            cache.append((xt, h_prev, r, z, n, h_n))
 
         output_np = np.stack(outputs, axis=1)
         if not self.batch_first:
@@ -1041,6 +1177,93 @@ class GRU(Module):
         h_n = h.reshape(1, batch_size, self.hidden_size)
 
         device = x.device if x.device == "gpu" or self.weight_ih_l0.device == "gpu" else "cpu"
-        output = _make_tensor_from_np(output_np, device=device, requires_grad=False, op="gru")
-        hidden = _make_tensor_from_np(h_n, device=device, requires_grad=False, op="gru_hidden")
+        track = is_grad_enabled() and (
+            x.requires_grad
+            or (h0 is not None and h0.requires_grad)
+            or self.weight_ih_l0.requires_grad
+            or self.weight_hh_l0.requires_grad
+            or self.bias_ih_l0.requires_grad
+            or self.bias_hh_l0.requires_grad
+        )
+        output = _make_tensor_from_np(output_np, device=device, requires_grad=track, op="gru")
+        hidden = _make_tensor_from_np(h_n, device=device, requires_grad=track, op="gru_hidden")
+
+        if track:
+            parents = {x}
+            if h0 is not None:
+                parents.add(h0)
+            output._prev = parents
+            hidden._prev = parents
+
+            def _accumulate_grads(grad_output: np.ndarray | None, grad_hidden: np.ndarray | None) -> None:
+                local_grad_output = (
+                    np.zeros((batch_size, seq_len, self.hidden_size), dtype=np.float32)
+                    if grad_output is None
+                    else np.asarray(grad_output, dtype=np.float32)
+                )
+                if not self.batch_first:
+                    local_grad_output = np.transpose(local_grad_output, (1, 0, 2))
+                dh_next = np.zeros((batch_size, self.hidden_size), dtype=np.float32)
+                if grad_hidden is not None:
+                    dh_next = dh_next + np.asarray(grad_hidden, dtype=np.float32)[0]
+
+                dx = np.zeros_like(x_np, dtype=np.float32)
+                dw_ih = np.zeros_like(w_ih, dtype=np.float32)
+                dw_hh = np.zeros_like(w_hh, dtype=np.float32)
+                db_ih = np.zeros_like(b_ih, dtype=np.float32)
+                db_hh = np.zeros_like(b_hh, dtype=np.float32)
+
+                for t in range(seq_len - 1, -1, -1):
+                    xt, h_prev, r, z, n, h_n_part = cache[t]
+                    dh = dh_next + local_grad_output[:, t, :]
+                    dz = (h_prev - n) * dh
+                    dn = (1.0 - z) * dh
+                    dh_carry = z * dh
+
+                    d_inner_n = (1.0 - n ** 2) * dn
+                    di_n = d_inner_n
+                    dh_n = r * d_inner_n
+                    dr = h_n_part * d_inner_n
+
+                    d_inner_z = z * (1.0 - z) * dz
+                    di_z = d_inner_z
+                    dh_z = d_inner_z
+
+                    d_inner_r = r * (1.0 - r) * dr
+                    di_r = d_inner_r
+                    dh_r = d_inner_r
+
+                    dgi = np.concatenate([di_r, di_z, di_n], axis=1)
+                    dgh = np.concatenate([dh_r, dh_z, dh_n], axis=1)
+
+                    dx[:, t, :] = dgi @ w_ih
+                    dw_ih += dgi.T @ xt
+                    dw_hh += dgh.T @ h_prev
+                    db_ih += dgi.sum(axis=0)
+                    db_hh += dgh.sum(axis=0)
+                    dh_next = dh_carry + dgh @ w_hh
+
+                dx_out = dx if self.batch_first else np.transpose(dx, (1, 0, 2))
+                _accum_tensor_grad(x, dx_out)
+                if h0 is not None:
+                    _accum_tensor_grad(h0, dh_next.reshape(1, batch_size, self.hidden_size))
+                _accum_tensor_grad(self.weight_ih_l0, dw_ih)
+                _accum_tensor_grad(self.weight_hh_l0, dw_hh)
+                _accum_tensor_grad(self.bias_ih_l0, db_ih)
+                _accum_tensor_grad(self.bias_hh_l0, db_hh)
+
+            def _backward_output() -> None:
+                grad_output = _grad_from_output(output)
+                if grad_output is None:
+                    return
+                _accumulate_grads(grad_output, None)
+
+            def _backward_hidden() -> None:
+                grad_hidden = _grad_from_output(hidden)
+                if grad_hidden is None:
+                    return
+                _accumulate_grads(None, grad_hidden)
+
+            output._backward = _backward_output
+            hidden._backward = _backward_hidden
         return output, hidden

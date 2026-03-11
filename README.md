@@ -19,11 +19,12 @@ High-level highlights:
 
 - Elementwise ops: `+`, `*`, `-`, `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu` (plus scalar variants)
 - Matmul: `@` (tiled/shared-memory shader)
-- Reductions: `sum`, `mean`
+- Tensor helpers: indexing/slicing via `tensor[...]`, `unsqueeze`, `squeeze`, `permute`, `transpose`, `flatten`, `max`, `min`, `argmax`, `argmin`, `cat`, `stack`, `split`, `chunk`
+- Reductions: `sum`, `mean` (global and axis-based on CPU; global on GPU)
 - Common broadcast forms: `(N,M) + (M,)` and `(N,M) * (M,)`
 - Losses: `cross_entropy`, `binary_cross_entropy`, `binary_cross_entropy_with_logits`, `nll_loss`, `smooth_l1_loss`, `label_smoothing_cross_entropy`
 - Optimizers and training utilities: `SGD`, `Adam`, `AdamW`, `RMSProp`, LR schedulers, gradient clipping, regularization helpers
-- NN essentials: GPU row-wise `softmax` / `log_softmax`, 2D `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, and GRU forward inference
+- NN essentials: GPU row-wise `softmax` / `log_softmax`, 2D `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, `MaxPool2d`, `AvgPool2d`, and `GRU`
 
 Performance notes:
 
@@ -137,13 +138,23 @@ Currently supported (GPU) in autograd:
 - `+`, `*`, `-` (scalar and tensor forms), `@` (matmul)
 - scalar ops: `tensor + s`, `tensor * s`, `tensor / s`, plus `s + tensor`, `s * tensor`, `s - tensor`
 - `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu`, `sum`, `mean`, `T` (2D transpose)
+- tensor shape/join helpers: `unsqueeze`, `squeeze`, `flatten`, `permute` (common tensors up to 4D), `transpose(dim0, dim1)`, `cat`, `stack`, `split`, `chunk`
 - `functional.softmax` / `functional.log_softmax` (2D row-wise, `dim=-1/1`)
-- `nn.LayerNorm` (2D inputs, 1D `normalized_shape`, `eps=1e-5`)
+- `nn.LayerNorm` (2D inputs, 1D `normalized_shape`; `eps=1e-5` stays on GPU, other `eps` values fall back to CPU)
 - `nn.BatchNorm1d`, `nn.BatchNorm2d`, `nn.Embedding`, `nn.MultiheadAttention`
 - `Linear` backward (GPU grads for `weight`/`bias`)
 - `SGD.step()` updates GPU parameters in-place (SGD + optional momentum/weight decay)
 - `Adam.step()`, `AdamW.step()`, `RMSProp.step()` update GPU parameters in-place
 - `functional.cross_entropy(logits, target_onehot)` (softmax cross-entropy, mean reduction)
+
+Also available on the CPU autograd path:
+
+- `GRU` backward
+- `Tensor.__getitem__` / slicing
+- axis-based `sum(axis=...)` / `mean(axis=...)`
+- `max(axis=...)` / `min(axis=...)` with autograd
+- `argmax(axis=...)` / `argmin(axis=...)`
+- `nn.MaxPool2d` / `nn.AvgPool2d`
 
 Also available across the library:
 
@@ -214,9 +225,21 @@ Regularization and gradient helpers:
 
 - `rasptorch.utils`: `clip_grad_norm_`, `clip_grad_value_`, `l1_regularization`, `l2_regularization`, `total_variation_loss`
 
+Tensor helpers:
+
+- `Tensor.unsqueeze()`, `Tensor.squeeze()`, `Tensor.permute()`, `Tensor.transpose()`, `Tensor.flatten()`
+- `Tensor.split()`, `Tensor.chunk()`
+- `rasptorch.cat(...)`, `rasptorch.stack(...)`
+
+GPU notes for tensor helpers:
+
+- `unsqueeze`, `squeeze`, and `flatten` are view-based on GPU
+- `cat`, `stack`, `split`, and `chunk` now use Vulkan device-to-device buffer copies
+- `permute` / general `transpose(dim0, dim1)` are Vulkan-native for common tensors up to 4D
+
 More modules:
 
-- `rasptorch.nn`: `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, `GRU`, `GELU`, `SiLU`, `LeakyReLU`, `ELU`
+- `rasptorch.nn`: `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, `GRU`, `MaxPool2d`, `AvgPool2d`, `GELU`, `SiLU`, `LeakyReLU`, `ELU`
 
 Mixed precision surface:
 
@@ -239,11 +262,12 @@ If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
 
 - GPU autograd is still **incomplete**. Core MLP/classification paths are covered, but full PyTorch-like operator coverage is not there yet.
 - Some newer APIs use CPU-backed math internally when no dedicated Vulkan/autograd kernel exists yet. The public API works, but not every path is fully GPU-native.
-- `GRU` currently supports forward/inference use; GRU autograd is not implemented yet.
+- The newer GPU-native tensor helper coverage is strongest for practical tensors up to 4D; generic higher-rank permutation is not on a dedicated Vulkan path yet.
+- `GRU` autograd is currently CPU-backed; there is no dedicated Vulkan GRU autograd path yet.
 - The mixed-precision API surface exists, but true fp16 Vulkan storage/compute kernels are not implemented yet. `autocast()` and `GradScaler` are currently preparatory/experimental.
-- GPU reductions now support `sum()` and `mean()`, but other reductions/broadcast patterns are still limited.
+- GPU reductions still focus on the common paths: global `sum()` / `mean()` are GPU-native, while axis-based reductions currently fall back to CPU.
 - PyTorch integration is experimental: `rasptorch.torch_bridge` currently supports a small inference subset
-  (Conv2d/Linear/ReLU) and may copy tensors CPU<->GPU.
+  (`Conv2d`, `Linear`, `ReLU`, `BatchNorm2d`, `MaxPool2d`, `Sigmoid`, `Tanh`, `GELU`, `Dropout`) and may copy tensors CPU<->GPU.
 
 ## Development & Tests
 

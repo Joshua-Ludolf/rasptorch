@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufIn { float x[]; } bufin;
+layout(set = 0, binding = 1, std430) writeonly buffer BufOut { float y[]; } bufout;
+
+layout(push_constant) uniform Push {
+    uvec4 meta;
+    uvec4 out_dims;
+    uvec4 in_strides;
+    uvec4 perm;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint ndim = pc.meta.x;
+
+    uint total = 1u;
+    for (uint i = 0u; i < ndim; ++i) {
+        total *= pc.out_dims[i];
+    }
+    if (idx >= total) return;
+
+    uint rem = idx;
+    uint src_idx = 0u;
+
+    for (uint i = 0u; i < ndim; ++i) {
+        uint out_stride = 1u;
+        for (uint j = i + 1u; j < ndim; ++j) {
+            out_stride *= pc.out_dims[j];
+        }
+        uint coord = rem / out_stride;
+        rem = rem % out_stride;
+        src_idx += coord * pc.in_strides[pc.perm[i]];
+    }
+
+    bufout.y[idx] = bufin.x[src_idx];
+}

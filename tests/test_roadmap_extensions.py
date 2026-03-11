@@ -8,7 +8,7 @@ from rasptorch import Tensor
 from rasptorch import functional as F
 from rasptorch import init as rt_init
 from rasptorch import utils
-from rasptorch.nn import BatchNorm1d, BatchNorm2d, ELU, Embedding, GELU, GRU, LeakyReLU, MultiheadAttention, SiLU
+from rasptorch.nn import AvgPool2d, BatchNorm1d, BatchNorm2d, ELU, Embedding, GELU, GRU, LayerNorm, LeakyReLU, MaxPool2d, MultiheadAttention, SiLU
 from rasptorch.optim import Adam, AdamW, RMSProp, SGD
 from rasptorch.optim_sched import CosineAnnealingLR, ExponentialLR, MultiStepLR, ReduceLROnPlateau, StepLR, WarmupScheduler
 from rasptorch import vulkan_backend as vk
@@ -243,8 +243,15 @@ def test_gru_forward_and_autograd_limit() -> None:
     assert hidden.shape == (1, 2, 5)
 
     x_req = Tensor(np.ones((2, 4, 3), dtype=np.float32), requires_grad=True)
-    with pytest.raises(NotImplementedError):
-        gru(x_req)
+    out2, hidden2 = gru(x_req)
+    loss = out2.sum() + hidden2.sum()
+    loss.backward()
+
+    assert x_req.grad is not None and x_req.grad.shape == x_req.shape
+    assert gru.weight_ih_l0.grad is not None and gru.weight_ih_l0.grad.shape == gru.weight_ih_l0.shape
+    assert gru.weight_hh_l0.grad is not None and gru.weight_hh_l0.grad.shape == gru.weight_hh_l0.shape
+    assert gru.bias_ih_l0.grad is not None and gru.bias_ih_l0.grad.shape == gru.bias_ih_l0.shape
+    assert gru.bias_hh_l0.grad is not None and gru.bias_hh_l0.grad.shape == gru.bias_hh_l0.shape
 
 
 def test_amp_scaler_and_cast_helpers() -> None:
@@ -263,3 +270,76 @@ def test_amp_scaler_and_cast_helpers() -> None:
     with rasptorch.amp.autocast("float16"):
         assert rasptorch.amp.get_compute_dtype() == "float16"
     assert rasptorch.amp.get_compute_dtype() == "float32"
+
+
+def test_tensor_indexing_reductions_and_extrema() -> None:
+    x = Tensor(np.array([[1.0, 3.0, 2.0], [4.0, -1.0, 5.0]], dtype=np.float32), requires_grad=True)
+    y = x[1:, 1:]
+    np.testing.assert_allclose(y.numpy(), np.array([[-1.0, 5.0]], dtype=np.float32))
+
+    loss = y.sum()
+    loss.backward()
+    np.testing.assert_allclose(
+        x.grad,
+        np.array([[0.0, 0.0, 0.0], [0.0, 1.0, 1.0]], dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    x2 = Tensor(np.array([[1.0, 3.0, 2.0], [4.0, -1.0, 5.0]], dtype=np.float32), requires_grad=True)
+    s = x2.sum(axis=1)
+    m = x2.mean(axis=0)
+    z = s.sum() + m.sum()
+    z.backward()
+    expected = np.ones_like(x2.numpy(), dtype=np.float32) + np.full_like(x2.numpy(), 0.5, dtype=np.float32)
+    np.testing.assert_allclose(x2.grad, expected, rtol=1e-6, atol=1e-6)
+
+    x3 = Tensor(np.array([[1.0, 3.0, 3.0], [4.0, -1.0, 5.0]], dtype=np.float32), requires_grad=True)
+    max_loss = x3.max(axis=1).sum()
+    min_loss = x3.min()
+    (max_loss + min_loss).backward()
+    np.testing.assert_allclose(
+        x3.grad,
+        np.array([[0.0, 0.5, 0.5], [0.0, 1.0, 1.0]], dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert x3.argmax() == 5
+    np.testing.assert_array_equal(x3.argmin(axis=1), np.array([0, 1], dtype=np.int64))
+
+
+def test_pooling_layers_forward_and_backward() -> None:
+    x_max = Tensor(np.array([[[[1.0, 3.0], [2.0, 4.0]]]], dtype=np.float32), requires_grad=True)
+    max_pool = MaxPool2d(2)
+    y_max = max_pool(x_max)
+    np.testing.assert_allclose(y_max.numpy(), np.array([[[[4.0]]]], dtype=np.float32), rtol=1e-6, atol=1e-6)
+    y_max.sum().backward()
+    np.testing.assert_allclose(
+        x_max.grad,
+        np.array([[[[0.0, 0.0], [0.0, 1.0]]]], dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+    x_avg = Tensor(np.array([[[[1.0, 3.0], [2.0, 4.0]]]], dtype=np.float32), requires_grad=True)
+    avg_pool = AvgPool2d(2)
+    y_avg = avg_pool(x_avg)
+    np.testing.assert_allclose(y_avg.numpy(), np.array([[[[2.5]]]], dtype=np.float32), rtol=1e-6, atol=1e-6)
+    y_avg.sum().backward()
+    np.testing.assert_allclose(
+        x_avg.grad,
+        np.full((1, 1, 2, 2), 0.25, dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_layernorm_gpu_falls_back_for_nondefault_eps() -> None:
+    x = Tensor(np.array([[1.0, 2.0, 3.0], [0.5, 1.5, -0.5]], dtype=np.float32), requires_grad=True).to("gpu")
+    ln = LayerNorm(3, eps=1e-4).to("gpu")
+    y = ln(x)
+    y.sum().backward()
+
+    assert y.shape == x.shape
+    np.testing.assert_allclose(y.numpy().mean(axis=1), np.zeros((2,), dtype=np.float32), atol=1e-4)
+    assert x.grad_vkbuf is not None

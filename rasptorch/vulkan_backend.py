@@ -149,6 +149,7 @@ class _VulkanContext:
         self.p_layernorm2d_backward: Optional[_Pipeline] = None
 
         # Lazy-created extension kernels so startup does not require compiling them.
+        self.p_permute_nd: Optional[_Pipeline] = None
         self.p_gelu: Optional[_Pipeline] = None
         self.p_gelu_backward: Optional[_Pipeline] = None
         self.p_silu: Optional[_Pipeline] = None
@@ -1697,6 +1698,267 @@ def view(buf: VulkanBuffer, shape: tuple[int, ...]) -> VulkanBuffer:
         base=base,
         refcount=1,
     )
+
+
+def _normalize_dim(dim: int, ndim: int, *, allow_end: bool = False) -> int:
+    dim_int = int(dim)
+    upper = ndim if allow_end else (ndim - 1)
+    lower = -ndim - (1 if allow_end else 0)
+    if dim_int < lower or dim_int > upper:
+        raise ValueError(f"dim {dim} is out of bounds for tensor with {ndim} dimensions")
+    if dim_int < 0:
+        dim_int += ndim + (1 if allow_end else 0)
+    return dim_int
+
+
+def _copy_buffer_region(
+    dst: VulkanBuffer,
+    dst_elem_offset: int,
+    src: VulkanBuffer,
+    src_elem_offset: int,
+    elem_count: int,
+) -> None:
+    if elem_count <= 0:
+        return
+
+    if not _ensure_vulkan_or_numpy(src, None) or not _ensure_vulkan_or_numpy(dst, None):
+        if dst.host is None:
+            dst.host = np.empty(dst.shape, dtype=np.float32)
+        src_host = src.host if src.host is not None else np.zeros(src.shape, dtype=np.float32)
+        src_flat = np.asarray(src_host, dtype=np.float32).reshape(-1)
+        dst_flat = np.asarray(dst.host, dtype=np.float32).reshape(-1)
+        dst_flat[dst_elem_offset : dst_elem_offset + elem_count] = src_flat[src_elem_offset : src_elem_offset + elem_count]
+        return
+
+    ctx = _ctx()
+    assert ctx.command_buffer is not None
+    region = VkBufferCopy(
+        srcOffset=int(src_elem_offset * 4),
+        dstOffset=int(dst_elem_offset * 4),
+        size=int(elem_count * 4),
+    )
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdCopyBuffer(ctx.command_buffer, src.buffer, dst.buffer, 1, [region])
+    ctx._end_commands()
+
+
+def permute(buf: VulkanBuffer, dims: tuple[int, ...]) -> VulkanBuffer:
+    ndim = len(buf.shape)
+    if len(dims) != ndim:
+        raise ValueError(f"permute expected {ndim} dims, got {len(dims)}")
+    axes = tuple(_normalize_dim(dim, ndim) for dim in dims)
+    if len(set(axes)) != ndim:
+        raise ValueError("permute dims must be unique")
+    if axes == tuple(range(ndim)):
+        return view(buf, buf.shape)
+    if ndim <= 1:
+        return view(buf, buf.shape)
+
+    if not _ensure_vulkan_or_numpy(buf, None):
+        src = buf.host if buf.host is not None else np.zeros(buf.shape, dtype=np.float32)
+        return _fallback_buf(np.transpose(src, axes))
+
+    if ndim == 2 and axes == (1, 0):
+        return transpose2d(buf)
+
+    if ndim > 4:
+        return _fallback_buf(np.transpose(to_cpu(buf), axes))
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    if ctx.p_permute_nd is None:
+        ctx.p_permute_nd = ctx._create_pipeline_vec2_pc64("permute_nd")
+
+    out_shape = tuple(buf.shape[ax] for ax in axes)
+    out = empty(out_shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_permute_nd)
+    infos = [
+        VkDescriptorBufferInfo(buffer=buf.buffer, offset=0, range=buf.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    in_strides = []
+    stride = 1
+    for size in reversed(buf.shape):
+        in_strides.append(stride)
+        stride *= int(size)
+    in_strides = list(reversed(in_strides))
+    out_dims = list(out_shape) + [1] * (4 - ndim)
+    in_strides = in_strides + [1] * (4 - ndim)
+    perm_arr = list(axes) + [0] * (4 - ndim)
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new(
+        "uint32_t[16]",
+        [int(ndim), 0, 0, 0, *[int(v) for v in out_dims], *[int(v) for v in in_strides], *[int(v) for v in perm_arr]],
+    )
+    n = int(np.prod(out_shape))
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_permute_nd.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_permute_nd.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_permute_nd.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        64,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
+    return out
+
+
+def concat(buffers: list[VulkanBuffer], dim: int = 0) -> VulkanBuffer:
+    if not buffers:
+        raise ValueError("concat expects at least one buffer")
+    ndim = len(buffers[0].shape)
+    axis = _normalize_dim(dim, ndim)
+    shape0 = buffers[0].shape
+    for buf in buffers[1:]:
+        if len(buf.shape) != ndim:
+            raise ValueError("all buffers must have the same rank for concat")
+        for i, (a, b) in enumerate(zip(shape0, buf.shape)):
+            if i != axis and a != b:
+                raise ValueError(f"concat mismatch at dim {i}: {a} != {b}")
+
+    if not all(_ensure_vulkan_or_numpy(buf, None) for buf in buffers):
+        arrays = [(buf.host if buf.host is not None else np.zeros(buf.shape, dtype=np.float32)) for buf in buffers]
+        return _fallback_buf(np.concatenate(arrays, axis=axis))
+
+    out_shape = list(shape0)
+    out_shape[axis] = sum(buf.shape[axis] for buf in buffers)
+    out = empty(tuple(out_shape))
+    outer = int(np.prod(shape0[:axis])) if axis > 0 else 1
+    inner = int(np.prod(shape0[axis + 1 :])) if axis + 1 < ndim else 1
+    out_axis = int(out_shape[axis])
+
+    begin_batch()
+    try:
+        for outer_idx in range(outer):
+            running = 0
+            for buf in buffers:
+                axis_size = int(buf.shape[axis])
+                block = axis_size * inner
+                src_base = outer_idx * axis_size * inner
+                dst_base = outer_idx * out_axis * inner + running * inner
+                _copy_buffer_region(out, dst_base, buf, src_base, block)
+                running += axis_size
+    finally:
+        end_batch()
+    return out
+
+
+def split(buf: VulkanBuffer, sections: list[int], dim: int = 0) -> tuple[VulkanBuffer, ...]:
+    ndim = len(buf.shape)
+    axis = _normalize_dim(dim, ndim)
+    total = int(buf.shape[axis])
+    if sum(int(s) for s in sections) != total:
+        raise ValueError(f"split sections {sections} do not sum to dimension size {total}")
+
+    if not _ensure_vulkan_or_numpy(buf, None):
+        src = buf.host if buf.host is not None else np.zeros(buf.shape, dtype=np.float32)
+        parts = []
+        start = 0
+        for sec in sections:
+            sl = [slice(None)] * ndim
+            sl[axis] = slice(start, start + int(sec))
+            parts.append(_fallback_buf(np.asarray(src[tuple(sl)], dtype=np.float32)))
+            start += int(sec)
+        return tuple(parts)
+
+    outputs = []
+    for sec in sections:
+        out_shape = list(buf.shape)
+        out_shape[axis] = int(sec)
+        outputs.append(empty(tuple(out_shape)))
+
+    outer = int(np.prod(buf.shape[:axis])) if axis > 0 else 1
+    inner = int(np.prod(buf.shape[axis + 1 :])) if axis + 1 < ndim else 1
+    axis_total = int(buf.shape[axis])
+
+    starts = []
+    running = 0
+    for sec in sections:
+        starts.append(running)
+        running += int(sec)
+
+    begin_batch()
+    try:
+        for outer_idx in range(outer):
+            for out, sec, start in zip(outputs, sections, starts):
+                block = int(sec) * inner
+                src_base = outer_idx * axis_total * inner + int(start) * inner
+                dst_base = outer_idx * int(sec) * inner
+                _copy_buffer_region(out, dst_base, buf, src_base, block)
+    finally:
+        end_batch()
+    return tuple(outputs)
+
+
+def scatter_slice(buf: VulkanBuffer, out_shape: tuple[int, ...], dim: int, start: int) -> VulkanBuffer:
+    ndim = len(out_shape)
+    axis = _normalize_dim(dim, ndim)
+    if buf.host is not None or not _HAS_VULKAN:
+        out = _fallback_buf(np.zeros(out_shape, dtype=np.float32))
+    else:
+        out = empty(out_shape)
+        zero = to_gpu(np.array([0.0], dtype=np.float32))
+        try:
+            out = scale_fill(zero, out, 1.0)
+        finally:
+            free(zero)
+
+    outer = int(np.prod(out_shape[:axis])) if axis > 0 else 1
+    inner = int(np.prod(out_shape[axis + 1 :])) if axis + 1 < ndim else 1
+    out_axis = int(out_shape[axis])
+    part_axis = int(buf.shape[axis])
+
+    begin_batch()
+    try:
+        for outer_idx in range(outer):
+            src_base = outer_idx * part_axis * inner
+            dst_base = outer_idx * out_axis * inner + int(start) * inner
+            _copy_buffer_region(out, dst_base, buf, src_base, part_axis * inner)
+    finally:
+        end_batch()
+    return out
 
 
 def _fallback_buf(data: np.ndarray) -> VulkanBuffer:
