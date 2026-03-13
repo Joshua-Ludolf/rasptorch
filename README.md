@@ -97,6 +97,33 @@ For local development from this repo:
 
 - `pip install -e .`
 
+
+### CLI Quickstart
+
+rasptorch includes an **agent-native CLI** for tensor operations, model management, and training:
+
+```bash
+# Show available commands
+python rasptorch --help
+
+# chat
+python rasptorch chat (you can type help once the cli is up and running in chat mode)
+
+# Create tensors
+python rasptorch tensor random --shape 2,3,4
+python rasptorch tensor zeros --shape 3,4
+
+# Manage models
+python rasptorch model list
+python rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
+
+# JSON output for scripting/agents
+python rasptorch --json tensor random --shape 2,3,4
+```
+
+See [rasptorch CLI.md](rasptorch%20CLI.md) for **complete CLI documentation**, including training, saving/loading models, and agent integration.
+
+
 ## GPU Training (Vulkan)
 
 There are currently two “modes” of training in this repo:
