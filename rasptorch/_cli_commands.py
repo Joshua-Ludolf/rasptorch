@@ -8,6 +8,58 @@ import tempfile
 import uuid
 
 
+class _GRUSequence(rasptorch.nn.Module):
+    """Wrap a GRU to return only the full output sequence (Tensor)."""
+
+    def __init__(self, gru: Any) -> None:
+        super().__init__()
+        self.gru = gru
+
+    def forward(self, x):
+        if len(getattr(x, "shape", ())) == 2:
+            x = x.view(x.shape[0], 1, x.shape[1])
+        output, _hidden = self.gru(x)
+        return output
+
+
+class _GRULastHidden(rasptorch.nn.Module):
+    """Wrap a GRU to return a 2D (batch, hidden) Tensor for composition."""
+
+    def __init__(self, gru: Any) -> None:
+        super().__init__()
+        self.gru = gru
+
+    def forward(self, x):
+        if len(getattr(x, "shape", ())) == 2:
+            x = x.view(x.shape[0], 1, x.shape[1])
+        _output, hidden = self.gru(x)
+        # hidden: (1, batch, hidden)
+        return hidden[0]
+
+
+class _SelfAttention(rasptorch.nn.Module):
+    """Wrap MultiheadAttention as self-attention for Sequential composition."""
+
+    def __init__(self, mha: Any) -> None:
+        super().__init__()
+        self.mha = mha
+
+    def forward(self, x):
+        # rasptorch.nn.MultiheadAttention expects [B,T,E]. For convenience in the CLI
+        # we allow [B,E] and treat it as a length-1 sequence.
+        squeeze_seq = False
+        if len(getattr(x, "shape", ())) == 2:
+            squeeze_seq = True
+            x = x.view(x.shape[0], 1, x.shape[1])
+
+        out = self.mha(x, x, x, need_weights=False)
+        if isinstance(out, tuple):
+            out = out[0]
+        if squeeze_seq:
+            return out[:, 0, :]
+        return out
+
+
 # Global session directory for model state persistence
 _SESSION_DIR = os.path.join(tempfile.gettempdir(), "rasptorch_cli_session")
 if not os.path.exists(_SESSION_DIR):
@@ -114,6 +166,115 @@ class ModelCommands:
             # Silently fail, session isn't critical
             pass
 
+    def _state_dict_to_numpy(self, state_dict: Any) -> Dict[str, np.ndarray]:
+        """Convert a state_dict to CPU numpy arrays."""
+        out: Dict[str, np.ndarray] = {}
+        if not isinstance(state_dict, dict):
+            return out
+
+        for k, v in state_dict.items():
+            try:
+                # torch Tensor
+                if hasattr(v, "detach") and hasattr(v, "cpu") and hasattr(v, "numpy"):
+                    out[str(k)] = np.asarray(v.detach().cpu().numpy(), dtype=np.float32)
+                else:
+                    out[str(k)] = np.asarray(v, dtype=np.float32)
+            except Exception:
+                continue
+        return out
+
+    def _apply_state_dict(self, model: Any, state_dict: Any) -> Dict[str, Any]:
+        """Best-effort state_dict application onto a rasptorch.nn.Module.
+
+        rasptorch modules do not currently expose load_state_dict, so we map by
+        parameter name as returned by Module.named_parameters().
+        """
+        sd = self._state_dict_to_numpy(state_dict)
+        if not sd:
+            return {"applied": 0, "missing": 0}
+
+        applied = 0
+        missing = 0
+        try:
+            named_params = list(model.named_parameters()) if hasattr(model, "named_parameters") else []
+        except Exception:
+            named_params = []
+
+        def _set_param_by_path(root: Any, dotted: str, new_param: Any) -> bool:
+            """Set a Parameter on a module by its dotted name."""
+            parts = str(dotted).split(".")
+            if not parts:
+                return False
+            cur = root
+            for i, part in enumerate(parts[:-1]):
+                if part.isdigit():
+                    idx = int(part)
+                    if isinstance(cur, (list, tuple)):
+                        cur = cur[idx]
+                    else:
+                        return False
+                else:
+                    nxt = getattr(cur, part, None)
+                    if nxt is None:
+                        return False
+                    cur = nxt
+
+            last = parts[-1]
+            if last.isdigit():
+                idx = int(last)
+                if isinstance(cur, list):
+                    cur[idx] = new_param
+                    return True
+                return False
+
+            setattr(cur, last, new_param)
+            return True
+
+        for name, param in named_params:
+            key = str(name)
+            if key not in sd:
+                missing += 1
+                continue
+            try:
+                arr = np.asarray(sd[key], dtype=np.float32)
+                if hasattr(param, "shape") and tuple(getattr(param, "shape")) != tuple(arr.shape):
+                    # Skip incompatible shapes.
+                    continue
+                if getattr(param, "device", "cpu") == "gpu":
+                    # Replace GPU param with a CPU param holding the loaded weights.
+                    try:
+                        param_cpu = param.to("cpu")
+                        param_cpu.data = arr.copy()
+                        if not _set_param_by_path(model, key, param_cpu):
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    param.data = arr.copy()
+                applied += 1
+            except Exception:
+                continue
+
+        return {"applied": applied, "missing": missing}
+
+    def _ensure_model(self, model_id: str) -> Any:
+        """Ensure `self.models[model_id]['model']` exists and has weights applied."""
+        model_data = self.models.get(model_id)
+        if not model_data:
+            return None
+        model = model_data.get("model")
+        if model is None:
+            model_type = model_data.get("type", "Unknown")
+            config = model_data.get("config", {})
+            model = self._reconstruct_model(model_type, config)
+            if model is None:
+                return None
+            # Apply saved weights if present.
+            if model_data.get("state_dict"):
+                self._apply_state_dict(model, model_data.get("state_dict"))
+            model_data["model"] = model
+        return model
+
     def _reconstruct_model(self, model_type: str, config: Dict[str, Any]) -> Any:
         """Reconstruct model from configuration."""
         def _act_layer(name: str) -> Optional[Any]:
@@ -181,6 +342,17 @@ class ModelCommands:
             input_size = config.get("input_size", 128)
             hidden_size = config.get("hidden_size", 256)
             num_layers = config.get("num_layers", 1)
+            if hasattr(rasptorch.nn, "GRU"):
+                if int(num_layers) <= 1:
+                    return rasptorch.nn.GRU(input_size, hidden_size, batch_first=True)
+
+                layers: List[Any] = []
+                layers.append(_GRUSequence(rasptorch.nn.GRU(input_size, hidden_size, batch_first=True)))
+                for _ in range(int(num_layers) - 2):
+                    layers.append(_GRUSequence(rasptorch.nn.GRU(hidden_size, hidden_size, batch_first=True)))
+                layers.append(_GRULastHidden(rasptorch.nn.GRU(hidden_size, hidden_size, batch_first=True)))
+                return rasptorch.nn.Sequential(*layers)
+
             layers = []
             for i in range(num_layers):
                 in_size = input_size if i == 0 else hidden_size
@@ -253,6 +425,137 @@ class ModelCommands:
 
         return first_in, last_out
 
+    def _infer_io_spec(self, model_id: str) -> Dict[str, Any]:
+        """Best-effort input/output spec inference for a model.
+
+        Returns a dict:
+          - type: model type string
+          - in_features/out_features: int|None (feature dimension for rank-2 inputs/outputs)
+          - in_ranks: set of allowed input ranks (e.g. {2} or {2,3})
+          - out_rank: int (currently always 2 for CLI-composed models)
+
+        This is used for combine-time compatibility checks.
+        """
+        model_data = self.models.get(model_id) or {}
+        model_type = str(model_data.get("type", "Unknown"))
+        config = model_data.get("config") or {}
+
+        in_ranks = {2}
+        out_rank = 2
+        in_features: Optional[int] = None
+        out_features: Optional[int] = None
+
+        try:
+            if model_type == "MLP":
+                layer_sizes = config.get("layer_sizes")
+                if isinstance(layer_sizes, list) and len(layer_sizes) >= 2:
+                    in_features = int(layer_sizes[0])
+                    out_features = int(layer_sizes[-1])
+            elif model_type == "Linear":
+                if "input_size" in config:
+                    in_features = int(config.get("input_size"))
+                if "output_size" in config:
+                    out_features = int(config.get("output_size"))
+            elif model_type == "CNN":
+                # CLI "CNN" is currently an MLP-like stack; treat channels as features.
+                if "in_channels" in config:
+                    in_features = int(config.get("in_channels"))
+                out_ch = config.get("out_channels")
+                if isinstance(out_ch, list) and out_ch:
+                    out_features = int(out_ch[-1])
+            elif model_type == "GRU":
+                # Wrapper allows 2D by treating as (B,1,E), so accept ranks {2,3}.
+                in_ranks = {2, 3}
+                if "input_size" in config:
+                    in_features = int(config.get("input_size"))
+                if "hidden_size" in config:
+                    out_features = int(config.get("hidden_size"))
+            elif model_type == "Transformer":
+                # Transformer as built here: Linear(vocab_size->d_model) ... -> d_model
+                if "vocab_size" in config:
+                    in_features = int(config.get("vocab_size"))
+                if "d_model" in config:
+                    out_features = int(config.get("d_model"))
+            elif model_type == "Combined":
+                # Prefer stored metadata if present.
+                if "input_size" in config:
+                    in_features = int(config.get("input_size"))
+                if "output_size" in config:
+                    out_features = int(config.get("output_size"))
+        except Exception:
+            # Fall through to inference.
+            pass
+
+        # Fallback: scan Linear layers if we still don't know.
+        if in_features is None or out_features is None:
+            try:
+                model = self._ensure_model(model_id)
+                lin_in, lin_out = self._infer_linear_in_out(model)
+                if in_features is None and lin_in is not None:
+                    in_features = int(lin_in)
+                if out_features is None and lin_out is not None:
+                    out_features = int(lin_out)
+            except Exception:
+                pass
+
+        return {
+            "type": model_type,
+            "in_features": in_features,
+            "out_features": out_features,
+            "in_ranks": set(in_ranks),
+            "out_rank": int(out_rank),
+        }
+
+    def _validate_combine_compatibility(self, model_a_id: str, model_b_id: str) -> Tuple[bool, str, Dict[str, Any], Dict[str, Any]]:
+        """Validate that model A's output can feed model B's input.
+
+        Returns (ok, reason, a_spec, b_spec).
+        """
+        a_spec = self._infer_io_spec(model_a_id)
+        b_spec = self._infer_io_spec(model_b_id)
+
+        a_type = a_spec.get("type", "Unknown")
+        b_type = b_spec.get("type", "Unknown")
+
+        a_out_rank = int(a_spec.get("out_rank", 2))
+        b_in_ranks = b_spec.get("in_ranks") or {2}
+
+        if a_out_rank not in b_in_ranks:
+            return (
+                False,
+                f"Incompatible tensor rank: {a_type} outputs rank {a_out_rank} but {b_type} expects rank {sorted(b_in_ranks)}",
+                a_spec,
+                b_spec,
+            )
+
+        a_out = a_spec.get("out_features")
+        b_in = b_spec.get("in_features")
+
+        if a_out is None:
+            return (
+                False,
+                f"Cannot verify compatibility: {a_type} output size is unknown (missing config/Linear layers)",
+                a_spec,
+                b_spec,
+            )
+        if b_in is None:
+            return (
+                False,
+                f"Cannot verify compatibility: {b_type} input size is unknown (missing config/Linear layers)",
+                a_spec,
+                b_spec,
+            )
+
+        if int(a_out) != int(b_in):
+            return (
+                False,
+                f"Incompatible feature size: {a_type} outputs {int(a_out)} but {b_type} expects {int(b_in)}",
+                a_spec,
+                b_spec,
+            )
+
+        return True, "", a_spec, b_spec
+
     def combine_models(self, model_a_id: str, model_b_id: str) -> Dict[str, Any]:
         """Combine two existing models sequentially (A then B) into a new model."""
         if model_a_id not in self.models:
@@ -264,46 +567,50 @@ class ModelCommands:
             model_a_data = self.models[model_a_id]
             model_b_data = self.models[model_b_id]
 
-            model_a = model_a_data.get("model")
-            model_b = model_b_data.get("model")
-
+            model_a = self._ensure_model(model_a_id)
             if model_a is None:
-                model_a = self._reconstruct_model(model_a_data.get("type", "Unknown"), model_a_data.get("config", {}))
-                if model_a is None:
-                    return {"error": f"Cannot reconstruct {model_a_data.get('type', 'Unknown')} model"}
-                model_a_data["model"] = model_a
-
+                return {"error": f"Cannot reconstruct {model_a_data.get('type', 'Unknown')} model"}
+            model_b = self._ensure_model(model_b_id)
             if model_b is None:
-                model_b = self._reconstruct_model(model_b_data.get("type", "Unknown"), model_b_data.get("config", {}))
-                if model_b is None:
-                    return {"error": f"Cannot reconstruct {model_b_data.get('type', 'Unknown')} model"}
-                model_b_data["model"] = model_b
+                return {"error": f"Cannot reconstruct {model_b_data.get('type', 'Unknown')} model"}
 
-            a_in, a_out = self._infer_linear_in_out(model_a)
-            b_in, b_out = self._infer_linear_in_out(model_b)
-
-            # If we can infer linear IO dims, enforce compatibility.
-            if a_out is not None and b_in is not None and a_out != b_in:
+            ok, reason, a_spec, b_spec = self._validate_combine_compatibility(model_a_id, model_b_id)
+            if not ok:
                 return {
-                    "error": f"Incompatible models: first outputs {a_out} but second expects {b_in}"
+                    "error": (
+                        f"Cannot combine {model_a_data.get('type', 'Unknown')}[{model_a_id[:8]}] -> "
+                        f"{model_b_data.get('type', 'Unknown')}[{model_b_id[:8]}]: {reason}"
+                    )
                 }
 
             combined_layers = self._flatten_layers(model_a) + self._flatten_layers(model_b)
             if not combined_layers:
                 return {"error": "Failed to combine models (no layers found)"}
 
-            combined_model = rasptorch.nn.Sequential(*combined_layers)
+            normalized_layers: List[Any] = []
+            for layer in combined_layers:
+                if hasattr(rasptorch.nn, "GRU") and isinstance(layer, rasptorch.nn.GRU):
+                    normalized_layers.append(_GRULastHidden(layer))
+                elif hasattr(rasptorch.nn, "MultiheadAttention") and isinstance(layer, rasptorch.nn.MultiheadAttention):
+                    normalized_layers.append(_SelfAttention(layer))
+                else:
+                    normalized_layers.append(layer)
+
+            combined_model = rasptorch.nn.Sequential(*normalized_layers)
             combined_id = str(uuid.uuid4())[:8]
 
             combined_config: Dict[str, Any] = {
                 "combine": "sequential",
                 "model_a_id": model_a_id,
                 "model_b_id": model_b_id,
+                "model_a_type": model_a_data.get("type", "Unknown"),
+                "model_b_type": model_b_data.get("type", "Unknown"),
             }
-            if a_in is not None:
-                combined_config["input_size"] = a_in
-            if b_out is not None:
-                combined_config["output_size"] = b_out
+            # Persist inferred IO sizes for downstream training / info.
+            if a_spec.get("in_features") is not None:
+                combined_config["input_size"] = int(a_spec["in_features"])
+            if b_spec.get("out_features") is not None:
+                combined_config["output_size"] = int(b_spec["out_features"])
 
             model_data = {
                 "model_id": combined_id,
@@ -321,12 +628,14 @@ class ModelCommands:
                 "combined_from": {
                     "model_a_id": model_a_id,
                     "model_b_id": model_b_id,
+                    "model_a_type": model_a_data.get("type", "Unknown"),
+                    "model_b_type": model_b_data.get("type", "Unknown"),
                 },
                 "architecture": {
                     "combine": "sequential",
-                    "input_size": a_in,
-                    "output_size": b_out,
-                    "num_layers": len(combined_layers),
+                    "input_size": a_spec.get("in_features"),
+                    "output_size": b_spec.get("out_features"),
+                    "num_layers": len(normalized_layers),
                 },
             }
         except Exception as e:
@@ -499,7 +808,15 @@ class ModelCommands:
         """Create a GRU model."""
         try:
             if hasattr(rasptorch.nn, "GRU"):
-                model = rasptorch.nn.GRU(input_size, hidden_size, num_layers)
+                if int(num_layers) <= 1:
+                    model = rasptorch.nn.GRU(input_size, hidden_size, batch_first=True)
+                else:
+                    layers: List[Any] = []
+                    layers.append(_GRUSequence(rasptorch.nn.GRU(input_size, hidden_size, batch_first=True)))
+                    for _ in range(int(num_layers) - 2):
+                        layers.append(_GRUSequence(rasptorch.nn.GRU(hidden_size, hidden_size, batch_first=True)))
+                    layers.append(_GRULastHidden(rasptorch.nn.GRU(hidden_size, hidden_size, batch_first=True)))
+                    model = rasptorch.nn.Sequential(*layers)
             else:
                 layers = []
                 for i in range(num_layers):
@@ -540,7 +857,7 @@ class ModelCommands:
                 return {"error": "Transformer requires MultiheadAttention support"}
             layers = [rasptorch.nn.Linear(vocab_size, d_model)]
             for _ in range(num_layers):
-                layers.append(rasptorch.nn.MultiheadAttention(d_model, num_heads))
+                layers.append(_SelfAttention(rasptorch.nn.MultiheadAttention(d_model, num_heads)))
                 layers.append(rasptorch.nn.Linear(d_model, d_model * 4))
                 layers.append(rasptorch.nn.ReLU())
                 layers.append(rasptorch.nn.Linear(d_model * 4, d_model))
@@ -664,34 +981,52 @@ class ModelCommands:
         if model_id not in self.models:
             return {"error": f"Model {model_id} not found"}
         try:
-            import pickle
             model_data = self.models[model_id]
-            model = model_data.get("model")
-            
-            # Reconstruct if needed
+            model = self._ensure_model(model_id)
             if model is None:
                 model_type = model_data.get("type", "Unknown")
-                config = model_data.get("config", {})
-                model = self._reconstruct_model(model_type, config)
-                if model is None:
-                    return {"error": f"Cannot reconstruct {model_type} model"}
-                model_data["model"] = model
-            
+                return {"error": f"Cannot reconstruct {model_type} model"}
+
             state_dict = model.state_dict()
-            
+
             save_data = {
                 "model_type": model_data.get("type", "Unknown"),
                 "config": model_data.get("config", {}),
                 "state_dict": state_dict,
             }
-            
-            with open(path, "wb") as f:
-                pickle.dump(save_data, f)
+
+            ext = os.path.splitext(str(path))[1].lower()
+            if ext in {".pth", ".pt"}:
+                try:
+                    import torch  # type: ignore
+                except Exception as e:
+                    return {"error": f"Saving {ext} requires torch (import failed: {e})"}
+
+                def _torch_safe(obj: Any) -> Any:
+                    # Make payload compatible with torch.load(weights_only=True).
+                    if isinstance(obj, np.ndarray):
+                        return torch.from_numpy(np.asarray(obj, dtype=np.float32))
+                    if isinstance(obj, (np.floating, np.integer)):
+                        return obj.item()
+                    if isinstance(obj, dict):
+                        return {str(k): _torch_safe(v) for k, v in obj.items()}
+                    if isinstance(obj, (list, tuple)):
+                        return type(obj)(_torch_safe(v) for v in obj)
+                    return obj
+
+                torch.save(_torch_safe(save_data), path)
+                fmt = "torch"
+            else:
+                import pickle
+                with open(path, "wb") as f:
+                    pickle.dump(save_data, f)
+                fmt = "pickle"
             
             return {
                 "status": "success",
                 "model_id": model_id,
                 "path": path,
+                "format": fmt,
                 "message": f"Model saved successfully",
             }
         except Exception as e:
@@ -700,15 +1035,38 @@ class ModelCommands:
     def load_model(self, path: str) -> Dict[str, Any]:
         """Load model from file."""
         try:
-            import pickle
-            with open(path, "rb") as f:
-                save_data = pickle.load(f)
+            ext = os.path.splitext(str(path))[1].lower()
+            unsafe_load = False
+            if ext in {".pth", ".pt"}:
+                try:
+                    import torch  # type: ignore
+                except Exception as e:
+                    return {"error": f"Loading {ext} requires torch (import failed: {e})"}
+                try:
+                    save_data = torch.load(path, map_location="cpu")
+                except Exception as e:
+                    msg = str(e)
+                    # Back-compat: handle older files that contained NumPy arrays.
+                    if "Weights only load failed" in msg or "weights_only" in msg:
+                        try:
+                            save_data = torch.load(path, map_location="cpu", weights_only=False)
+                            unsafe_load = True
+                        except TypeError:
+                            raise
+                    else:
+                        raise
+                fmt = "torch"
+            else:
+                import pickle
+                with open(path, "rb") as f:
+                    save_data = pickle.load(f)
+                fmt = "pickle"
             
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
-            state_dict = save_data.get("state_dict", {})
-            
-            model_id = str(id({}))
+            state_dict = self._state_dict_to_numpy(save_data.get("state_dict", {}))
+
+            model_id = str(uuid.uuid4())[:8]
             self.models[model_id] = {
                 "model": None,
                 "type": model_type,
@@ -720,6 +1078,8 @@ class ModelCommands:
                 "status": "success",
                 "model_id": model_id,
                 "model_type": model_type,
+                "format": fmt,
+                **({"unsafe_load": True} if unsafe_load else {}),
                 "message": f"Model loaded successfully",
             }
         except Exception as e:
@@ -740,16 +1100,10 @@ class ModelCommands:
         
         try:
             model_data = self.models[model_id]
-            model = model_data.get("model")
-            
-            # Reconstruct model if needed
+            model = self._ensure_model(model_id)
             if model is None:
                 model_type = model_data.get("type", "Unknown")
-                config = model_data.get("config", {})
-                model = self._reconstruct_model(model_type, config)
-                if model is None:
-                    return {"error": f"Cannot reconstruct {model_type} model"}
-                model_data["model"] = model
+                return {"error": f"Cannot reconstruct {model_type} model"}
             
             # Move model to device if needed
             if device == "gpu":
@@ -768,11 +1122,45 @@ class ModelCommands:
             
             # Infer input size from model config
             config = model_data.get("config", {})
-            input_size = config.get("input_size") or config.get("layer_sizes", [10])[0]
-            output_size = config.get("output_size") or config.get("layer_sizes", [10, 2])[-1]
-            
-            input_shape = (batch_size, input_size)
-            label_shape = (batch_size, output_size)
+
+            def _find_input_gru(m: Any) -> Optional[Any]:
+                """Return a GRU that is on the model input path (first layer), if any."""
+                if hasattr(rasptorch.nn, "GRU") and isinstance(m, rasptorch.nn.GRU):
+                    return m
+                if hasattr(m, "gru") and hasattr(rasptorch.nn, "GRU") and isinstance(getattr(m, "gru"), rasptorch.nn.GRU):
+                    return getattr(m, "gru")
+                layers = getattr(m, "layers", None)
+                if isinstance(layers, list) and layers:
+                    return _find_input_gru(layers[0])
+                return None
+
+            def _forward_for_loss(m: Any, x: Any) -> Any:
+                out = m(x)
+                if hasattr(rasptorch.nn, "GRU") and isinstance(m, rasptorch.nn.GRU) and isinstance(out, tuple) and len(out) == 2:
+                    _o, h = out
+                    return h[0]
+                if isinstance(out, tuple):
+                    for item in out:
+                        if hasattr(item, "shape"):
+                            return item
+                    return out[0]
+                return out
+
+            first_gru = _find_input_gru(model)
+            if first_gru is not None:
+                seq_len = int(config.get("seq_len") or config.get("sequence_length") or 8)
+                inferred_in = getattr(first_gru, "input_size", None)
+                input_size = int(inferred_in if inferred_in is not None else (config.get("input_size") or 128))
+                input_shape = (batch_size, seq_len, input_size)
+            else:
+                input_size = int(config.get("input_size") or config.get("vocab_size") or config.get("layer_sizes", [10])[0])
+                input_shape = (batch_size, input_size)
+
+            X_probe = rasptorch.Tensor(np.random.randn(*input_shape).astype(np.float32), device=device)
+            y_probe = _forward_for_loss(model, X_probe)
+            if not hasattr(y_probe, "shape"):
+                return {"error": f"Model forward did not return a Tensor (got {type(y_probe)})"}
+            label_shape = tuple(int(s) for s in y_probe.shape)
             
             training_history = []
             
@@ -788,7 +1176,9 @@ class ModelCommands:
                 )
                 
                 # Forward pass
-                output = model(X_batch)
+                output = _forward_for_loss(model, X_batch)
+                if not hasattr(output, "shape"):
+                    return {"error": f"Model forward did not return a Tensor (got {type(output)})"}
                 
                 # Simple MSE loss (no power operator - use multiplication)
                 diff = output - y_batch

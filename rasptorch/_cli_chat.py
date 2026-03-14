@@ -378,6 +378,8 @@ MODEL MANAGEMENT:
   model info <id>              Show model details
   model use|select <id>        Select model for training
     model combine <id1> <id2>     Combine models (A then B)
+    model save <path>            Save selected model (.pth/.pt via torch, else pickle)
+    model load <path>            Load model and select it
   model deselect               Deselect current model
   model remove <id>            Remove a model
   model remove-all             Remove all models
@@ -393,6 +395,7 @@ OPTIMIZER:
 TRAINING:
   train epochs <n>             Set training epochs
   train batch-size <n>         Set batch size
+    train lr <value>             Set learning rate
   train start                  Start training
 
 DEVICE:
@@ -780,8 +783,28 @@ Type 'help <command>' for more details.
                     print(f"\nModel: {model_id[:8]}")
                     print(f"  Type: {model_data.get('type', 'Unknown')}")
                     config = model_data.get('config', {})
+                    is_combined = str(model_data.get("type", "")).lower() == "combined"
+                    # For Combined models, print base types once, but use live lookup
+                    # when the base models still exist in the session.
+                    a_id = config.get("model_a_id") if is_combined else None
+                    b_id = config.get("model_b_id") if is_combined else None
+                    live_a_type = None
+                    live_b_type = None
+                    if is_combined:
+                        if a_id and a_id in cmds.models:
+                            live_a_type = cmds.models[a_id].get("type")
+                        if b_id and b_id in cmds.models:
+                            live_b_type = cmds.models[b_id].get("type")
+
                     for k, v in config.items():
-                        print(f"  {k}: {v}")
+                        key = str(k)
+                        if is_combined and key == "model_a_type":
+                            print(f"  model_a_type: {live_a_type or v or 'Unknown'}")
+                            continue
+                        if is_combined and key == "model_b_type":
+                            print(f"  model_b_type: {live_b_type or v or 'Unknown'}")
+                            continue
+                        print(f"  {key}: {v}")
                 else:
                     print(f"✗ Model not found: {model_id}")
             
@@ -826,6 +849,44 @@ Type 'help <command>' for more details.
                     print(f"✓ Removed all {count} model(s)")
                 else:
                     print("(no models to remove)")
+
+            elif subcmd == "save":
+                # Usage:
+                #   model save <path>
+                #   model save <model_id> <path>
+                if len(args) < 2:
+                    print("✗ Usage: model save <path> OR model save <model_id> <path>")
+                    return
+                if len(args) == 2:
+                    if "current_model" not in self.context:
+                        print("✗ No model selected. Use 'model use <id>' first")
+                        return
+                    model_id = self.context["current_model"]
+                    path = args[1]
+                else:
+                    model_id = args[1]
+                    path = args[2]
+                result = cmds.save_model(model_id, path)
+                if "error" in result:
+                    print(f"✗ Error: {result['error']}")
+                else:
+                    fmt = result.get("format", "?")
+                    print(f"✓ Saved model {model_id[:8]} to {path} ({fmt})")
+
+            elif subcmd == "load":
+                # Usage: model load <path>
+                if len(args) < 2:
+                    print("✗ Usage: model load <path>")
+                    return
+                path = args[1]
+                result = cmds.load_model(path)
+                if "error" in result:
+                    print(f"✗ Error: {result['error']}")
+                    return
+                mid = result["model_id"]
+                self.context["current_model"] = mid
+                fmt = result.get("format", "?")
+                print(f"✓ Loaded {result.get('model_type', 'model')} as {mid[:8]} ({fmt})")
             
             else:
                 print(f"✗ Unknown model command: {subcmd}")
@@ -860,6 +921,17 @@ Type 'help <command>' for more details.
                 print(f"✓ Set batch size: {self.context['batch_size']}")
             except ValueError:
                 print("✗ Invalid batch size")
+
+        elif subcmd in ("lr", "learning-rate", "learning_rate"):
+            if len(args) < 2:
+                print("✗ Usage: train lr <value>")
+                return
+            try:
+                lr = float(args[1])
+                self.context["learning_rate"] = lr
+                print(f"✓ Set learning rate: {lr}")
+            except ValueError:
+                print("✗ Invalid learning rate")
         
         elif subcmd == "start":
             self._train_model()
@@ -877,6 +949,8 @@ Type 'help <command>' for more details.
         epochs = self.context.get("train_epochs", 5)
         batch_size = self.context.get("batch_size", 32)
         device = self.context.get("device", "cpu")
+        lr = float(self.context.get("learning_rate", 0.001))
+        opt = str(self.context.get("optimizer", "Adam"))
         
         cmds = get_model_commands()
         
@@ -889,10 +963,10 @@ Type 'help <command>' for more details.
             result = cmds.train_model(
                 model_id,
                 epochs=epochs,
-                learning_rate=0.001,
+                learning_rate=lr,
                 batch_size=batch_size,
                 device=device,
-                optimizer_type="Adam"
+                optimizer_type=opt
             )
             
             if "error" in result:
