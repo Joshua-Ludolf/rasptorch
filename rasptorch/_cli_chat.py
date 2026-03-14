@@ -48,6 +48,262 @@ class ChatREPL:
         )
         self._print_banner()
 
+    def _ensure_session(self) -> None:
+        if self.session is None:
+            self.initialize()
+
+    def _prompt_text(self, prompt: str, *, default: Optional[str] = None) -> Optional[str]:
+        self._ensure_session()
+        suffix = f" [{default}]" if default is not None else ""
+        try:
+            val = self.session.prompt(f"{prompt}{suffix}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("Cancelled.")
+            return None
+        if val == "" and default is not None:
+            return str(default)
+        return val
+
+    def _prompt_int(self, prompt: str, *, default: Optional[int] = None, min_value: Optional[int] = None) -> Optional[int]:
+        while True:
+            raw = self._prompt_text(prompt, default=str(default) if default is not None else None)
+            if raw is None:
+                return None
+            try:
+                val = int(raw)
+            except ValueError:
+                print("✗ Please enter an integer")
+                continue
+            if min_value is not None and val < min_value:
+                print(f"✗ Must be >= {min_value}")
+                continue
+            return val
+
+    def _prompt_float(self, prompt: str, *, default: Optional[float] = None, min_value: Optional[float] = None) -> Optional[float]:
+        while True:
+            raw = self._prompt_text(prompt, default=str(default) if default is not None else None)
+            if raw is None:
+                return None
+            try:
+                val = float(raw)
+            except ValueError:
+                print("✗ Please enter a number")
+                continue
+            if min_value is not None and val < min_value:
+                print(f"✗ Must be >= {min_value}")
+                continue
+            return val
+
+    def _prompt_activation(self, prompt: str, *, default: str = "relu") -> Optional[str]:
+        allowed = {"relu", "gelu", "tanh", "sigmoid", "silu", "leaky_relu", "elu", "none"}
+        while True:
+            raw = self._prompt_text(prompt, default=default)
+            if raw is None:
+                return None
+            val = str(raw).strip().lower().replace("-", "_")
+            if val in {"leakyrelu", "leaky"}:
+                val = "leaky_relu"
+            if val in allowed:
+                return val
+            print(f"✗ Unknown activation '{raw}'. Choose one of: {', '.join(sorted(allowed))}")
+
+    def _parse_builder_args(self, tokens: List[str]) -> Dict[str, Any]:
+        """Parse act/activation/activations tokens used by builders."""
+        activation = "relu"
+        activations = None
+        for tok in tokens:
+            t = str(tok).strip()
+            if t.startswith("activations="):
+                activations = [x.strip() for x in t.split("=", 1)[1].split(",") if x.strip()]
+            elif t.startswith("act=") or t.startswith("activation="):
+                activation = t.split("=", 1)[1].strip()
+            else:
+                # Allow shorthand: `... gelu` or `... relu,none`
+                if "," in t:
+                    activations = [x.strip() for x in t.split(",") if x.strip()]
+                else:
+                    activation = t
+        return {"activation": activation, "activations": activations}
+
+    def _wizard_mlp(self) -> Optional[Dict[str, Any]]:
+        n_layers = self._prompt_int("Number of layers (including input+output)", default=4, min_value=2)
+        if n_layers is None:
+            return None
+        sizes: List[int] = []
+        for i in range(n_layers):
+            label = "input" if i == 0 else ("output" if i == n_layers - 1 else f"hidden{i}")
+            val = self._prompt_int(f"Units for {label} layer", min_value=1)
+            if val is None:
+                return None
+            sizes.append(val)
+
+        if n_layers <= 2:
+            return {"layer_sizes": sizes, "activation": "none", "activations": None}
+
+        mode = self._prompt_text("Activation mode (single/per-layer)", default="single")
+        if mode is None:
+            return None
+        mode = mode.strip().lower()
+
+        if mode in ("per", "per-layer", "per_layer", "layer", "layers"):
+            acts: List[str] = []
+            for i in range(n_layers - 2):
+                act = self._prompt_activation(f"Activation after hidden transition {i+1}", default="relu")
+                if act is None:
+                    return None
+                acts.append(act)
+            return {"layer_sizes": sizes, "activation": "relu", "activations": acts}
+
+        act = self._prompt_activation("Activation between layers", default="relu")
+        if act is None:
+            return None
+        return {"layer_sizes": sizes, "activation": act, "activations": None}
+
+    def _wizard_linear(self) -> Optional[Dict[str, Any]]:
+        input_size = self._prompt_int("Input size", default=10, min_value=1)
+        if input_size is None:
+            return None
+        n_hidden = self._prompt_int("Number of hidden layers", default=2, min_value=0)
+        if n_hidden is None:
+            return None
+        hidden_sizes: List[int] = []
+        for i in range(n_hidden):
+            val = self._prompt_int(f"Units for hidden{i+1}", default=32, min_value=1)
+            if val is None:
+                return None
+            hidden_sizes.append(val)
+        output_size = self._prompt_int("Output size", default=2, min_value=1)
+        if output_size is None:
+            return None
+
+        if n_hidden == 0:
+            return {
+                "input_size": input_size,
+                "hidden_sizes": hidden_sizes,
+                "output_size": output_size,
+                "activation": "none",
+                "activations": None,
+            }
+
+        mode = self._prompt_text("Activation mode (single/per-layer)", default="single")
+        if mode is None:
+            return None
+        mode = mode.strip().lower()
+        if mode in ("per", "per-layer", "per_layer", "layer", "layers"):
+            acts: List[str] = []
+            for i in range(n_hidden):
+                act = self._prompt_activation(f"Activation after hidden{i+1}", default="relu")
+                if act is None:
+                    return None
+                acts.append(act)
+            return {
+                "input_size": input_size,
+                "hidden_sizes": hidden_sizes,
+                "output_size": output_size,
+                "activation": "relu",
+                "activations": acts,
+            }
+        act = self._prompt_activation("Activation after each hidden layer", default="relu")
+        if act is None:
+            return None
+        return {
+            "input_size": input_size,
+            "hidden_sizes": hidden_sizes,
+            "output_size": output_size,
+            "activation": act,
+            "activations": None,
+        }
+
+    def _wizard_cnn(self) -> Optional[Dict[str, Any]]:
+        in_ch = self._prompt_int("Input channels", default=3, min_value=1)
+        if in_ch is None:
+            return None
+        n_layers = self._prompt_int("Number of layers", default=3, min_value=1)
+        if n_layers is None:
+            return None
+        out_chs: List[int] = []
+        for i in range(n_layers):
+            val = self._prompt_int(f"Output channels for layer{i+1}", default=32 if i == 0 else 64, min_value=1)
+            if val is None:
+                return None
+            out_chs.append(val)
+
+        kernels_mode = self._prompt_text("Kernel sizes? (default/enter)", default="default")
+        if kernels_mode is None:
+            return None
+        kernels = None
+        if kernels_mode.strip().lower() not in ("default", "d", ""):
+            # Ask each kernel size explicitly
+            kernels = []
+            for i in range(n_layers):
+                k = self._prompt_int(f"Kernel size for layer{i+1}", default=3, min_value=1)
+                if k is None:
+                    return None
+                kernels.append(k)
+
+        if n_layers <= 1:
+            return {"in_channels": in_ch, "out_channels": out_chs, "kernels": kernels, "activation": "none", "activations": None}
+
+        mode = self._prompt_text("Activation mode (single/per-layer)", default="single")
+        if mode is None:
+            return None
+        mode = mode.strip().lower()
+        if mode in ("per", "per-layer", "per_layer", "layer", "layers"):
+            acts: List[str] = []
+            for i in range(n_layers - 1):
+                act = self._prompt_activation(f"Activation after layer{i+1}", default="relu")
+                if act is None:
+                    return None
+                acts.append(act)
+            return {"in_channels": in_ch, "out_channels": out_chs, "kernels": kernels, "activation": "relu", "activations": acts}
+        act = self._prompt_activation("Activation between layers", default="relu")
+        if act is None:
+            return None
+        return {"in_channels": in_ch, "out_channels": out_chs, "kernels": kernels, "activation": act, "activations": None}
+
+    def _wizard_gru(self) -> Optional[Dict[str, Any]]:
+        input_sz = self._prompt_int("Input size", default=128, min_value=1)
+        if input_sz is None:
+            return None
+        hidden_sz = self._prompt_int("Hidden size", default=256, min_value=1)
+        if hidden_sz is None:
+            return None
+        num_layers = self._prompt_int("Number of layers", default=1, min_value=1)
+        if num_layers is None:
+            return None
+        return {"input_size": input_sz, "hidden_size": hidden_sz, "num_layers": num_layers}
+
+    def _wizard_transformer(self) -> Optional[Dict[str, Any]]:
+        vocab_size = self._prompt_int("Vocab size", default=1000, min_value=2)
+        if vocab_size is None:
+            return None
+        d_model = self._prompt_int("d_model", default=128, min_value=1)
+        if d_model is None:
+            return None
+        num_heads = self._prompt_int("num_heads", default=4, min_value=1)
+        if num_heads is None:
+            return None
+        num_layers = self._prompt_int("num_layers", default=2, min_value=1)
+        if num_layers is None:
+            return None
+        return {"vocab_size": vocab_size, "d_model": d_model, "num_heads": num_heads, "num_layers": num_layers}
+
+    def _wizard_lora(self, cmds: Any) -> Optional[Dict[str, Any]]:
+        if not getattr(cmds, "models", None):
+            print("✗ No models available. Create a model first.")
+            return None
+        default_base = self.context.get("current_model")
+        base = self._prompt_text("Base model id", default=str(default_base) if default_base else None)
+        if base is None:
+            return None
+        rank = self._prompt_int("Rank", default=8, min_value=1)
+        if rank is None:
+            return None
+        alpha = self._prompt_float("Alpha", default=16.0, min_value=0.0)
+        if alpha is None:
+            return None
+        return {"base_model": base, "rank": rank, "alpha": alpha}
+
     def _print_banner(self):
         """Print welcome banner."""
         banner = """
@@ -110,11 +366,12 @@ TENSOR OPERATIONS:
   tensor ones <shape>          Create ones tensor
 
 MODEL BUILDERS:
-  model mlp <arch>             Create MLP (e.g., "10,32,16,2")
-  model cnn <config>           Create CNN (layers, filters, kernel)
-  model lora <base> <rank>     Create LoRA adapter
-  model transformer <config>   Create Transformer model
-  model gru <input>,<hidden>   Create GRU model
+    model mlp [args]             Create MLP (args or interactive)
+    model linear [args]          Create Linear/MLP-style model (args or interactive)
+    model cnn [args]             Create CNN (args or interactive)
+    model gru [args]             Create GRU (args or interactive)
+    model transformer [args]     Create Transformer (args or interactive)
+    model lora [args]            Create LoRA adapter (args or interactive)
 
 MODEL MANAGEMENT:
   model list                   List all models
@@ -124,6 +381,10 @@ MODEL MANAGEMENT:
   model deselect               Deselect current model
   model remove <id>            Remove a model
   model remove-all             Remove all models
+
+LAYER/ACTIVATION OPTIONS (for builders):
+    act=<name>                   Set activation (relu, gelu, tanh, sigmoid, silu, leaky_relu, elu, none)
+    activations=a,b,c            Per-layer activations (for MLP: count=layers-2)
 
 OPTIMIZER:
   optimizer create <type>      Create optimizer (adam, sgd)
@@ -214,7 +475,7 @@ Type 'help <command>' for more details.
         """Print help for specific command."""
         helps = {
             "tensor": "tensor create|zeros|ones <shape> - Create tensors",
-            "model": "model mlp|cnn|gru|transformer|lora <config> - Create/manage models",
+            "model": "model mlp|linear|cnn|gru|transformer|lora <args> - Create/manage models (interactive if args omitted)",
             "train": "train epochs|batch-size|start - Configure and start training",
             "optimizer": "optimizer create|set-lr - Configure optimizer",
             "device": "device cpu|gpu|status - Set compute device (GPU requires Vulkan)",
@@ -289,7 +550,7 @@ Type 'help <command>' for more details.
     def _handle_model_command(self, args: List[str]):
         """Handle model operations."""
         if not args:
-            print("✗ Usage: model mlp|cnn|gru|transformer|lora|list|info|use|remove|remove-all <config>")
+            print("✗ Usage: model mlp|linear|cnn|gru|transformer|lora|combine|list|info|use|select|deselect|remove|remove-all <args>")
             return
         
         subcmd = args[0].lower()
@@ -307,25 +568,94 @@ Type 'help <command>' for more details.
             
             elif subcmd == "mlp":
                 if len(args) < 2:
-                    print("✗ Usage: model mlp <layers> (e.g., 64,32,16,2)")
-                    return
-                layers = [int(x.strip()) for x in args[1].split(",")]
-                result = cmds.create_mlp(layers)
+                    wiz = self._wizard_mlp()
+                    if wiz is None:
+                        return
+                    result = cmds.create_mlp(
+                        wiz["layer_sizes"],
+                        activation=wiz.get("activation", "relu"),
+                        activations=wiz.get("activations"),
+                    )
+                else:
+                    layers = [int(x.strip()) for x in args[1].split(",")]
+                    parsed = self._parse_builder_args(args[2:])
+                    result = cmds.create_mlp(layers, activation=parsed["activation"], activations=parsed["activations"])
                 if "error" not in result:
                     mid = result["model_id"]
                     self.context["current_model"] = mid
                     print(f"✓ Created MLP: {mid[:8]}")
                 else:
                     print(f"✗ Error: {result['error']}")
+
+            elif subcmd == "linear":
+                if len(args) < 2:
+                    wiz = self._wizard_linear()
+                    if wiz is None:
+                        return
+                    result = cmds.create_linear_model(
+                        wiz["input_size"],
+                        wiz["hidden_sizes"],
+                        wiz["output_size"],
+                        activation=wiz.get("activation", "relu"),
+                        activations=wiz.get("activations"),
+                    )
+                else:
+                    # Format: model linear <input> <hidden1,hidden2,...> <output> [act/activations]
+                    if len(args) < 4:
+                        print("✗ Usage: model linear <input_size> <hidden_sizes_csv> <output_size> [act=relu|activations=...]")
+                        return
+                    input_size = int(args[1])
+                    hidden_sizes = [int(x.strip()) for x in args[2].split(",") if x.strip()]
+                    output_size = int(args[3])
+                    parsed = self._parse_builder_args(args[4:])
+                    result = cmds.create_linear_model(
+                        input_size,
+                        hidden_sizes,
+                        output_size,
+                        activation=parsed["activation"],
+                        activations=parsed["activations"],
+                    )
+                if "error" not in result:
+                    mid = result["model_id"]
+                    self.context["current_model"] = mid
+                    print(f"✓ Created Linear: {mid[:8]}")
+                else:
+                    print(f"✗ Error: {result['error']}")
             
             elif subcmd == "cnn":
-                if len(args) < 2:
-                    print("✗ Usage: model cnn <in_channels>,<out_channels>")
-                    return
                 try:
-                    in_ch = int(args[1])
-                    out_chs = [int(x.strip()) for x in args[2].split(",")] if len(args) > 2 else [32, 64]
-                    result = cmds.create_cnn(in_ch, out_chs)
+                    if len(args) < 2:
+                        wiz = self._wizard_cnn()
+                        if wiz is None:
+                            return
+                        result = cmds.create_cnn(
+                            wiz["in_channels"],
+                            wiz["out_channels"],
+                            wiz.get("kernels"),
+                            activation=wiz.get("activation", "relu"),
+                            activations=wiz.get("activations"),
+                        )
+                    else:
+                        # Format: model cnn <in_channels> <out_channels_csv> [kernels_csv] [act/activations]
+                        if len(args) < 3:
+                            print("✗ Usage: model cnn <in_channels> <out_channels_csv> [kernels_csv] [act=relu|activations=...]")
+                            return
+                        in_ch = int(args[1])
+                        out_chs = [int(x.strip()) for x in args[2].split(",") if x.strip()]
+                        kernels = None
+                        extra_start = 3
+                        if len(args) >= 4 and args[3].replace(",", "").strip().isdigit():
+                            kernels = [int(x.strip()) for x in args[3].split(",") if x.strip()]
+                            extra_start = 4
+                        parsed = self._parse_builder_args(args[extra_start:])
+                        result = cmds.create_cnn(
+                            in_ch,
+                            out_chs,
+                            kernels,
+                            activation=parsed["activation"],
+                            activations=parsed["activations"],
+                        )
+
                     if "error" not in result:
                         mid = result["model_id"]
                         self.context["current_model"] = mid
@@ -333,17 +663,24 @@ Type 'help <command>' for more details.
                     else:
                         print(f"✗ Error: {result['error']}")
                 except ValueError:
-                    print("✗ Invalid channel specification")
+                    print("✗ Invalid numeric value")
             
             elif subcmd == "gru":
-                if len(args) < 3:
-                    print("✗ Usage: model gru <input_size> <hidden_size> [num_layers]")
-                    return
                 try:
-                    input_sz = int(args[1])
-                    hidden_sz = int(args[2])
-                    num_layers = int(args[3]) if len(args) > 3 else 1
-                    result = cmds.create_gru(input_sz, hidden_sz, num_layers)
+                    if len(args) < 2:
+                        wiz = self._wizard_gru()
+                        if wiz is None:
+                            return
+                        result = cmds.create_gru(wiz["input_size"], wiz["hidden_size"], wiz["num_layers"])
+                    else:
+                        if len(args) < 3:
+                            print("✗ Usage: model gru <input_size> <hidden_size> [num_layers]")
+                            return
+                        input_sz = int(args[1])
+                        hidden_sz = int(args[2])
+                        num_layers = int(args[3]) if len(args) > 3 else 1
+                        result = cmds.create_gru(input_sz, hidden_sz, num_layers)
+
                     if "error" not in result:
                         mid = result["model_id"]
                         self.context["current_model"] = mid
@@ -351,7 +688,54 @@ Type 'help <command>' for more details.
                     else:
                         print(f"✗ Error: {result['error']}")
                 except ValueError:
-                    print("✗ Invalid size specification")
+                    print("✗ Invalid numeric value")
+
+            elif subcmd == "transformer":
+                try:
+                    if len(args) < 2:
+                        wiz = self._wizard_transformer()
+                        if wiz is None:
+                            return
+                        result = cmds.create_transformer(
+                            wiz["vocab_size"], wiz["d_model"], wiz["num_heads"], wiz["num_layers"]
+                        )
+                    else:
+                        if len(args) < 5:
+                            print("✗ Usage: model transformer <vocab_size> <d_model> <num_heads> <num_layers>")
+                            return
+                        vocab_size = int(args[1])
+                        d_model = int(args[2])
+                        num_heads = int(args[3])
+                        num_layers = int(args[4])
+                        result = cmds.create_transformer(vocab_size, d_model, num_heads, num_layers)
+
+                    if "error" not in result:
+                        mid = result["model_id"]
+                        self.context["current_model"] = mid
+                        print(f"✓ Created Transformer: {mid[:8]}")
+                    else:
+                        print(f"✗ Error: {result['error']}")
+                except ValueError:
+                    print("✗ Invalid numeric value")
+
+            elif subcmd == "lora":
+                if len(args) < 2:
+                    wiz = self._wizard_lora(cmds)
+                    if wiz is None:
+                        return
+                    result = cmds.create_lora_adapter(wiz["base_model"], rank=wiz["rank"], alpha=wiz["alpha"])
+                else:
+                    # Format: model lora <base_model_id> [rank] [alpha]
+                    base = args[1]
+                    rank = int(args[2]) if len(args) > 2 else 8
+                    alpha = float(args[3]) if len(args) > 3 else 16.0
+                    result = cmds.create_lora_adapter(base, rank=rank, alpha=alpha)
+
+                if "error" not in result:
+                    aid = result.get("adapter_id", "?")
+                    print(f"✓ Created LoRA adapter: {str(aid)[:8]}")
+                else:
+                    print(f"✗ Error: {result['error']}")
             
             elif subcmd in ("use", "select"):
                 if len(args) < 2:

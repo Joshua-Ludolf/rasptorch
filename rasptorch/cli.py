@@ -101,13 +101,38 @@ def model():
 @click.option("--input-size", required=True, type=int)
 @click.option("--hidden-sizes", required=True)
 @click.option("--output-size", required=True, type=int)
+@click.option(
+    "--activation",
+    default="relu",
+    type=click.Choice(["relu", "gelu", "tanh", "sigmoid", "silu", "leaky_relu", "elu", "none"], case_sensitive=False),
+    show_default=True,
+    help="Activation between layers (or 'none')",
+)
+@click.option(
+    "--activations",
+    default=None,
+    help="Comma-separated per-hidden-layer activations (overrides --activation)",
+)
 @click.pass_context
-def create_linear(ctx, input_size, hidden_sizes, output_size):
+def create_linear(ctx, input_size, hidden_sizes, output_size, activation, activations):
     """Create linear model."""
     try:
         hidden_list = [int(x.strip()) for x in hidden_sizes.split(",")]
+        activations_list = None
+        if activations:
+            activations_list = [x.strip() for x in str(activations).split(",") if x.strip()]
+            if len(activations_list) != len(hidden_list):
+                raise ValueError(
+                    f"--activations must have {len(hidden_list)} value(s) (one per hidden layer)"
+                )
         cmds = get_model_commands()
-        result = cmds.create_linear_model(input_size, hidden_list, output_size)
+        result = cmds.create_linear_model(
+            input_size,
+            hidden_list,
+            output_size,
+            activation=str(activation),
+            activations=activations_list,
+        )
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(result))
         else:
@@ -122,13 +147,37 @@ def create_linear(ctx, input_size, hidden_sizes, output_size):
 
 @model.command("mlp")
 @click.option("--layers", required=True)
+@click.option(
+    "--activation",
+    default="relu",
+    type=click.Choice(["relu", "gelu", "tanh", "sigmoid", "silu", "leaky_relu", "elu", "none"], case_sensitive=False),
+    show_default=True,
+    help="Activation between layers (or 'none')",
+)
+@click.option(
+    "--activations",
+    default=None,
+    help="Comma-separated per-layer activations (count must be layers-2; overrides --activation)",
+)
 @click.pass_context
-def create_mlp(ctx, layers):
+def create_mlp(ctx, layers, activation, activations):
     """Create MLP."""
     try:
         layer_sizes = [int(x.strip()) for x in layers.split(",")]
+        activations_list = None
+        if activations:
+            activations_list = [x.strip() for x in str(activations).split(",") if x.strip()]
+            expected = max(len(layer_sizes) - 2, 0)
+            if len(activations_list) != expected:
+                raise ValueError(
+                    f"--activations must have {expected} value(s) (one per hidden transition)"
+                )
         cmds = get_model_commands()
-        result = cmds.create_mlp(layer_sizes)
+        result = cmds.create_mlp(
+            layer_sizes,
+            activation=str(activation),
+            activations=activations_list,
+        )
         if "error" in result:
             raise ValueError(result["error"])
         if ctx.obj.get("json_output"):
@@ -147,14 +196,40 @@ def create_mlp(ctx, layers):
 @click.option("--in-channels", required=True, type=int)
 @click.option("--out-channels", required=True)
 @click.option("--kernels", default=None)
+@click.option(
+    "--activation",
+    default="relu",
+    type=click.Choice(["relu", "gelu", "tanh", "sigmoid", "silu", "leaky_relu", "elu", "none"], case_sensitive=False),
+    show_default=True,
+    help="Activation between layers (or 'none')",
+)
+@click.option(
+    "--activations",
+    default=None,
+    help="Comma-separated per-layer activations (count must be out_channels-1; overrides --activation)",
+)
 @click.pass_context
-def create_cnn(ctx, in_channels, out_channels, kernels):
+def create_cnn(ctx, in_channels, out_channels, kernels, activation, activations):
     """Create CNN."""
     try:
         out_ch_list = [int(x.strip()) for x in out_channels.split(",")]
         kernel_list = [int(x.strip()) for x in kernels.split(",")] if kernels else None
+        activations_list = None
+        if activations:
+            activations_list = [x.strip() for x in str(activations).split(",") if x.strip()]
+            expected = max(len(out_ch_list) - 1, 0)
+            if len(activations_list) != expected:
+                raise ValueError(
+                    f"--activations must have {expected} value(s) (one per transition)"
+                )
         cmds = get_model_commands()
-        result = cmds.create_cnn(in_channels, out_ch_list, kernel_list)
+        result = cmds.create_cnn(
+            in_channels,
+            out_ch_list,
+            kernel_list,
+            activation=str(activation),
+            activations=activations_list,
+        )
         if "error" in result:
             raise ValueError(result["error"])
         if ctx.obj.get("json_output"):

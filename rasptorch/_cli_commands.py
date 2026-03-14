@@ -116,35 +116,65 @@ class ModelCommands:
 
     def _reconstruct_model(self, model_type: str, config: Dict[str, Any]) -> Any:
         """Reconstruct model from configuration."""
+        def _act_layer(name: str) -> Optional[Any]:
+            return self._make_activation_layer(name)
+
         if model_type == "MLP":
             layer_sizes = config.get("layer_sizes", [64, 32, 2])
+            activation = config.get("activation", "relu")
+            activations = config.get("activations")
             layers = []
             for i in range(len(layer_sizes) - 1):
                 layers.append(rasptorch.nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
                 if i < len(layer_sizes) - 2:
-                    layers.append(rasptorch.nn.ReLU())
+                    act_name = None
+                    if isinstance(activations, list) and i < len(activations):
+                        act_name = str(activations[i])
+                    else:
+                        act_name = str(activation)
+                    act = _act_layer(act_name)
+                    if act is not None:
+                        layers.append(act)
             return rasptorch.nn.Sequential(*layers)
         elif model_type == "Linear":
             input_size = config.get("input_size", 10)
             hidden_sizes = config.get("hidden_sizes", [32])
             output_size = config.get("output_size", 2)
+            activation = config.get("activation", "relu")
+            activations = config.get("activations")
             layers = []
             prev_size = input_size
-            for hidden_size in hidden_sizes:
+            for idx, hidden_size in enumerate(hidden_sizes):
                 layers.append(rasptorch.nn.Linear(prev_size, hidden_size))
-                layers.append(rasptorch.nn.ReLU())
+                act_name = None
+                if isinstance(activations, list) and idx < len(activations):
+                    act_name = str(activations[idx])
+                else:
+                    act_name = str(activation)
+                act = _act_layer(act_name)
+                if act is not None:
+                    layers.append(act)
                 prev_size = hidden_size
             layers.append(rasptorch.nn.Linear(prev_size, output_size))
             return rasptorch.nn.Sequential(*layers)
         elif model_type == "CNN":
             in_channels = config.get("in_channels", 3)
             out_channels = config.get("out_channels", [32, 64])
+            activation = config.get("activation", "relu")
+            activations = config.get("activations")
             layers = []
             in_ch = in_channels
             for i, out_ch in enumerate(out_channels):
                 layers.append(rasptorch.nn.Linear(in_ch, out_ch))
                 if i < len(out_channels) - 1:
-                    layers.append(rasptorch.nn.ReLU())
+                    act_name = None
+                    if isinstance(activations, list) and i < len(activations):
+                        act_name = str(activations[i])
+                    else:
+                        act_name = str(activation)
+                    act = _act_layer(act_name)
+                    if act is not None:
+                        layers.append(act)
                 in_ch = out_ch
             return rasptorch.nn.Sequential(*layers)
         elif model_type == "GRU":
@@ -158,6 +188,36 @@ class ModelCommands:
             return rasptorch.nn.Sequential(*layers)
         else:
             return None
+
+    def _normalize_activation_name(self, activation: str) -> str:
+        name = str(activation).strip().lower().replace("-", "_")
+        if name in {"", "none", "null", "no", "identity"}:
+            return "none"
+        if name in {"leaky", "leakyrelu"}:
+            return "leaky_relu"
+        if name in {"swish"}:
+            return "silu"
+        return name
+
+    def _make_activation_layer(self, activation: str) -> Optional[Any]:
+        name = self._normalize_activation_name(activation)
+        if name == "none":
+            return None
+        if name == "relu":
+            return rasptorch.nn.ReLU()
+        if name == "gelu":
+            return rasptorch.nn.GELU()
+        if name == "tanh":
+            return rasptorch.nn.Tanh()
+        if name == "sigmoid":
+            return rasptorch.nn.Sigmoid()
+        if name == "silu":
+            return rasptorch.nn.SiLU()
+        if name == "leaky_relu":
+            return rasptorch.nn.LeakyReLU()
+        if name == "elu":
+            return rasptorch.nn.ELU()
+        raise ValueError(f"Unknown activation: {activation}")
 
     def _flatten_layers(self, model: Any) -> List[Any]:
         """Best-effort flattening of Sequential-like modules into a list of layers."""
@@ -272,14 +332,28 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
-    def create_linear_model(self, input_size: int, hidden_sizes: list, output_size: int) -> Dict[str, Any]:
+    def create_linear_model(
+        self,
+        input_size: int,
+        hidden_sizes: list,
+        output_size: int,
+        activation: str = "relu",
+        activations: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Create a linear model."""
         try:
+            if isinstance(activations, list) and len(activations) != len(hidden_sizes):
+                return {
+                    "error": f"activations must have {len(hidden_sizes)} value(s) (one per hidden layer)"
+                }
             layers = []
             prev_size = input_size
-            for hidden_size in hidden_sizes:
+            for idx, hidden_size in enumerate(hidden_sizes):
                 layers.append(rasptorch.nn.Linear(prev_size, hidden_size))
-                layers.append(rasptorch.nn.ReLU())
+                act_name = activations[idx] if isinstance(activations, list) and idx < len(activations) else activation
+                act = self._make_activation_layer(act_name)
+                if act is not None:
+                    layers.append(act)
                 prev_size = hidden_size
             layers.append(rasptorch.nn.Linear(prev_size, output_size))
             model = rasptorch.nn.Sequential(*layers)
@@ -293,6 +367,8 @@ class ModelCommands:
                     "input_size": input_size,
                     "hidden_sizes": hidden_sizes,
                     "output_size": output_size,
+                    "activation": self._normalize_activation_name(activation),
+                    **({"activations": [self._normalize_activation_name(a) for a in activations]} if isinstance(activations, list) else {}),
                 },
             }
             self._save_session_model(model_id, model_data)
@@ -310,16 +386,29 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
-    def create_mlp(self, layer_sizes: List[int]) -> Dict[str, Any]:
+    def create_mlp(
+        self,
+        layer_sizes: List[int],
+        activation: str = "relu",
+        activations: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Create a Multi-Layer Perceptron."""
         if len(layer_sizes) < 2:
             return {"error": "MLP requires at least 2 layers"}
         try:
+            expected = max(len(layer_sizes) - 2, 0)
+            if isinstance(activations, list) and len(activations) != expected:
+                return {
+                    "error": f"activations must have {expected} value(s) (one per hidden transition)"
+                }
             layers = []
             for i in range(len(layer_sizes) - 1):
                 layers.append(rasptorch.nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
                 if i < len(layer_sizes) - 2:
-                    layers.append(rasptorch.nn.ReLU())
+                    act_name = activations[i] if isinstance(activations, list) and i < len(activations) else activation
+                    act = self._make_activation_layer(act_name)
+                    if act is not None:
+                        layers.append(act)
             model = rasptorch.nn.Sequential(*layers)
             model_id = str(uuid.uuid4())[:8]
             
@@ -327,7 +416,11 @@ class ModelCommands:
                 "model_id": model_id,
                 "model": model,
                 "type": "MLP",
-                "config": {"layer_sizes": layer_sizes},
+                "config": {
+                    "layer_sizes": layer_sizes,
+                    "activation": self._normalize_activation_name(activation),
+                    **({"activations": [self._normalize_activation_name(a) for a in activations]} if isinstance(activations, list) else {}),
+                },
             }
             self._save_session_model(model_id, model_data)
             
@@ -343,11 +436,23 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
-    def create_cnn(self, in_channels: int, out_channels: List[int], kernel_sizes: List[int] = None) -> Dict[str, Any]:
+    def create_cnn(
+        self,
+        in_channels: int,
+        out_channels: List[int],
+        kernel_sizes: List[int] = None,
+        activation: str = "relu",
+        activations: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Create a CNN."""
         if not out_channels:
             return {"error": "CNN requires output channels"}
         try:
+            expected = max(len(out_channels) - 1, 0)
+            if isinstance(activations, list) and len(activations) != expected:
+                return {
+                    "error": f"activations must have {expected} value(s) (one per transition)"
+                }
             if kernel_sizes is None:
                 kernel_sizes = [3] * len(out_channels)
             layers = []
@@ -355,7 +460,10 @@ class ModelCommands:
             for i, out_ch in enumerate(out_channels):
                 layers.append(rasptorch.nn.Linear(in_ch, out_ch))
                 if i < len(out_channels) - 1:
-                    layers.append(rasptorch.nn.ReLU())
+                    act_name = activations[i] if isinstance(activations, list) and i < len(activations) else activation
+                    act = self._make_activation_layer(act_name)
+                    if act is not None:
+                        layers.append(act)
                 in_ch = out_ch
             model = rasptorch.nn.Sequential(*layers)
             model_id = str(uuid.uuid4())[:8]
@@ -368,6 +476,8 @@ class ModelCommands:
                     "in_channels": in_channels,
                     "out_channels": out_channels,
                     "kernel_sizes": kernel_sizes,
+                    "activation": self._normalize_activation_name(activation),
+                    **({"activations": [self._normalize_activation_name(a) for a in activations]} if isinstance(activations, list) else {}),
                 },
             }
             self._save_session_model(model_id, model_data)
