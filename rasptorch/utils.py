@@ -8,6 +8,32 @@ from . import vulkan_backend as vk
 from .tensor import Tensor
 
 
+def resolve_device(device: str | None) -> str:
+    """Resolve a user-provided device string.
+
+    Accepted values:
+    - "cpu": force CPU
+    - "gpu": request GPU (may still fall back internally if Vulkan is unavailable)
+    - "auto": use GPU if Vulkan initializes successfully, else CPU
+
+    Returns: "cpu" or "gpu".
+    """
+
+    if device is None:
+        return "cpu"
+
+    d = str(device).strip().lower()
+    if d == "auto":
+        return "gpu" if vk.is_available() else "cpu"
+    if d in ("cpu", "gpu"):
+        # For GPU, proactively try init so callers can surface failures early.
+        if d == "gpu":
+            vk.init(strict=False)
+        return d
+
+    raise ValueError(f"Unknown device: {device!r} (expected 'cpu', 'gpu', or 'auto')")
+
+
 def _materialize_params(parameters: Iterable[Tensor]) -> list[Tensor]:
     return [p for p in parameters if getattr(p, "requires_grad", False)]
 

@@ -24,13 +24,21 @@ except ImportError:
 class ChatREPL:
     """Interactive chat-like REPL for rasptorch."""
 
-    def __init__(self):
+    def __init__(self, *, device: str = "cpu"):
         self.history_file = os.path.expanduser("~/.rasptorch_history")
         self.session: Optional[PromptSession] = None
+        resolved_device = "cpu"
+        if _HAS_RASPTORCH:
+            try:
+                from .utils import resolve_device
+
+                resolved_device = resolve_device(device)
+            except Exception:
+                resolved_device = "cpu"
         self.context: Dict[str, Any] = {
             "train_epochs": 5,
             "batch_size": 32,
-            "device": "cpu",
+            "device": resolved_device,
             "optimizer": "Adam",
             "learning_rate": 0.001,
         }
@@ -490,29 +498,25 @@ Type 'help <command>' for more details.
         """Show system info."""
         try:
             import rasptorch
-            from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
+            from . import vulkan_backend as vk
 
             device = self.context.get("device", "cpu")
 
             print(f"rasptorch version: {rasptorch.__version__}")
             print(f"numpy version: {np.__version__}")
-            if _HAS_VULKAN:
-                print(f"vulkan: ✓ Available")
-                if device == "gpu":
-                    print(f"device: gpu")
-                else:
-                    print(f"device: cpu (gpu available via Vulkan)")
+            if vk.using_vulkan():
+                print("vulkan: ✓ Using GPU")
             else:
-                print(f"vulkan: ✗ Not available")
-                if _VULKAN_DISABLED_REASON:
-                    print(f"  Reason: {_VULKAN_DISABLED_REASON}")
+                print("vulkan: ✗ Not using GPU")
+                reason = vk.disabled_reason()
+                if reason:
+                    print(f"  Reason: {reason}")
 
-                # If user requested GPU in this session but Vulkan isn't available,
-                # surface that mismatch.
-                if device == "gpu":
-                    print(f"device: gpu (requested, but Vulkan unavailable)")
-                else:
-                    print(f"device: cpu")
+            if device == "gpu" and not vk.using_vulkan():
+                print("device: gpu (requested, but Vulkan not active)")
+            else:
+                print(f"device: {device}")
+
         except Exception as e:
             print(f"✗ Error: {e}")
 
@@ -535,12 +539,13 @@ Type 'help <command>' for more details.
             return
         
         try:
+            device = self.context.get("device", "cpu")
             if subcmd == "create":
-                result = TensorCommands.create_random(shape)
+                result = TensorCommands.create_random(shape, device=device)
             elif subcmd == "zeros":
-                result = TensorCommands.create_zeros(shape)
+                result = TensorCommands.create_zeros(shape, device=device)
             elif subcmd == "ones":
-                result = TensorCommands.create_ones(shape)
+                result = TensorCommands.create_ones(shape, device=device)
             else:
                 print(f"✗ Unknown tensor command: {subcmd}")
                 return
@@ -1032,23 +1037,42 @@ Type 'help <command>' for more details.
             print(f"✓ Device set to: CPU")
         
         elif subcmd == "gpu":
-            from .vulkan_backend import _HAS_VULKAN
-            if not _HAS_VULKAN:
-                print(f"✗ Vulkan GPU not available. Run 'info' for details.")
+            try:
+                from . import vulkan_backend as vk
+
+                vk.init(strict=True)
+            except Exception as e:
+                print("✗ Vulkan GPU init failed; staying on CPU")
+                print(f"  {e}")
+                reason = None
+                try:
+                    from . import vulkan_backend as vk
+
+                    reason = vk.disabled_reason()
+                except Exception:
+                    reason = None
+                if reason:
+                    print(f"  Reason: {reason}")
                 return
+
             self.context["device"] = "gpu"
-            print(f"✓ Device set to: GPU (Vulkan)")
+            print("✓ Device set to: GPU (Vulkan)")
         
         elif subcmd == "status":
-            from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
             device = self.context.get("device", "cpu")
             print(f"Current device: {device.upper()}")
-            if _HAS_VULKAN:
-                print(f"Vulkan: ✓ Available (can use GPU)")
-            else:
-                print(f"Vulkan: ✗ Not available (CPU only)")
-                if _VULKAN_DISABLED_REASON:
-                    print(f"  Reason: {_VULKAN_DISABLED_REASON}")
+            try:
+                from . import vulkan_backend as vk
+
+                if vk.using_vulkan():
+                    print("Vulkan: ✓ Using GPU")
+                else:
+                    print("Vulkan: ✗ Not using GPU")
+                    reason = vk.disabled_reason()
+                    if reason:
+                        print(f"  Reason: {reason}")
+            except Exception as e:
+                print(f"Vulkan: ? (error checking status: {e})")
         
         else:
             print(f"✗ Unknown device command: {subcmd}")

@@ -1375,6 +1375,27 @@ class _VulkanContext:
 _CTX: Optional[_VulkanContext] = None
 
 
+def using_vulkan() -> bool:
+    """Return True if rasptorch is currently using real Vulkan GPU execution.
+
+    Note: This is stronger than merely having the Python Vulkan bindings
+    installed. It indicates the Vulkan context successfully initialized.
+    """
+
+    return bool(_HAS_VULKAN and _CTX is not None)
+
+
+def is_available() -> bool:
+    """Return True if Vulkan can be initialized (non-strict).
+
+    This attempts initialization once; on failure, Vulkan is disabled and
+    this returns False.
+    """
+
+    init(strict=False)
+    return using_vulkan()
+
+
 def _disable_vulkan(reason: str) -> None:
     global _HAS_VULKAN, _VULKAN_DISABLED_REASON, _CTX
     _HAS_VULKAN = False

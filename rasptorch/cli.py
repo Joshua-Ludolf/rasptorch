@@ -7,18 +7,25 @@ from . import __version__
 from ._cli_utils import parse_shape, format_error, format_json_output
 from ._cli_commands import TensorCommands, get_model_commands
 from ._cli_chat import ChatREPL
+from .utils import resolve_device
 
 
 @click.group(invoke_without_command=True)
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
-@click.option("--device", default="cpu", help="Device: cpu or gpu")
+@click.option(
+    "--device",
+    default="auto",
+    type=click.Choice(["cpu", "gpu", "auto"], case_sensitive=False),
+    show_default=True,
+    help="Device selection: cpu, gpu, or auto (gpu when Vulkan is working)",
+)
 @click.version_option(__version__)
 @click.pass_context
 def cli(ctx: click.Context, json_output: bool, device: str):
     """rasptorch - Deep learning on Raspberry Pi 5."""
     ctx.ensure_object(dict)
     ctx.obj["json_output"] = json_output
-    ctx.obj["device"] = device
+    ctx.obj["device"] = resolve_device(device)
 
 
 @cli.group()
@@ -29,14 +36,14 @@ def tensor():
 
 @tensor.command()
 @click.option("--shape", required=True)
-@click.option("--device", default="cpu", type=click.Choice(["cpu", "gpu"]))
+@click.option("--device", default="auto", type=click.Choice(["cpu", "gpu", "auto"], case_sensitive=False), show_default=True)
 @click.option("--dtype", default="float32")
 @click.pass_context
 def random(ctx, shape, device, dtype):
     """Create random tensor."""
     try:
         shape_tuple = parse_shape(shape)
-        result = TensorCommands.create_random(shape_tuple, dtype, device)
+        result = TensorCommands.create_random(shape_tuple, dtype, resolve_device(device))
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(result))
         else:
@@ -51,13 +58,13 @@ def random(ctx, shape, device, dtype):
 
 @tensor.command()
 @click.option("--shape", required=True)
-@click.option("--device", default="cpu", type=click.Choice(["cpu", "gpu"]))
+@click.option("--device", default="auto", type=click.Choice(["cpu", "gpu", "auto"], case_sensitive=False), show_default=True)
 @click.pass_context
 def zeros(ctx, shape, device):
     """Create zeros tensor."""
     try:
         shape_tuple = parse_shape(shape)
-        result = TensorCommands.create_zeros(shape_tuple, "float32", device)
+        result = TensorCommands.create_zeros(shape_tuple, "float32", resolve_device(device))
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(result))
         else:
@@ -72,13 +79,13 @@ def zeros(ctx, shape, device):
 
 @tensor.command()
 @click.option("--shape", required=True)
-@click.option("--device", default="cpu", type=click.Choice(["cpu", "gpu"]))
+@click.option("--device", default="auto", type=click.Choice(["cpu", "gpu", "auto"], case_sensitive=False), show_default=True)
 @click.pass_context
 def ones(ctx, shape, device):
     """Create ones tensor."""
     try:
         shape_tuple = parse_shape(shape)
-        result = TensorCommands.create_ones(shape_tuple, "float32", device)
+        result = TensorCommands.create_ones(shape_tuple, "float32", resolve_device(device))
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(result))
         else:
@@ -412,13 +419,21 @@ def load_model(ctx, path):
 @click.option("--epochs", "-e", type=int, default=10, help="Number of epochs")
 @click.option("--lr", type=float, default=0.001, help="Learning rate")
 @click.option("--batch-size", "-b", type=int, default=32, help="Batch size")
-@click.option("--device", type=click.Choice(["cpu", "gpu"]), default="cpu", help="Device (cpu or gpu for Vulkan)")
+@click.option(
+    "--device",
+    type=click.Choice(["cpu", "gpu", "auto"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Device selection: cpu, gpu, or auto (gpu when Vulkan is working)",
+)
 @click.option("--optimizer", default="Adam", type=click.Choice(["Adam", "SGD"]), help="Optimizer type")
 @click.pass_context
 def train_model(ctx, model_id, epochs, lr, batch_size, device, optimizer):
     """Train a model."""
     try:
         cmds = get_model_commands()
+
+        device = resolve_device(device)
         
         if ctx.obj.get("json_output"):
             click.echo('{"status": "training_started"}')
@@ -479,7 +494,7 @@ def combine_models(ctx, model_a, model_b):
 @click.pass_context
 def chat(ctx):
     """Interactive chat mode."""
-    repl = ChatREPL()
+    repl = ChatREPL(device=ctx.obj.get("device", "cpu"))
     repl.run()
 
 
@@ -489,19 +504,17 @@ def info(ctx):
     """Show info."""
     try:
         import numpy
-        from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
+        from . import vulkan_backend as vk
         
         info_data = {
             "rasptorch_version": __version__,
             "numpy_version": numpy.__version__,
             "device": ctx.obj.get("device", "cpu"),
-            "vulkan_available": _HAS_VULKAN,
+            "vulkan_available": vk.is_available(),
+            "vulkan_using_real_gpu": vk.using_vulkan(),
         }
-        
-        if _VULKAN_DISABLED_REASON:
-            info_data["vulkan_status"] = _VULKAN_DISABLED_REASON
-        else:
-            info_data["vulkan_status"] = "Available"
+
+        info_data["vulkan_status"] = vk.disabled_reason() or ("Available" if vk.using_vulkan() else "Unavailable")
         
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(info_data))
@@ -509,12 +522,13 @@ def info(ctx):
             click.echo(f"rasptorch: {info_data['rasptorch_version']}")
             click.echo(f"numpy: {info_data['numpy_version']}")
             click.echo(f"device: {info_data['device']}")
-            if _HAS_VULKAN:
-                click.echo(f"vulkan: ✓ Available")
+            if info_data["vulkan_using_real_gpu"]:
+                click.echo(f"vulkan: ✓ Using GPU")
             else:
-                click.echo(f"vulkan: ✗ Not available")
-                if _VULKAN_DISABLED_REASON:
-                    click.echo(f"  Reason: {_VULKAN_DISABLED_REASON}")
+                click.echo(f"vulkan: ✗ Not using GPU")
+                reason = vk.disabled_reason()
+                if reason:
+                    click.echo(f"  Reason: {reason}")
     except Exception as e:
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(format_error(str(e))))
