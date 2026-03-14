@@ -121,7 +121,7 @@ python rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --ou
 python rasptorch --json tensor random --shape 2,3,4
 ```
 
-See [rasptorch CLI.md](rasptorch%20CLI.md) for **complete CLI documentation**, including training, saving/loading models, and agent integration.
+See rasptorch/rasptorch CLI.md for **complete CLI documentation**, including training, saving/loading models, and agent integration.
 
 
 ## GPU Training (Vulkan)
