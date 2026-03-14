@@ -390,17 +390,32 @@ def info(ctx):
     """Show info."""
     try:
         import numpy
+        from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
+        
         info_data = {
             "rasptorch_version": __version__,
             "numpy_version": numpy.__version__,
             "device": ctx.obj.get("device", "cpu"),
+            "vulkan_available": _HAS_VULKAN,
         }
+        
+        if _VULKAN_DISABLED_REASON:
+            info_data["vulkan_status"] = _VULKAN_DISABLED_REASON
+        else:
+            info_data["vulkan_status"] = "Available"
+        
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(info_data))
         else:
             click.echo(f"rasptorch: {info_data['rasptorch_version']}")
             click.echo(f"numpy: {info_data['numpy_version']}")
             click.echo(f"device: {info_data['device']}")
+            if _HAS_VULKAN:
+                click.echo(f"vulkan: ✓ Available")
+            else:
+                click.echo(f"vulkan: ✗ Not available")
+                if _VULKAN_DISABLED_REASON:
+                    click.echo(f"  Reason: {_VULKAN_DISABLED_REASON}")
     except Exception as e:
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(format_error(str(e))))

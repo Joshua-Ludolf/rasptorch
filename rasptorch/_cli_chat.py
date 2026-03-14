@@ -119,7 +119,8 @@ MODEL BUILDERS:
 MODEL MANAGEMENT:
   model list                   List all models
   model info <id>              Show model details
-  model use <id>               Select model for training
+  model use|select <id>        Select model for training
+  model deselect               Deselect current model
   model remove <id>            Remove a model
   model remove-all             Remove all models
 
@@ -131,6 +132,11 @@ TRAINING:
   train epochs <n>             Set training epochs
   train batch-size <n>         Set batch size
   train start                  Start training
+
+DEVICE:
+  device cpu                   Use CPU for operations
+  device gpu                   Use Vulkan GPU for operations
+  device status                Show current device
 
 UTILITY:
   info                         Show version & environment
@@ -196,6 +202,9 @@ Type 'help <command>' for more details.
         elif cmd == "optimizer":
             self._handle_optimizer_command(parts[1:])
         
+        elif cmd == "device":
+            self._handle_device_command(parts[1:])
+        
         else:
             print(f"✗ Command not recognized: {cmd}")
             print(f"  Type 'help' for available commands")
@@ -207,6 +216,7 @@ Type 'help <command>' for more details.
             "model": "model mlp|cnn|gru|transformer|lora <config> - Create/manage models",
             "train": "train epochs|batch-size|start - Configure and start training",
             "optimizer": "optimizer create|set-lr - Configure optimizer",
+            "device": "device cpu|gpu|status - Set compute device (GPU requires Vulkan)",
             "info": "info - Show system information",
         }
         print(helps.get(subcommand, f"No help available for {subcommand}"))
@@ -215,9 +225,18 @@ Type 'help <command>' for more details.
         """Show system info."""
         try:
             import rasptorch
+            from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
+            
             print(f"rasptorch version: {rasptorch.__version__}")
             print(f"numpy version: {np.__version__}")
-            print(f"device: cpu (gpu available if Vulkan present)")
+            if _HAS_VULKAN:
+                print(f"vulkan: ✓ Available")
+                print(f"device: cpu (gpu available via Vulkan)")
+            else:
+                print(f"vulkan: ✗ Not available")
+                if _VULKAN_DISABLED_REASON:
+                    print(f"  Reason: {_VULKAN_DISABLED_REASON}")
+                print(f"device: cpu")
         except Exception as e:
             print(f"✗ Error: {e}")
 
@@ -322,9 +341,9 @@ Type 'help <command>' for more details.
                 except ValueError:
                     print("✗ Invalid size specification")
             
-            elif subcmd == "use":
+            elif subcmd in ("use", "select"):
                 if len(args) < 2:
-                    print("✗ Usage: model use <model_id>")
+                    print("✗ Usage: model use|select <model_id>")
                     return
                 model_id = args[1]
                 if model_id in cmds.models:
@@ -332,6 +351,14 @@ Type 'help <command>' for more details.
                     print(f"✓ Selected model: {model_id[:8]}")
                 else:
                     print(f"✗ Model not found: {model_id}")
+            
+            elif subcmd == "deselect":
+                if "current_model" not in self.context:
+                    print("✗ No model currently selected")
+                    return
+                model_id = self.context["current_model"]
+                del self.context["current_model"]
+                print(f"✓ Deselected model: {model_id[:8]}")
             
             elif subcmd == "info":
                 if "current_model" not in self.context:
@@ -507,6 +534,40 @@ Type 'help <command>' for more details.
         
         else:
             print(f"✗ Unknown optimizer command: {subcmd}")
+
+    def _handle_device_command(self, args: List[str]):
+        """Handle device configuration."""
+        if not args:
+            print("✗ Usage: device cpu|gpu|status")
+            return
+        
+        subcmd = args[0].lower()
+        
+        if subcmd == "cpu":
+            self.context["device"] = "cpu"
+            print(f"✓ Device set to: CPU")
+        
+        elif subcmd == "gpu":
+            from .vulkan_backend import _HAS_VULKAN
+            if not _HAS_VULKAN:
+                print(f"✗ Vulkan GPU not available. Run 'info' for details.")
+                return
+            self.context["device"] = "gpu"
+            print(f"✓ Device set to: GPU (Vulkan)")
+        
+        elif subcmd == "status":
+            from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
+            device = self.context.get("device", "cpu")
+            print(f"Current device: {device.upper()}")
+            if _HAS_VULKAN:
+                print(f"Vulkan: ✓ Available (can use GPU)")
+            else:
+                print(f"Vulkan: ✗ Not available (CPU only)")
+                if _VULKAN_DISABLED_REASON:
+                    print(f"  Reason: {_VULKAN_DISABLED_REASON}")
+        
+        else:
+            print(f"✗ Unknown device command: {subcmd}")
 
     def display_table(self, headers: List[str], rows: List[List[str]]):
         """Display formatted table."""
