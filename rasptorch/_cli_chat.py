@@ -120,6 +120,7 @@ MODEL MANAGEMENT:
   model list                   List all models
   model info <id>              Show model details
   model use|select <id>        Select model for training
+    model combine <id1> <id2>     Combine models (A then B)
   model deselect               Deselect current model
   model remove <id>            Remove a model
   model remove-all             Remove all models
@@ -226,17 +227,28 @@ Type 'help <command>' for more details.
         try:
             import rasptorch
             from .vulkan_backend import _HAS_VULKAN, _VULKAN_DISABLED_REASON
-            
+
+            device = self.context.get("device", "cpu")
+
             print(f"rasptorch version: {rasptorch.__version__}")
             print(f"numpy version: {np.__version__}")
             if _HAS_VULKAN:
                 print(f"vulkan: ✓ Available")
-                print(f"device: cpu (gpu available via Vulkan)")
+                if device == "gpu":
+                    print(f"device: gpu")
+                else:
+                    print(f"device: cpu (gpu available via Vulkan)")
             else:
                 print(f"vulkan: ✗ Not available")
                 if _VULKAN_DISABLED_REASON:
                     print(f"  Reason: {_VULKAN_DISABLED_REASON}")
-                print(f"device: cpu")
+
+                # If user requested GPU in this session but Vulkan isn't available,
+                # surface that mismatch.
+                if device == "gpu":
+                    print(f"device: gpu (requested, but Vulkan unavailable)")
+                else:
+                    print(f"device: cpu")
         except Exception as e:
             print(f"✗ Error: {e}")
 
@@ -351,6 +363,20 @@ Type 'help <command>' for more details.
                     print(f"✓ Selected model: {model_id[:8]}")
                 else:
                     print(f"✗ Model not found: {model_id}")
+
+            elif subcmd == "combine":
+                if len(args) < 3:
+                    print("✗ Usage: model combine <model_id_a> <model_id_b>")
+                    return
+                model_a_id = args[1]
+                model_b_id = args[2]
+                result = cmds.combine_models(model_a_id, model_b_id)
+                if "error" in result:
+                    print(f"✗ Error: {result['error']}")
+                    return
+                mid = result["model_id"]
+                self.context["current_model"] = mid
+                print(f"✓ Combined model: {mid[:8]}")
             
             elif subcmd == "deselect":
                 if "current_model" not in self.context:

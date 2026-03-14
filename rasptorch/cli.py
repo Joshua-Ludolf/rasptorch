@@ -376,6 +376,30 @@ def train_model(ctx, model_id, epochs, lr, batch_size, device, optimizer):
         sys.exit(1)
 
 
+@model.command("combine")
+@click.argument("model_a")
+@click.argument("model_b")
+@click.pass_context
+def combine_models(ctx, model_a, model_b):
+    """Combine two models sequentially (A then B)."""
+    try:
+        cmds = get_model_commands()
+        result = cmds.combine_models(model_a, model_b)
+        if "error" in result:
+            raise ValueError(result["error"])
+
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(result))
+        else:
+            click.echo(f"✓ Combined model: {result['model_id'][:8]}")
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
+
+
 @cli.command()
 @click.pass_context
 def chat(ctx):

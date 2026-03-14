@@ -1,6 +1,6 @@
 """Command implementations for rasptorch CLI."""
 
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple, List, Optional
 import numpy as np
 import rasptorch
 import os
@@ -158,6 +158,119 @@ class ModelCommands:
             return rasptorch.nn.Sequential(*layers)
         else:
             return None
+
+    def _flatten_layers(self, model: Any) -> List[Any]:
+        """Best-effort flattening of Sequential-like modules into a list of layers."""
+        if model is None:
+            return []
+
+        # rasptorch.nn.Sequential stores layers in `.layers`.
+        layers = getattr(model, "layers", None)
+        if isinstance(layers, list):
+            flat: List[Any] = []
+            for layer in layers:
+                flat.extend(self._flatten_layers(layer))
+            return flat
+
+        return [model]
+
+    def _infer_linear_in_out(self, model: Any) -> Tuple[Optional[int], Optional[int]]:
+        """Infer (in_features, out_features) by scanning Linear layers, if possible."""
+        flat = self._flatten_layers(model)
+
+        first_in: Optional[int] = None
+        last_out: Optional[int] = None
+
+        for layer in flat:
+            try:
+                if isinstance(layer, rasptorch.nn.Linear):
+                    # Linear.weight: [out, in]
+                    if first_in is None:
+                        first_in = int(layer.weight.shape[1])
+                    last_out = int(layer.weight.shape[0])
+            except Exception:
+                continue
+
+        return first_in, last_out
+
+    def combine_models(self, model_a_id: str, model_b_id: str) -> Dict[str, Any]:
+        """Combine two existing models sequentially (A then B) into a new model."""
+        if model_a_id not in self.models:
+            return {"error": f"Model {model_a_id} not found"}
+        if model_b_id not in self.models:
+            return {"error": f"Model {model_b_id} not found"}
+
+        try:
+            model_a_data = self.models[model_a_id]
+            model_b_data = self.models[model_b_id]
+
+            model_a = model_a_data.get("model")
+            model_b = model_b_data.get("model")
+
+            if model_a is None:
+                model_a = self._reconstruct_model(model_a_data.get("type", "Unknown"), model_a_data.get("config", {}))
+                if model_a is None:
+                    return {"error": f"Cannot reconstruct {model_a_data.get('type', 'Unknown')} model"}
+                model_a_data["model"] = model_a
+
+            if model_b is None:
+                model_b = self._reconstruct_model(model_b_data.get("type", "Unknown"), model_b_data.get("config", {}))
+                if model_b is None:
+                    return {"error": f"Cannot reconstruct {model_b_data.get('type', 'Unknown')} model"}
+                model_b_data["model"] = model_b
+
+            a_in, a_out = self._infer_linear_in_out(model_a)
+            b_in, b_out = self._infer_linear_in_out(model_b)
+
+            # If we can infer linear IO dims, enforce compatibility.
+            if a_out is not None and b_in is not None and a_out != b_in:
+                return {
+                    "error": f"Incompatible models: first outputs {a_out} but second expects {b_in}"
+                }
+
+            combined_layers = self._flatten_layers(model_a) + self._flatten_layers(model_b)
+            if not combined_layers:
+                return {"error": "Failed to combine models (no layers found)"}
+
+            combined_model = rasptorch.nn.Sequential(*combined_layers)
+            combined_id = str(uuid.uuid4())[:8]
+
+            combined_config: Dict[str, Any] = {
+                "combine": "sequential",
+                "model_a_id": model_a_id,
+                "model_b_id": model_b_id,
+            }
+            if a_in is not None:
+                combined_config["input_size"] = a_in
+            if b_out is not None:
+                combined_config["output_size"] = b_out
+
+            model_data = {
+                "model_id": combined_id,
+                "model": combined_model,
+                "type": "Combined",
+                "config": combined_config,
+            }
+            self._save_session_model(combined_id, model_data)
+
+            return {
+                "status": "success",
+                "model_id": combined_id,
+                "type": "Combined",
+                "message": "Models combined sequentially",
+                "combined_from": {
+                    "model_a_id": model_a_id,
+                    "model_b_id": model_b_id,
+                },
+                "architecture": {
+                    "combine": "sequential",
+                    "input_size": a_in,
+                    "output_size": b_out,
+                    "num_layers": len(combined_layers),
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
     def create_linear_model(self, input_size: int, hidden_sizes: list, output_size: int) -> Dict[str, Any]:
         """Create a linear model."""
