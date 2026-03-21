@@ -83,7 +83,7 @@ Notes for GPU mode:
 
 Quick GPU validation:
 
-- `uv run gpu_demo.py --smoke-only`
+- `uv run gpu_demo.py --smoke-only` (
   - Initializes Vulkan strictly and runs fast correctness checks for core kernels.
   - If this fails, `uv run main.py --device gpu` will also fail.
 
@@ -102,9 +102,15 @@ For local development from this repo:
 
 rasptorch includes an **agent-native CLI** for tensor operations, model management, and training:
 
+
+
 ```bash
+# To start it
+-- uv run rasptorch chat (uv)
+-- rasptorch chat (.venv or standalone python)
+
 # Show available commands
-python rasptorch --help
+rasptorch --help (if using venv alone: rasptorch --help , if using uv: uv run rasptorch --help [follows for all commands in the markdown files])
 
 # chat
 python rasptorch chat (you can type help once the cli is up and running in chat mode)
