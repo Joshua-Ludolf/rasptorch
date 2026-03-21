@@ -79,7 +79,7 @@ Dev/test:
 Notes for GPU mode:
 
 - Requires working Vulkan drivers on your system.
-- Requires `glslc` (shader compiler) available on PATH.
+- Requires `glslc` (shader compiler) available on PATH (for raspberry pi users).
 
 Quick GPU validation:
 
