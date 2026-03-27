@@ -1,4 +1,10 @@
-"""Command implementations for rasptorch CLI."""
+"""Compatibility shim for CLI commands.
+
+This module re-exports from the implementation module.
+"""
+
+from __future__ import annotations
+
 
 from typing import Any, Dict, Tuple, List, Optional
 import numpy as np
@@ -266,7 +272,54 @@ class ModelCommands:
         if model is None:
             model_type = model_data.get("type", "Unknown")
             config = model_data.get("config", {})
-            model = self._reconstruct_model(model_type, config)
+            # Combined models need to be reconstructed from their component models.
+            if model_type == "Combined" and isinstance(config, dict) and str(config.get("combine")) == "sequential":
+                model_a_id = str(config.get("model_a_id", ""))
+                model_b_id = str(config.get("model_b_id", ""))
+                if not model_a_id or not model_b_id:
+                    # Missing linkage data; cannot reconstruct.
+                    return None
+                # Prefer reconstructing from existing session models.
+                model_a = self._ensure_model(model_a_id) if model_a_id in self.models else None
+                model_b = self._ensure_model(model_b_id) if model_b_id in self.models else None
+
+                # If components are missing from session, try embedded snapshots.
+                if model_a is None or model_b is None:
+                    try:
+                        a_snap = config.get("model_a_snapshot") or {}
+                        b_snap = config.get("model_b_snapshot") or {}
+                        if model_a is None and isinstance(a_snap, dict) and a_snap.get("type"):
+                            ma = self._reconstruct_model(str(a_snap.get("type")), a_snap.get("config") or {})
+                            if ma is not None and a_snap.get("state_dict"):
+                                self._apply_state_dict(ma, a_snap.get("state_dict"))
+                            model_a = ma
+                        if model_b is None and isinstance(b_snap, dict) and b_snap.get("type"):
+                            mb = self._reconstruct_model(str(b_snap.get("type")), b_snap.get("config") or {})
+                            if mb is not None and b_snap.get("state_dict"):
+                                self._apply_state_dict(mb, b_snap.get("state_dict"))
+                            model_b = mb
+                    except Exception:
+                        pass
+
+                if model_a is None or model_b is None:
+                    return None
+
+                combined_layers = self._flatten_layers(model_a) + self._flatten_layers(model_b)
+                if not combined_layers:
+                    return None
+
+                normalized_layers: List[Any] = []
+                for layer in combined_layers:
+                    if hasattr(rasptorch.nn, "GRU") and isinstance(layer, rasptorch.nn.GRU):
+                        normalized_layers.append(_GRULastHidden(layer))
+                    elif hasattr(rasptorch.nn, "MultiheadAttention") and isinstance(layer, rasptorch.nn.MultiheadAttention):
+                        normalized_layers.append(_SelfAttention(layer))
+                    else:
+                        normalized_layers.append(layer)
+
+                model = rasptorch.nn.Sequential(*normalized_layers)
+            else:
+                model = self._reconstruct_model(model_type, config)
             if model is None:
                 return None
             # Apply saved weights if present.
@@ -606,6 +659,21 @@ class ModelCommands:
                 "model_a_type": model_a_data.get("type", "Unknown"),
                 "model_b_type": model_b_data.get("type", "Unknown"),
             }
+            # Embed minimal snapshots of components so Combined can be reconstructed
+            # even if individual session files are missing later.
+            try:
+                combined_config["model_a_snapshot"] = {
+                    "type": model_a_data.get("type", "Unknown"),
+                    "config": model_a_data.get("config", {}),
+                    "state_dict": model_a_data.get("model").state_dict() if model_a_data.get("model") else model_a_data.get("state_dict", {}),
+                }
+                combined_config["model_b_snapshot"] = {
+                    "type": model_b_data.get("type", "Unknown"),
+                    "config": model_b_data.get("config", {}),
+                    "state_dict": model_b_data.get("model").state_dict() if model_b_data.get("model") else model_b_data.get("state_dict", {}),
+                }
+            except Exception:
+                pass
             # Persist inferred IO sizes for downstream training / info.
             if a_spec.get("in_features") is not None:
                 combined_config["input_size"] = int(a_spec["in_features"])
@@ -919,10 +987,15 @@ class ModelCommands:
             return {"error": f"Model {model_id} not found"}
         try:
             model = self.models[model_id]["model"]
-            if optimizer_type.lower() == "adam":
+            opt = str(optimizer_type).strip().lower().replace("-", "").replace("_", "")
+            if opt == "adam":
                 optimizer = rasptorch.Adam(model.parameters(), lr=lr)
-            elif optimizer_type.lower() == "sgd":
+            elif opt == "adamw":
+                optimizer = rasptorch.AdamW(model.parameters(), lr=lr)
+            elif opt == "sgd":
                 optimizer = rasptorch.SGD(model.parameters(), lr=lr)
+            elif opt == "rmsprop":
+                optimizer = rasptorch.RMSProp(model.parameters(), lr=lr)
             else:
                 return {"error": f"Unknown optimizer: {optimizer_type}"}
             optimizer_id = str(id(optimizer))
@@ -985,6 +1058,37 @@ class ModelCommands:
             model = self._ensure_model(model_id)
             if model is None:
                 model_type = model_data.get("type", "Unknown")
+                if model_type == "Combined":
+                    cfg2 = model_data.get("config", {}) or {}
+                    a_id = str(cfg2.get("model_a_id", ""))
+                    b_id = str(cfg2.get("model_b_id", ""))
+                    missing: List[str] = []
+                    if not a_id:
+                        missing.append("model_a_id")
+                    if not b_id:
+                        missing.append("model_b_id")
+                    if a_id and a_id not in self.models:
+                        missing.append(f"A not found: {a_id}")
+                    if b_id and b_id not in self.models:
+                        missing.append(f"B not found: {b_id}")
+
+                    # If IDs exist, try to ensure each side to identify which reconstruction failed.
+                    if a_id and a_id in self.models:
+                        try:
+                            if self._ensure_model(a_id) is None:
+                                a_type = (self.models.get(a_id) or {}).get("type", "Unknown")
+                                missing.append(f"A cannot reconstruct: {a_type}[{a_id[:8]}]")
+                        except Exception as ex:
+                            missing.append(f"A reconstruct error: {type(ex).__name__}")
+                    if b_id and b_id in self.models:
+                        try:
+                            if self._ensure_model(b_id) is None:
+                                b_type = (self.models.get(b_id) or {}).get("type", "Unknown")
+                                missing.append(f"B cannot reconstruct: {b_type}[{b_id[:8]}]")
+                        except Exception as ex:
+                            missing.append(f"B reconstruct error: {type(ex).__name__}")
+                    extra = f" (missing: {', '.join(missing)})" if missing else ""
+                    return {"error": f"Cannot reconstruct Combined model{extra}"}
                 return {"error": f"Cannot reconstruct {model_type} model"}
 
             state_dict = model.state_dict()
@@ -1113,10 +1217,15 @@ class ModelCommands:
                     return {"error": f"Failed to move model to GPU: {str(e)}"}
             
             # Create optimizer
-            if optimizer_type.lower() == "adam":
+            opt = str(optimizer_type).strip().lower().replace("-", "").replace("_", "")
+            if opt == "adam":
                 optimizer = rasptorch.Adam(model.parameters(), lr=learning_rate)
-            elif optimizer_type.lower() == "sgd":
+            elif opt == "adamw":
+                optimizer = rasptorch.AdamW(model.parameters(), lr=learning_rate)
+            elif opt == "sgd":
                 optimizer = rasptorch.SGD(model.parameters(), lr=learning_rate)
+            elif opt == "rmsprop":
+                optimizer = rasptorch.RMSProp(model.parameters(), lr=learning_rate)
             else:
                 return {"error": f"Unknown optimizer: {optimizer_type}"}
             
@@ -1213,7 +1322,17 @@ class ModelCommands:
                 "training_history": training_history,
             }
         except Exception as e:
-            return {"error": str(e)}
+            import traceback
+
+            msg = str(e) if e is not None else ""
+            if not msg.strip():
+                msg = f"{type(e).__name__}: {repr(e)}"
+            tb = traceback.format_exc(limit=8)
+            return {
+                "error": msg,
+                "error_type": type(e).__name__,
+                "traceback": tb,
+            }
 
 
 _model_commands = ModelCommands()

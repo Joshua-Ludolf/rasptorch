@@ -1,15 +1,19 @@
 [project]
 name = "rasptorch"
-version = "2.0.5"
+version = "3.0.0"
 description = "Experimental PyTorch-like autograd engine with an optional Vulkan compute backend (Raspberry Pi 5-focused)."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
 	"numpy>=1.26",
-	"torch>=2.10.0",
+	"torch>=2.11.0",
 	"vulkan>=1.3.275.1",
 	"click>=8.0",
 	"prompt-toolkit>=3.0",
+	"streamlit>=1.55.0",
+	"pytest>=9.0.2",
+	"plotly>=6.6.0",
+	"build>=1.4.0",
 ]
 
 
@@ -51,7 +55,7 @@ include = ["rasptorch*"]
 rasptorch = ["shaders/*.spv", "shaders/*.comp"]
 
 [project.scripts]
-rasptorch = "rasptorch.cli:cli"
+rasptorch = "rasptorch.CLI.cli:cli"
 rasptorch-setup = "rasptorch._cli_setup:setup_shell_alias"
 
 [project.urls]

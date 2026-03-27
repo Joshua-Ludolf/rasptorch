@@ -2,12 +2,15 @@
 
 import click
 import json
+import subprocess
 import sys
-from . import __version__
+from pathlib import Path
+from typing import List, Tuple
+from .. import __version__
 from ._cli_utils import parse_shape, format_error, format_json_output
 from ._cli_commands import TensorCommands, get_model_commands
 from ._cli_chat import ChatREPL
-from .utils import resolve_device
+from ..utils import resolve_device
 
 
 @click.group(invoke_without_command=True)
@@ -504,7 +507,7 @@ def info(ctx):
     """Show info."""
     try:
         import numpy
-        from . import vulkan_backend as vk
+        from .. import vulkan_backend as vk
         
         info_data = {
             "rasptorch_version": __version__,
@@ -535,6 +538,29 @@ def info(ctx):
         else:
             click.echo(f"✗ Error: {e}")
         sys.exit(1)
+
+
+@cli.command()
+@click.option("--port", type=int, default=None, help="Port to run the Streamlit UI on")
+@click.option("--server-headless", is_flag=True, default=True, show_default=True, help="Run Streamlit in headless mode")
+@click.argument("streamlit_args", nargs=-1)
+@click.pass_context
+def ui(ctx: click.Context, port: int | None, server_headless: bool, streamlit_args: Tuple[str, ...]):
+    """Launch the Streamlit UI."""
+    # Resolve app path from the installed package location.
+    app_path = Path(__file__).resolve().parent / "ui" / "app.py"
+    if not app_path.exists():
+        raise click.ClickException(f"UI entry not found at: {app_path}")
+
+    cmd: List[str] = [sys.executable, "-m", "streamlit", "run", str(app_path)]
+    if server_headless:
+        cmd.extend(["--server.headless", "true"])
+    if port is not None:
+        cmd.extend(["--server.port", str(port)])
+    cmd.extend(list(streamlit_args))
+
+    # Use subprocess so this works even when Streamlit isn't installed as a console script.
+    raise SystemExit(subprocess.call(cmd))
 
 
 if __name__ == "__main__":

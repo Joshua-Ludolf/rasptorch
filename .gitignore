@@ -1,5 +1,6 @@
 # Python-generated files
 __pycache__/
+.pytest_cache/
 /rasptorch/__pycache__/*
 *.py[oc]
 build/
