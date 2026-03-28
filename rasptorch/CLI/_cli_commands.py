@@ -1136,10 +1136,24 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
+    def _safe_model_path(self, path: str) -> str:
+        """Resolve user-provided path to a safe location under a fixed root directory."""
+        base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
+        os.makedirs(base_dir, exist_ok=True)
+        # Disallow arbitrary absolute paths by treating them as simple filenames.
+        if os.path.isabs(path):
+            path = os.path.basename(path)
+        candidate = os.path.normpath(os.path.join(base_dir, path))
+        # Ensure the resulting path is within the base directory.
+        if os.path.commonpath([base_dir, candidate]) != base_dir:
+            raise ValueError("Invalid model path")
+        return candidate
+
     def load_model(self, path: str) -> Dict[str, Any]:
         """Load model from file."""
         try:
-            ext = os.path.splitext(str(path))[1].lower()
+            safe_path = self._safe_model_path(str(path))
+            ext = os.path.splitext(str(safe_path))[1].lower()
             unsafe_load = False
             if ext in {".pth", ".pt"}:
                 try:
@@ -1147,13 +1161,13 @@ class ModelCommands:
                 except Exception as e:
                     return {"error": f"Loading {ext} requires torch (import failed: {e})"}
                 try:
-                    save_data = torch.load(path, map_location="cpu")
+                    save_data = torch.load(safe_path, map_location="cpu")
                 except Exception as e:
                     msg = str(e)
                     # Back-compat: handle older files that contained NumPy arrays.
                     if "Weights only load failed" in msg or "weights_only" in msg:
                         try:
-                            save_data = torch.load(path, map_location="cpu", weights_only=False)
+                            save_data = torch.load(safe_path, map_location="cpu", weights_only=False)
                             unsafe_load = True
                         except TypeError:
                             raise
@@ -1162,7 +1176,7 @@ class ModelCommands:
                 fmt = "torch"
             else:
                 import pickle
-                with open(path, "rb") as f:
+                with open(safe_path, "rb") as f:
                     save_data = pickle.load(f)
                 fmt = "pickle"
             
