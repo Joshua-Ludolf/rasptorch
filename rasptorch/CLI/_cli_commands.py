@@ -1138,15 +1138,26 @@ class ModelCommands:
 
     def _safe_model_path(self, path: str) -> str:
         """Resolve user-provided path to a safe location under a fixed root directory."""
-        base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
+        # Fixed base directory for all model files.
+        base_dir = os.path.abspath(os.path.join(tempfile.gettempdir(), "rasptorch_models"))
         os.makedirs(base_dir, exist_ok=True)
+
+        # Normalize the user-provided path string.
+        path = (path or "").strip()
+        if not path:
+            raise ValueError("Invalid model path")
+
         # Disallow arbitrary absolute paths by treating them as simple filenames.
         if os.path.isabs(path):
             path = os.path.basename(path)
-        candidate = os.path.normpath(os.path.join(base_dir, path))
+
+        # Build a normalized absolute path under the base directory.
+        candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, path)))
+
         # Ensure the resulting path is within the base directory.
         if os.path.commonpath([base_dir, candidate]) != base_dir:
             raise ValueError("Invalid model path")
+
         return candidate
 
     def load_model(self, path: str) -> Dict[str, Any]:
