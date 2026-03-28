@@ -1150,9 +1150,15 @@ class ModelCommands:
                     # Prefer safe, weights-only loading to avoid arbitrary code execution.
                     save_data = torch.load(path, map_location="cpu", weights_only=True)
                 except TypeError:
-                    # Older torch versions may not support weights_only; fall back to default,
-                    # which should still load state dict–style data for recent files.
-                    save_data = torch.load(path, map_location="cpu")
+                    # This PyTorch version does not support the weights_only argument.
+                    # To avoid unsafe deserialization with torch.load, refuse to load the file.
+                    return {
+                        "error": (
+                            "This environment uses an older PyTorch version that does not "
+                            "support safe weights-only loading. Please convert the model "
+                            "using a trusted offline tool with a newer PyTorch version and retry."
+                        )
+                    }
                 except Exception as e:
                     msg = str(e)
                     # Back-compat: previously this code attempted an unsafe fallback with
