@@ -1168,52 +1168,51 @@ class ModelCommands:
 
         return candidate
 
-    def _safe_torch_load(self, path: str) -> Tuple[Dict[str, Any], bool]:
+    def _safe_torch_load(self, path: str) -> Dict[str, Any]:
         """Safely load a torch checkpoint, preferring weights_only when available.
 
-        Returns a tuple of (save_data, unsafe_load_flag). The unsafe_load flag
-        indicates that we had to fall back to a less safe loading mode for
-        backwards compatibility with older files.
+        This helper only performs loads that do not require arbitrary object
+        deserialization. If safe loading is not supported by the installed
+        torch version or by the given file, it raises an exception instead of
+        falling back to an unsafe mode.
         """
         import torch  # type: ignore
 
-        unsafe_load = False
         try:
             # Prefer weights_only=True when supported by the installed torch version.
             save_data = torch.load(path, map_location="cpu", weights_only=True)  # type: ignore[call-arg]
         except TypeError:
-            # Older torch without weights_only: fallback to default behavior.
-            save_data = torch.load(path, map_location="cpu")
+            # Older torch without weights_only: refuse to perform an unsafe load.
+            raise RuntimeError(
+                "Safe model loading is not supported by the installed torch version "
+                "(missing weights_only parameter). Refusing to load checkpoint."
+            )
         except Exception as e:
             msg = str(e)
-            # Back-compat: handle older files that contained NumPy arrays.
+            # If weights_only specifically failed for this file, treat it as unsupported.
             if "Weights only load failed" in msg or "weights_only" in msg:
-                try:
-                    save_data = torch.load(path, map_location="cpu", weights_only=False)  # type: ignore[call-arg]
-                    unsafe_load = True
-                except TypeError:
-                    # weights_only parameter not supported; re-raise original error.
-                    raise
-            else:
-                raise
+                raise RuntimeError(
+                    "Checkpoint cannot be loaded safely with weights_only=True; "
+                    "refusing to load due to potential unsafe deserialization."
+                ) from e
+            raise
 
         if not isinstance(save_data, dict):
             raise ValueError("Unexpected checkpoint format: expected a dict")
-        return save_data, unsafe_load
+        return save_data
 
     def load_model(self, path: str) -> Dict[str, Any]:
         """Load model from file."""
         try:
             safe_path = self._resolve_model_path(path)
             ext = os.path.splitext(str(safe_path))[1].lower()
-            unsafe_load = False
             if ext in {".pth", ".pt"}:
                 try:
                     import torch  # type: ignore
                 except Exception as e:
                     return {"error": f"Loading {ext} requires torch (import failed: {e})"}
                 try:
-                    save_data, unsafe_load = self._safe_torch_load(safe_path)
+                    save_data = self._safe_torch_load(safe_path)
                 except Exception as e:
                     return {"error": str(e)}
                 fmt = "torch"
@@ -1245,7 +1244,6 @@ class ModelCommands:
                 "model_id": model_id,
                 "model_type": model_type,
                 "format": fmt,
-                **({"unsafe_load": True} if unsafe_load else {}),
                 "message": f"Model loaded successfully",
             }
         except Exception as e:
