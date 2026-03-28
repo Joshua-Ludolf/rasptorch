@@ -109,6 +109,10 @@ rasptorch includes an **agent-native CLI** for tensor operations, model manageme
 -- uv run rasptorch chat (uv)
 -- rasptorch chat (.venv or standalone python)
 
+# GUI (Streamlit-based)
+-- uv run rasptorch ui (uv)
+-- rasptorch ui (.venv or standalone python)
+
 # Show available commands
 rasptorch --help (if using venv alone: rasptorch --help , if using uv: uv run rasptorch --help [follows for all commands in the markdown files])
 
