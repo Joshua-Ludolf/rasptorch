@@ -12,6 +12,7 @@ dependencies = [
 	"streamlit>=1.55.0",
 	"pytest>=9.0.2",
 	"build>=1.4.0",
+	"twine>=6.2.0",
 ]
 
 
