@@ -1160,8 +1160,20 @@ class ModelCommands:
 
         return candidate
 
-    def load_model(self, path: str) -> Dict[str, Any]:
-        """Load model from file."""
+    def load_model(self, path: str, allow_unsafe: bool = False) -> Dict[str, Any]:
+        """Load model from file.
+
+        Parameters
+        ----------
+        path:
+            User-specified path to the model file. This will be resolved to a
+            safe location under a fixed root directory.
+        allow_unsafe:
+            If True, permit legacy, fully-unpickled loads for backwards
+            compatibility. This should only be set from trusted, non-remote
+            contexts. When False (the default), only safer loading modes are
+            used and obviously unsafe formats are rejected.
+        """
         try:
             safe_path = self._safe_model_path(str(path))
             ext = os.path.splitext(str(safe_path))[1].lower()
@@ -1172,25 +1184,63 @@ class ModelCommands:
                 except Exception as e:
                     return {"error": f"Loading {ext} requires torch (import failed: {e})"}
                 try:
+                    # Prefer safe, weights-only loading which does not require
+                    # unpickling arbitrary Python objects.
+                    save_data = torch.load(safe_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    # Older PyTorch versions may not support weights_only; fall
+                    # back to the previous behavior but only if explicitly allowed.
+                    if not allow_unsafe:
+                        return {
+                            "error": (
+                                "This model file requires an unsafe deserialization "
+                                "(legacy torch.load behavior). "
+                                "Refuse to load it without allow_unsafe=True."
+                            )
+                        }
                     save_data = torch.load(safe_path, map_location="cpu")
+                    unsafe_load = True
                 except Exception as e:
                     msg = str(e)
                     # Back-compat: handle older files that contained NumPy arrays.
                     if "Weights only load failed" in msg or "weights_only" in msg:
+                        if not allow_unsafe:
+                            return {
+                                "error": (
+                                    "This model file requires an unsafe deserialization "
+                                    "(torch.load with weights_only=False). "
+                                    "Refuse to load it without allow_unsafe=True."
+                                )
+                            }
                         try:
-                            save_data = torch.load(safe_path, map_location="cpu", weights_only=False)
+                            save_data = torch.load(
+                                safe_path,
+                                map_location="cpu",
+                                weights_only=False,
+                            )
                             unsafe_load = True
                         except TypeError:
+                            # Re-raise for the outer except to handle.
                             raise
                     else:
                         raise
                 fmt = "torch"
             else:
+                # Previously, arbitrary formats fell back to pickle.load, which is
+                # not safe with untrusted data. Only allow this in explicitly
+                # unsafe/trusted contexts.
+                if not allow_unsafe:
+                    return {
+                        "error": (
+                            f"Loading '{ext}' model files requires unsafe deserialization "
+                            "(pickle). Refuse to load it without allow_unsafe=True."
+                        )
+                    }
                 import pickle
                 with open(safe_path, "rb") as f:
                     save_data = pickle.load(f)
                 fmt = "pickle"
-            
+
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
             state_dict = self._state_dict_to_numpy(save_data.get("state_dict", {}))
@@ -1202,14 +1252,14 @@ class ModelCommands:
                 "config": config,
                 "state_dict": state_dict,
             }
-            
+
             return {
                 "status": "success",
                 "model_id": model_id,
                 "model_type": model_type,
                 "format": fmt,
                 **({"unsafe_load": True} if unsafe_load else {}),
-                "message": f"Model loaded successfully",
+                "message": "Model loaded successfully",
             }
         except Exception as e:
             return {"error": str(e)}
