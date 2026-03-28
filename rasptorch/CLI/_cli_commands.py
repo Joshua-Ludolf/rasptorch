@@ -1188,42 +1188,31 @@ class ModelCommands:
                     # unpickling arbitrary Python objects.
                     save_data = torch.load(safe_path, map_location="cpu", weights_only=True)
                 except TypeError:
-                    # Older PyTorch versions may not support weights_only; fall
-                    # back to the previous behavior but only if explicitly allowed.
-                    if not allow_unsafe:
+                    # Older PyTorch versions may not support weights_only; in that
+                    # case we refuse to load the file rather than falling back to
+                    # unsafe torch.load behavior.
+                    return {
+                        "error": (
+                            "This model file requires an unsafe deserialization "
+                            "(legacy torch.load behavior without weights_only). "
+                            "Refusing to load it for security reasons."
+                        )
+                    }
+                except Exception as e:
+                    msg = str(e)
+                    # Back-compat: handle older files that contained NumPy arrays
+                    # or otherwise require weights_only=False. We refuse to perform
+                    # such unsafe deserialization from this interface.
+                    if "Weights only load failed" in msg or "weights_only" in msg:
                         return {
                             "error": (
                                 "This model file requires an unsafe deserialization "
-                                "(legacy torch.load behavior). "
-                                "Refuse to load it without allow_unsafe=True."
+                                "(torch.load with weights_only=False). "
+                                "Refusing to load it for security reasons."
                             )
                         }
-                    save_data = torch.load(safe_path, map_location="cpu")
-                    unsafe_load = True
-                except Exception as e:
-                    msg = str(e)
-                    # Back-compat: handle older files that contained NumPy arrays.
-                    if "Weights only load failed" in msg or "weights_only" in msg:
-                        if not allow_unsafe:
-                            return {
-                                "error": (
-                                    "This model file requires an unsafe deserialization "
-                                    "(torch.load with weights_only=False). "
-                                    "Refuse to load it without allow_unsafe=True."
-                                )
-                            }
-                        try:
-                            save_data = torch.load(
-                                safe_path,
-                                map_location="cpu",
-                                weights_only=False,
-                            )
-                            unsafe_load = True
-                        except TypeError:
-                            # Re-raise for the outer except to handle.
-                            raise
-                    else:
-                        raise
+                    # Any other error is propagated as-is.
+                    raise
                 fmt = "torch"
             else:
                 # Previously, arbitrary formats fell back to pickle.load, which is
