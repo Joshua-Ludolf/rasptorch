@@ -7,10 +7,11 @@ from .amp import autocast, GradScaler
 from . import nn, functional, data, train, optim, optim_sched, init, utils, amp
 from . import torch_bridge
 
+
 try:
 	__version__ = version("rasptorch")
 except PackageNotFoundError:  # pragma: no cover
-	__version__ = "1.1.0"
+	__version__ = "3.0.0"
 
 __all__ = [
 	"Tensor",
