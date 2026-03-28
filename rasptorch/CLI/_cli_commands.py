@@ -1147,25 +1147,36 @@ class ModelCommands:
                 except Exception as e:
                     return {"error": f"Loading {ext} requires torch (import failed: {e})"}
                 try:
+                    # Prefer safe, weights-only loading to avoid arbitrary code execution.
+                    save_data = torch.load(path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    # Older torch versions may not support weights_only; fall back to default,
+                    # which should still load state dict–style data for recent files.
                     save_data = torch.load(path, map_location="cpu")
                 except Exception as e:
                     msg = str(e)
-                    # Back-compat: handle older files that contained NumPy arrays.
+                    # Back-compat: previously this code attempted an unsafe fallback with
+                    # weights_only=False for legacy files. To avoid unsafe deserialization
+                    # from untrusted sources, we now refuse such files instead.
                     if "Weights only load failed" in msg or "weights_only" in msg:
-                        try:
-                            save_data = torch.load(path, map_location="cpu", weights_only=False)
-                            unsafe_load = True
-                        except TypeError:
-                            raise
-                    else:
-                        raise
+                        return {
+                            "error": (
+                                "This model file appears to use an unsupported legacy format "
+                                "that cannot be safely loaded. Please convert it using a "
+                                "trusted offline tool and retry."
+                            )
+                        }
+                    raise
                 fmt = "torch"
             else:
-                import pickle
-                with open(path, "rb") as f:
-                    save_data = pickle.load(f)
-                fmt = "pickle"
-            
+                # For security reasons, only PyTorch .pth/.pt files are supported by this loader.
+                return {
+                    "error": (
+                        f"Unsupported model file extension '{ext}'. "
+                        "Only .pth/.pt files are supported for loading."
+                    )
+                }
+
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
             state_dict = self._state_dict_to_numpy(save_data.get("state_dict", {}))
@@ -1177,7 +1188,7 @@ class ModelCommands:
                 "config": config,
                 "state_dict": state_dict,
             }
-            
+
             return {
                 "status": "success",
                 "model_id": model_id,
