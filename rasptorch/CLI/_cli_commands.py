@@ -1169,14 +1169,23 @@ class ModelCommands:
         return candidate
 
     def _safe_torch_load(self, path: str) -> Dict[str, Any]:
-        """Safely load a torch checkpoint, preferring weights_only when available.
+        """Safely load a torch checkpoint, using weights_only=True to avoid
+        arbitrary object deserialization.
 
-        This helper only performs loads that do not require arbitrary object
-        deserialization. If safe loading is not supported by the installed
-        torch version or by the given file, it raises an exception instead of
-        falling back to an unsafe mode.
+        This helper is intentionally strict:
+        * It only allows loading standard PyTorch checkpoint files (.pt/.pth).
+        * It never falls back to an unsafe pickle-based load if weights_only is
+          not supported or fails for the given file.
         """
+        import os
         import torch  # type: ignore
+
+        # Defense in depth: ensure that only typical PyTorch checkpoint files are loaded.
+        ext = os.path.splitext(str(path))[1].lower()
+        if ext not in {".pt", ".pth"}:
+            raise RuntimeError(
+                f"Refusing to load non-torch checkpoint file with torch.load: {path}"
+            )
 
         try:
             # Prefer weights_only=True when supported by the installed torch version.
@@ -1185,7 +1194,8 @@ class ModelCommands:
             # Older torch without weights_only: refuse to perform an unsafe load.
             raise RuntimeError(
                 "Safe model loading is not supported by the installed torch version "
-                "(missing weights_only parameter). Refusing to load checkpoint."
+                "(missing weights_only parameter). Refusing to load checkpoint "
+                "to avoid unsafe deserialization."
             )
         except Exception as e:
             msg = str(e)
@@ -1195,6 +1205,7 @@ class ModelCommands:
                     "Checkpoint cannot be loaded safely with weights_only=True; "
                     "refusing to load due to potential unsafe deserialization."
                 ) from e
+            # Propagate other errors (I/O, corruption, etc.) as-is.
             raise
 
         if not isinstance(save_data, dict):
