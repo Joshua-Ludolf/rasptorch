@@ -547,8 +547,8 @@ def info(ctx):
 @click.pass_context
 def ui(ctx: click.Context, port: int | None, server_headless: bool, streamlit_args: Tuple[str, ...]):
     """Launch the Streamlit UI."""
-    # Resolve app path from the installed package location.
-    app_path = Path(__file__).resolve().parent / "ui" / "app.py"
+    # Resolve app path to the isometric SVG UI version in rasptorch/ui/app.py
+    app_path = Path(__file__).resolve().parents[1] / "ui" / "app.py"
     if not app_path.exists():
         raise click.ClickException(f"UI entry not found at: {app_path}")
 
