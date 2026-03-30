@@ -407,18 +407,22 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
         rcx =  STACK_SEP / 2
         left_centers  = _draw_stack(lcx, left_sizes,  left_labels,  left_hovers,  idx_off=0)
         right_centers = _draw_stack(rcx, right_sizes, right_labels, right_hovers, idx_off=len(left_sizes))
-        if left_centers and right_centers:
-            lx, ly = left_centers[-1]
-            rx, ry = right_centers[0]
-            edge_l = lx + _w(left_sizes[-1]) / 2 + 8
-            edge_r = rx - _w(right_sizes[0]) / 2 - 8
-            mid_y  = (ly + ry) / 2
+        # Draw arrows from both A and B to Combined
+        if left_centers:
+            # Arrow from A (left stack top) to Combined (left stack bottom)
+            ax, ay = left_centers[0]  # A block center
+            cx, cy = left_centers[-1] # Combined block center
             conns_svg.append(
-                f'<line class="fc cross" x1="{edge_l:.1f}" y1="{ly:.1f}" '
-                f'x2="{edge_r:.1f}" y2="{ry:.1f}" marker-end="url(#ah)"/>'
+                f'<line class="fc cross" x1="{ax:.1f}" y1="{ay:.1f}" '
+                f'x2="{cx:.1f}" y2="{cy:.1f}" marker-end="url(#ah)"/>'
             )
+        if right_centers and left_centers:
+            # Arrow from B (right stack) to Combined (left stack bottom)
+            bx, by = right_centers[0]  # B block center
+            cx, cy = left_centers[-1]  # Combined block center
             conns_svg.append(
-                f'<text class="flow-lbl" x="{(edge_l+edge_r)/2:.1f}" y="{mid_y - 10:.1f}">A → B</text>'
+                f'<line class="fc cross" x1="{bx:.1f}" y1="{by:.1f}" '
+                f'x2="{cx:.1f}" y2="{cy:.1f}" marker-end="url(#ah)"/>'
             )
     else:
         left_centers  = _draw_stack(0.0, left_sizes, left_labels, left_hovers)
@@ -462,7 +466,7 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
     <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
   </filter>
   <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
-    <polygon points="0 0,7 2.5,0 5" fill="rgba(150,175,220,0.75)"/>
+    <polygon points="0 0,7 2.5,0 5" fill="rgba(255,255,255,0.9)"/>
   </marker>
   <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse">
     <circle cx="1" cy="1" r="1" fill="rgba(255,255,255,0.045)"/>
@@ -525,8 +529,8 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
     animation:dash 1.1s linear infinite;
   }}
   .cross {{
-    stroke:rgba(200,155,255,.75);
-    stroke-dasharray:8 5;
+    stroke: rgba(255,255,255,0.9);  /* white */
+    stroke-dasharray: 8 5;
   }}
   @keyframes dash {{ to {{ stroke-dashoffset:-20; }} }}
   .flow-lbl {{
