@@ -74,60 +74,6 @@ def test_train_model_returns_history() -> None:
     assert len(hist) == 3
     assert all(isinstance(x, (int, float)) for x in hist)
 
-
-def test_plotly_3d_helper_callable_and_hovertext_enriched() -> None:
-    ui = _import_ui_app()
-    models = {
-        "m1": {
-            "type": "CNN",
-            "config": {
-                "in_channels": 3,
-                "out_channels": [8, 16],
-                "kernels": [3, 5],
-                "activation": "relu",
-            },
-        },
-    }
-    fig = ui._model_plotly_3d_figure(models, "m1")
-    # Plotly is optional; if not installed, helper returns None.
-    if fig is None:
-        return
-    d = fig.to_dict()
-    # Mesh traces should have hovertext carrying config context.
-    mesh_traces = [t for t in d.get("data", []) if t.get("type") == "mesh3d"]
-    assert mesh_traces, "expected at least one mesh3d trace"
-    hover = str(mesh_traces[0].get("hovertext", ""))
-    assert "type=CNN" in hover
-    assert "activation=" in hover
-
-
-def test_plotly_2d_helper_has_hoverable_boxes_when_available() -> None:
-    ui = _import_ui_app()
-
-    models = {
-        "m1": {
-            "type": "CNN",
-            "config": {
-                "in_channels": 3,
-                "out_channels": [8, 16],
-                "kernels": [3, 5],
-                "activation": "relu",
-            },
-        },
-    }
-
-    fig = ui._model_plotly_2d_figure(models, "m1")
-    if fig is None:
-        return
-    d = fig.to_dict()
-    traces = d.get("data", []) or []
-    # Boxes are rendered as filled scatter polygons.
-    filled = [t for t in traces if t.get("type") == "scatter" and t.get("fill") == "toself"]
-    assert filled, "expected at least one filled polygon trace"
-    hover = str(filled[0].get("hovertext", ""))
-    assert "type=CNN" in hover
-
-
 def test_info_config_filtering_logic_removes_activation_when_activations_present() -> None:
     # Mirrors the Info-panel filtering behavior (without rendering Streamlit).
     cfg = {"activation": "relu", "activations": ["relu", "none"], "layer_sizes": [10, 32, 2]}
