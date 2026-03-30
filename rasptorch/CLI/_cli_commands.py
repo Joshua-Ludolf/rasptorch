@@ -12,6 +12,7 @@ import rasptorch
 import os
 import tempfile
 import uuid
+import json
 
 
 class _GRUSequence(rasptorch.nn.Module):
@@ -1136,36 +1137,96 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
+    def _resolve_model_path(self, path: str) -> str:
+        """Resolve a user-provided model path into a confined, normalized path.
+
+        The resulting path is guaranteed to reside within a dedicated models
+        directory under the system temporary directory. Absolute paths and
+        paths that escape this directory are rejected.
+        """
+        raw = (path or "").strip()
+        if not raw:
+            raise ValueError("Model path must not be empty")
+        if os.path.isabs(raw):
+            raise ValueError("Absolute model paths are not allowed")
+
+        # Base directory where models are stored.
+        base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
+        os.makedirs(base_dir, exist_ok=True)
+
+        candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, raw)))
+        base_dir_abs = os.path.abspath(base_dir)
+
+        # Ensure the candidate path is within base_dir.
+        try:
+            common = os.path.commonpath([base_dir_abs, candidate])
+        except ValueError:
+            # Different drives on Windows, etc.
+            raise ValueError("Invalid model path")
+        if common != base_dir_abs:
+            raise ValueError("Model path escapes allowed directory")
+
+        return candidate
+
+    def _safe_torch_load(self, path: str) -> Dict[str, Any]:
+        """Safely load a torch checkpoint, preferring weights_only when available.
+
+        This helper only performs loads that do not require arbitrary object
+        deserialization. If safe loading is not supported by the installed
+        torch version or by the given file, it raises an exception instead of
+        falling back to an unsafe mode.
+        """
+        import torch  # type: ignore
+
+        try:
+            # Prefer weights_only=True when supported by the installed torch version.
+            save_data = torch.load(path, map_location="cpu", weights_only=True)  # type: ignore[call-arg]
+        except TypeError:
+            # Older torch without weights_only: refuse to perform an unsafe load.
+            raise RuntimeError(
+                "Safe model loading is not supported by the installed torch version "
+                "(missing weights_only parameter). Refusing to load checkpoint."
+            )
+        except Exception as e:
+            msg = str(e)
+            # If weights_only specifically failed for this file, treat it as unsupported.
+            if "Weights only load failed" in msg or "weights_only" in msg:
+                raise RuntimeError(
+                    "Checkpoint cannot be loaded safely with weights_only=True; "
+                    "refusing to load due to potential unsafe deserialization."
+                ) from e
+            raise
+
+        if not isinstance(save_data, dict):
+            raise ValueError("Unexpected checkpoint format: expected a dict")
+        return save_data
+
     def load_model(self, path: str) -> Dict[str, Any]:
         """Load model from file."""
         try:
-            ext = os.path.splitext(str(path))[1].lower()
-            unsafe_load = False
+            safe_path = self._resolve_model_path(path)
+            ext = os.path.splitext(str(safe_path))[1].lower()
             if ext in {".pth", ".pt"}:
                 try:
                     import torch  # type: ignore
                 except Exception as e:
                     return {"error": f"Loading {ext} requires torch (import failed: {e})"}
                 try:
-                    save_data = torch.load(path, map_location="cpu")
+                    save_data = self._safe_torch_load(safe_path)
                 except Exception as e:
-                    msg = str(e)
-                    # Back-compat: handle older files that contained NumPy arrays.
-                    if "Weights only load failed" in msg or "weights_only" in msg:
-                        try:
-                            save_data = torch.load(path, map_location="cpu", weights_only=False)
-                            unsafe_load = True
-                        except TypeError:
-                            raise
-                    else:
-                        raise
+                    return {"error": str(e)}
                 fmt = "torch"
             else:
-                import pickle
-                with open(path, "rb") as f:
-                    save_data = pickle.load(f)
-                fmt = "pickle"
-            
+                # Use JSON for non-torch model files to avoid unsafe pickle deserialization.
+                try:
+                    with open(safe_path, "r", encoding="utf-8") as f:
+                        save_data = json.load(f)
+                except Exception as e:
+                    return {"error": f"Failed to load JSON model file: {e}"}
+                if not isinstance(save_data, dict):
+                    return {"error": "Unexpected model file format: expected JSON object"}
+                fmt = "json"
+
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
             state_dict = self._state_dict_to_numpy(save_data.get("state_dict", {}))
@@ -1177,13 +1238,12 @@ class ModelCommands:
                 "config": config,
                 "state_dict": state_dict,
             }
-            
+
             return {
                 "status": "success",
                 "model_id": model_id,
                 "model_type": model_type,
                 "format": fmt,
-                **({"unsafe_load": True} if unsafe_load else {}),
                 "message": f"Model loaded successfully",
             }
         except Exception as e:
