@@ -6,7 +6,6 @@ import json
 import sys
 import tempfile
 import hashlib
-import platform
 import os
 import streamlit as st
 import numpy as np
@@ -15,16 +14,6 @@ try:
     import streamlit.components.v1 as components  # type: ignore
 except Exception:  # pragma: no cover
     components = None  # type: ignore[assignment]
-
-try:
-    import plotly.graph_objects as go  # type: ignore
-except Exception:  # pragma: no cover
-    go = None  # type: ignore[assignment]
-
-try:
-    import pyvista as pv  # type: ignore
-except Exception:  # pragma: no cover
-    pv = None  # type: ignore[assignment]
 
 _UI_BUILD = "2026-03-27-activation-conditional-v1"
 
@@ -92,12 +81,12 @@ HELP_TEXT = [
 ]
 
 
-TensorCommands: Any = None
+TENSORCOMMANDS: Any = None
 if _HAS_RASPTORCH:
     try:
-        from rasptorch._cli_commands import TensorCommands as TensorCommands  # type: ignore
+        from rasptorch._cli_commands import TensorCommands as TENSORCOMMANDS  # type: ignore
     except Exception:
-        TensorCommands = None
+        TENSORCOMMANDS = None
 
 
 def _mermaid_escape(text: str) -> str:
@@ -210,722 +199,21 @@ def _model_mermaid_diagram(models: Dict[str, Any], model_id: Optional[str]) -> O
     return "\n".join(lines)
 
 
-def _model_plotly_3d_figure(models: Dict[str, Any], model_id: Optional[str]):
-    """Create a simple 3D schematic (stacked boxes) for the model.
-
-    This is an approximate visualization intended for intuition, not exact tensor shapes.
-    Returns None if Plotly isn't available or model is missing.
-    """
-    if go is None or not model_id or model_id not in models:
-        return None
-
-    # Keep the 3D diagram background consistent with the app panel.
-    # Plotly uses separate background colors for the paper and the 3D scene.
-    plot_bg = "rgba(35,38,45,1.0)"
-    # Pi/ARM WebGL drivers sometimes render Mesh3d very dark/black with defaults.
-    # Use an explicit bright-ish color + high ambient lighting so the boxes remain visible.
-    # Avoid alpha blending: on some Pi WebGL stacks, float framebuffers + blending
-    # require EXT_float_blend (often missing). Fully-opaque traces are more portable.
-    mesh_color = "rgb(145,150,170)"
-    mesh_lighting = dict(ambient=0.95, diffuse=0.35, specular=0.05, roughness=1.0, fresnel=0.0)
-    mesh_lightpos = dict(x=200, y=200, z=400)
-    wire_color = "rgb(235,235,245)"
-
-    md = models.get(model_id) or {}
-    mtype = str(md.get("type", "Unknown"))
-    cfg = md.get("config") or {}
-
-    # Special-case Combined(sequential): render as two stacks (left=A+Combined, right=B)
-    # with a left-to-right flow indicator. This makes the execution direction explicit.
-    if mtype == "Combined" and str(cfg.get("combine")) == "sequential":
-        a_id = str(cfg.get("model_a_id", ""))
-        b_id = str(cfg.get("model_b_id", ""))
-        a_t = str(cfg.get("model_a_type", "A"))
-        b_t = str(cfg.get("model_b_type", "B"))
-        io_in = cfg.get("input_size")
-        io_out = cfg.get("output_size")
-
-        left_sizes: List[float] = []
-        left_labels: List[str] = []
-        left_hovers: List[str] = []
-        right_sizes: List[float] = []
-        right_labels: List[str] = []
-        right_hovers: List[str] = []
-
-        def _coerce_size(v: Any) -> float:
-            try:
-                fv = float(v)
-            except Exception:
-                fv = 1.0
-            return max(1.0, fv)
-
-        # Left stack: A then composition boundary.
-        left_sizes.append(_coerce_size(io_in or 8))
-        left_labels.append(f"A {a_t}")
-        left_hovers.append(
-            "type=Combined(sequential)"
-            f"<br>direction=A → B"
-            f"<br>A={a_t} ({a_id[:8] if a_id else '?'})"
-            f"<br>input_size={io_in}"
-        )
-        left_sizes.append(_coerce_size(io_out or (io_in or 8)))
-        left_labels.append("Combined")
-        left_hovers.append(
-            "type=Combined(sequential)"
-            f"<br>direction=A → B"
-            f"<br>output_size={io_out}"
-        )
-
-        # Right stack: B.
-        right_sizes.append(_coerce_size(io_out or 8))
-        right_labels.append(f"B {b_t}")
-        right_hovers.append(
-            "type=Combined(sequential)"
-            f"<br>direction=A → B"
-            f"<br>B={b_t} ({b_id[:8] if b_id else '?'})"
-            f"<br>output_size={io_out}"
-        )
-
-        max_sz = max(left_sizes + right_sizes) if (left_sizes or right_sizes) else 1.0
-        left_dims = [0.6 + 2.4 * (s / max_sz) for s in left_sizes]
-        right_dims = [0.6 + 2.4 * (s / max_sz) for s in right_sizes]
-
-        fig = go.Figure()
-        label_x: List[float] = []
-        label_y: List[float] = []
-        label_z: List[float] = []
-        label_text: List[str] = []
-
-        def _add_box(center_x: float, z0: float, d: float, hov: str) -> float:
-            w = d
-            h = d
-            t = 0.8
-            x0, x1 = center_x - w / 2, center_x + w / 2
-            y0, y1 = -h / 2, h / 2
-            z1 = z0 + t
-
-            xs = [x0, x1, x1, x0, x0, x1, x1, x0]
-            ys = [y0, y0, y1, y1, y0, y0, y1, y1]
-            zs = [z0, z0, z0, z0, z1, z1, z1, z1]
-
-            # Wireframe overlay: helps on systems where Mesh3d faces don't render reliably.
-            # Vert indices: 0..3 bottom face, 4..7 top face.
-            edges = [
-                (0, 1), (1, 2), (2, 3), (3, 0),  # bottom
-                (4, 5), (5, 6), (6, 7), (7, 4),  # top
-                (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
-            ]
-            ex: List[float] = []
-            ey: List[float] = []
-            ez: List[float] = []
-            for a, b in edges:
-                ex.extend([xs[a], xs[b], None])
-                ey.extend([ys[a], ys[b], None])
-                ez.extend([zs[a], zs[b], None])
-            fig.add_trace(
-                go.Scatter3d(
-                    x=ex,
-                    y=ey,
-                    z=ez,
-                    mode="lines",
-                    line=dict(width=6, color=wire_color),
-                    hovertext=hov,
-                    hoverinfo="text",
-                    showlegend=False,
-                )
-            )
-
-            I = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
-            J = [1, 2, 5, 6, 4, 7, 5, 6, 3, 6, 0, 4]
-            K = [2, 3, 6, 7, 5, 6, 6, 2, 6, 7, 4, 7]
-
-            fig.add_trace(
-                go.Mesh3d(
-                    x=xs,
-                    y=ys,
-                    z=zs,
-                    i=I,
-                    j=J,
-                    k=K,
-                    color=mesh_color,
-                    opacity=1.0,
-                    flatshading=True,
-                    lighting=mesh_lighting,
-                    lightposition=mesh_lightpos,
-                    hovertext=hov,
-                    hoverinfo="text",
-                    showscale=False,
-                )
-            )
-            return z1
-
-        # Spacing between the two stacks and between boxes.
-        # Combined tends to have many layers; give it extra room.
-        stack_dx = 3.6
-        box_gap = 0.45
-        z_left = 0.0
-        left_centers: List[float] = []
-        for d, lab, hov in zip(left_dims, left_labels, left_hovers):
-            z1 = _add_box(center_x=-stack_dx, z0=z_left, d=d, hov=hov)
-            label_x.append(-stack_dx)
-            label_y.append(0.0)
-            label_z.append((z_left + z1) / 2)
-            label_text.append(lab)
-            left_centers.append((z_left + z1) / 2)
-            z_left = z1 + box_gap
-
-        z_right = 0.0
-        right_centers: List[float] = []
-        for d, lab, hov in zip(right_dims, right_labels, right_hovers):
-            z1 = _add_box(center_x=stack_dx, z0=z_right, d=d, hov=hov)
-            label_x.append(stack_dx)
-            label_y.append(0.0)
-            label_z.append((z_right + z1) / 2)
-            label_text.append(lab)
-            right_centers.append((z_right + z1) / 2)
-            z_right = z1 + box_gap
-
-        # Flow arrow: from left-stack "Combined" level to right-stack "B" level.
-        # Relationship connectors (lighter gray to match UI tone).
-        conn_color = "rgb(200,200,200)"
-
-        # 1) Vertical connector: A stack flow (left)
-        if len(left_centers) >= 2:
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[-stack_dx + 0.55, -stack_dx + 0.55],
-                    y=[0.0, 0.0],
-                    z=[left_centers[0], left_centers[1]],
-                    mode="lines+markers+text",
-                    line=dict(width=6, color=conn_color),
-                    marker=dict(size=4, color=conn_color),
-                    text=["", "A → …"],
-                    textposition="top center",
-                    textfont=dict(size=13, color=conn_color),
-                    hoverinfo="skip",
-                    showlegend=False,
-                )
-            )
-
-        # 2) Horizontal connector: boundary → B stack
-        # Anchor from the rendered "Combined" block (left stack, index 1) to the rendered B block (right stack, index 0).
-        left_flow_z = left_centers[1] if len(left_centers) >= 2 else (left_centers[0] if left_centers else 0.4)
-        right_flow_z = right_centers[0] if right_centers else 0.4
-        fig.add_trace(
-            go.Scatter3d(
-                x=[-stack_dx + 0.35, stack_dx - 0.35],
-                y=[0.0, 0.0],
-                z=[left_flow_z, right_flow_z],
-                mode="lines+markers+text",
-                line=dict(width=6, color=conn_color),
-                marker=dict(size=4, color=conn_color),
-                text=["", "A → B"],
-                textposition="top center",
-                textfont=dict(size=13, color=conn_color),
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter3d(
-                x=label_x,
-                y=label_y,
-                z=label_z,
-                mode="text",
-                text=label_text,
-                textposition="middle center",
-                textfont=dict(size=16, color="white"),
-                showlegend=False,
-                hoverinfo="skip",
-            )
-        )
-
-        fig.update_layout(
-            height=520,
-            margin=dict(l=0, r=0, t=10, b=0),
-            paper_bgcolor=plot_bg,
-            scene=dict(
-                xaxis=dict(visible=False),
-                yaxis=dict(visible=False),
-                zaxis=dict(visible=False),
-                bgcolor=plot_bg,
-            ),
-            showlegend=False,
-        )
-        return fig
-
-    sizes: List[float] = []
-    labels: List[str] = []
-    hovers: List[str] = []
-
-    def _add(sz: Any, label: str, hover: Optional[str] = None) -> None:
-        try:
-            v = float(sz)
-        except Exception:
-            v = 1.0
-        sizes.append(max(1.0, v))
-        labels.append(label)
-        hovers.append(hover or label)
-
-    def _act_summary() -> str:
-        acts = cfg.get("activations")
-        act = cfg.get("activation")
-        if isinstance(acts, list) and acts:
-            return "activations=" + ",".join(str(a) for a in acts)
-        if act is not None:
-            return f"activation={act}"
-        return ""
-
-    if mtype == "MLP":
-        act_s = _act_summary()
-        for i, s in enumerate(cfg.get("layer_sizes") or []):
-            hover = f"type=MLP<br>layer={i}<br>size={s}"
-            if act_s:
-                hover += f"<br>{act_s}"
-            _add(s, f"L{i}: {s}", hover=hover)
-    elif mtype == "Linear":
-        act_s = _act_summary()
-        inp = cfg.get("input_size")
-        hover = f"type=Linear<br>input_size={inp}"
-        if act_s:
-            hover += f"<br>{act_s}"
-        _add(inp or 1, f"in: {inp}", hover=hover)
-        for i, h in enumerate(cfg.get("hidden_sizes") or []):
-            hover = f"type=Linear<br>hidden[{i}]={h}"
-            if act_s:
-                hover += f"<br>{act_s}"
-            _add(h, f"h{i}: {h}", hover=hover)
-        out = cfg.get("output_size")
-        hover = f"type=Linear<br>output_size={out}"
-        if act_s:
-            hover += f"<br>{act_s}"
-        _add(out or 1, f"out: {out}", hover=hover)
-    elif mtype == "CNN":
-        act_s = _act_summary()
-        kernels = cfg.get("kernels")
-        in_ch = cfg.get("in_channels")
-        hover = f"type=CNN<br>in_channels={in_ch}"
-        if act_s:
-            hover += f"<br>{act_s}"
-        _add(in_ch or 1, f"in_ch: {in_ch}", hover=hover)
-        for i, ch in enumerate(cfg.get("out_channels") or []):
-            k = None
-            if isinstance(kernels, list) and i < len(kernels):
-                k = kernels[i]
-            lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
-            hover = f"type=CNN<br>out_channels[{i}]={ch}"
-            if k is not None:
-                hover += f"<br>kernel={k}"
-            if act_s:
-                hover += f"<br>{act_s}"
-            _add(ch, lab, hover=hover)
-    else:
-        io_in = cfg.get("input_size")
-        _add(io_in or 8, mtype, hover=f"type={mtype}<br>input_size={io_in}")
-
-    if not sizes:
-        return None
-
-    max_sz = max(sizes) if sizes else 1.0
-    dims = [0.6 + 2.4 * (s / max_sz) for s in sizes]
-
-    fig = go.Figure()
-    z0 = 0.0
-    label_x: List[float] = []
-    label_y: List[float] = []
-    label_z: List[float] = []
-    label_text: List[str] = []
-    for d, lab, hov in zip(dims, labels, hovers):
-        w = d
-        h = d
-        t = 0.8
-        x0, x1 = -w / 2, w / 2
-        y0, y1 = -h / 2, h / 2
-        z1 = z0 + t
-
-        xs = [x0, x1, x1, x0, x0, x1, x1, x0]
-        ys = [y0, y0, y1, y1, y0, y0, y1, y1]
-        zs = [z0, z0, z0, z0, z1, z1, z1, z1]
-
-        edges = [
-            (0, 1), (1, 2), (2, 3), (3, 0),
-            (4, 5), (5, 6), (6, 7), (7, 4),
-            (0, 4), (1, 5), (2, 6), (3, 7),
-        ]
-        ex: List[float] = []
-        ey: List[float] = []
-        ez: List[float] = []
-        for a, b in edges:
-            ex.extend([xs[a], xs[b], None])
-            ey.extend([ys[a], ys[b], None])
-            ez.extend([zs[a], zs[b], None])
-        fig.add_trace(
-            go.Scatter3d(
-                x=ex,
-                y=ey,
-                z=ez,
-                mode="lines",
-                line=dict(width=6, color=wire_color),
-                hovertext=hov,
-                hoverinfo="text",
-                showlegend=False,
-            )
-        )
-
-        # 12 triangles (2 per face)
-        I = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
-        J = [1, 2, 5, 6, 4, 7, 5, 6, 3, 6, 0, 4]
-        K = [2, 3, 6, 7, 5, 6, 6, 2, 6, 7, 4, 7]
-
-        fig.add_trace(
-            go.Mesh3d(
-                x=xs,
-                y=ys,
-                z=zs,
-                i=I,
-                j=J,
-                k=K,
-                color=mesh_color,
-                opacity=1.0,
-                flatshading=True,
-                lighting=mesh_lighting,
-                lightposition=mesh_lightpos,
-                hovertext=hov,
-                hoverinfo="text",
-                showscale=False,
-            )
-        )
-        label_x.append(0.0)
-        label_y.append(0.0)
-        label_z.append((z0 + z1) / 2)
-        label_text.append(lab)
-
-        z0 = z1 + 0.3
-
-    # Draw labels as one trace so we can control font globally.
-    fig.add_trace(
-        go.Scatter3d(
-            x=label_x,
-            y=label_y,
-            z=label_z,
-            mode="text",
-            text=label_text,
-            textposition="middle center",
-            textfont=dict(size=16, color="white"),
-            showlegend=False,
-            hoverinfo="skip",
-        )
-    )
-
-    fig.update_layout(
-        height=520,
-        margin=dict(l=0, r=0, t=10, b=0),
-        paper_bgcolor=plot_bg,
-        scene=dict(
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
-            bgcolor=plot_bg,
-        ),
-        showlegend=False,
-    )
-    return fig
-
-
-def _running_on_raspberry_pi() -> bool:
-    """Best-effort detection for Raspberry Pi / ARM desktops.
-
-    Plotly 3D traces use WebGL and can render poorly or not at all on some Pi
-    browser + driver combinations. We keep 3D available elsewhere, and fall
-    back to a simple 2D schematic on Pi/ARM.
-    """
-    # Escape hatch: allow users to force 3D (WebGL) even on Pi.
-    # Usage: RASPTORCH_UI_FORCE_3D=1 streamlit run rasptorch/ui/app.py
-    try:
-        if str(os.environ.get("RASPTORCH_UI_FORCE_3D", "")).strip().lower() in {"1", "true", "yes", "on"}:
-            return False
-    except Exception:
-        pass
-    try:
-        machine = platform.machine().lower()
-        if machine not in {"aarch64", "arm64", "armv7l", "armv6l"}:
-            return False
-        # Prefer a concrete model check when present.
-        model_path = Path("/proc/device-tree/model")
-        if model_path.exists():
-            txt = model_path.read_text(errors="ignore").lower()
-            if "raspberry pi" in txt:
-                return True
-        # Otherwise: treat ARM as needing the safer fallback.
-        return True
-    except Exception:
-        return False
-
-
-def _is_raspberry_pi_arm() -> bool:
-    """Detection for Pi/ARM that ignores UI escape hatches.
-
-    We use this for choosing safe default renderers. Users can still override
-    explicitly via `RASPTORCH_UI_3D_RENDER`.
-    """
-    try:
-        machine = platform.machine().lower()
-        if machine not in {"aarch64", "arm64", "armv7l", "armv6l"}:
-            return False
-        model_path = Path("/proc/device-tree/model")
-        if model_path.exists():
-            txt = model_path.read_text(errors="ignore").lower()
-            if "raspberry pi" in txt:
-                return True
-        return True
-    except Exception:
-        return False
-
-
-def _ui_3d_render_mode() -> str:
-    """Select the renderer for the 3D structure panel.
-
-    Modes:
-      - plotly: interactive WebGL (default on non-Pi)
-      - pyvista: interactive (requires a working `stpyvista` + browser WebGL)
-      - pyvista_png: server-side offscreen render to PNG (WebGL-free; reliable)
-
-    Set via: `RASPTORCH_UI_3D_RENDER=plotly|pyvista|pyvista_png`.
-    """
-    raw = str(os.environ.get("RASPTORCH_UI_3D_RENDER", "")).strip().lower()
-    if raw in {"plotly", "pyvista", "pyvista_png", "png", "image", "static"}:
-        if raw in {"png", "image", "static"}:
-            return "pyvista_png" if pv is not None else "plotly"
-        return raw
-
-    # Default: on Raspberry Pi / ARM, prefer the WebGL-free PNG renderer when PyVista is present.
-    if _is_raspberry_pi_arm() and pv is not None:
-        return "pyvista_png"
-    return "plotly"
-
-
-def _model_pyvista_plotter(models: Dict[str, Any], model_id: Optional[str], *, off_screen: bool) -> Any:
-    if pv is None or not model_id or model_id not in models:
+def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -> Optional[str]:
+    """Interactive isometric 3D schematic — pure SVG+JS, no WebGL."""
+    if not model_id or model_id not in models:
         return None
 
     md = models.get(model_id) or {}
     mtype = str(md.get("type", "Unknown"))
     cfg = md.get("config") or {}
 
-    def _act_summary() -> str:
-        acts = cfg.get("activations")
-        act = cfg.get("activation")
-        if isinstance(acts, list) and acts:
-            return "activations=" + ",".join(str(a) for a in acts)
-        if act is not None:
-            return f"activation={act}"
-        return ""
-
-    def _coerce_size(v: Any) -> float:
-        try:
-            fv = float(v)
-        except Exception:
-            fv = 1.0
-        return max(1.0, fv)
-
-    plotter = pv.Plotter(off_screen=off_screen, window_size=(980, 560))
-    plotter.set_background((35 / 255.0, 38 / 255.0, 45 / 255.0))
-
-    # Consistent “wire” tone.
-    edge_color = (235 / 255.0, 235 / 255.0, 245 / 255.0)
-
-    points: List[List[float]] = []
-    texts: List[str] = []
-
-    def _add_cube(center_x: float, z0: float, d: float, label: str, scalar: float) -> Tuple[float, float]:
-        w = float(d)
-        h = float(d)
-        t = 0.8
-        z1 = z0 + t
-        zc = (z0 + z1) / 2
-        cube = pv.Cube(center=(center_x, 0.0, zc), x_length=w, y_length=h, z_length=t)
-        cube.cell_data["layer"] = np.full(cube.n_cells, scalar, dtype=np.float32)
-        plotter.add_mesh(
-            cube,
-            scalars="layer",
-            cmap="viridis",
-            show_scalar_bar=False,
-            smooth_shading=False,
-            opacity=1.0,
-            show_edges=True,
-            edge_color=edge_color,
-            line_width=2,
+    def _esc(s: Any) -> str:
+        t = str(s)
+        return (
+            t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+             .replace('"', "&quot;").replace("'", "&#39;")
         )
-        points.append([center_x, 0.0, zc])
-        texts.append(label)
-        return z1, zc
-
-    def _add_line(a: List[float], b: List[float]) -> None:
-        try:
-            plotter.add_lines(np.array([a, b], dtype=np.float32), color=(200 / 255.0, 200 / 255.0, 200 / 255.0), width=4)
-        except Exception:
-            pass
-
-    # Combined(sequential): two stacks.
-    if mtype == "Combined" and str(cfg.get("combine")) == "sequential":
-        a_t = str(cfg.get("model_a_type", "A"))
-        b_t = str(cfg.get("model_b_type", "B"))
-        io_in = cfg.get("input_size")
-        io_out = cfg.get("output_size")
-
-        left_sizes = [_coerce_size(io_in or 8), _coerce_size(io_out or (io_in or 8))]
-        right_sizes = [_coerce_size(io_out or 8)]
-        max_sz = max(left_sizes + right_sizes) if (left_sizes or right_sizes) else 1.0
-        left_dims = [0.6 + 2.4 * (s / max_sz) for s in left_sizes]
-        right_dims = [0.6 + 2.4 * (s / max_sz) for s in right_sizes]
-
-        stack_dx = 3.6
-        box_gap = 0.45
-
-        z_left = 0.0
-        left_centers: List[List[float]] = []
-        for idx, (d, lab) in enumerate(zip(left_dims, [f"A {a_t}", "Combined"])):
-            z1, zc = _add_cube(-stack_dx, z_left, d, lab, scalar=float(idx))
-            left_centers.append([-stack_dx, 0.0, zc])
-            z_left = z1 + box_gap
-
-        z_right = 0.0
-        right_centers: List[List[float]] = []
-        for idx, (d, lab) in enumerate(zip(right_dims, [f"B {b_t}"])):
-            z1, zc = _add_cube(stack_dx, z_right, d, lab, scalar=float(10 + idx))
-            right_centers.append([stack_dx, 0.0, zc])
-            z_right = z1 + box_gap
-
-        if len(left_centers) >= 2:
-            _add_line([left_centers[0][0] + 0.6, 0.0, left_centers[0][2]], [left_centers[1][0] + 0.6, 0.0, left_centers[1][2]])
-        if left_centers and right_centers:
-            _add_line([left_centers[-1][0] + 0.6, 0.0, left_centers[-1][2]], [right_centers[0][0] - 0.6, 0.0, right_centers[0][2]])
-
-    else:
-        sizes: List[float] = []
-        labels: List[str] = []
-
-        def _add(sz: Any, label: str) -> None:
-            sizes.append(_coerce_size(sz))
-            labels.append(label)
-
-        act_s = _act_summary()
-
-        if mtype == "MLP":
-            for i, s in enumerate(cfg.get("layer_sizes") or []):
-                _add(s, f"L{i}: {s}")
-        elif mtype == "Linear":
-            inp = cfg.get("input_size")
-            _add(inp or 1, f"in: {inp}")
-            for i, h in enumerate(cfg.get("hidden_sizes") or []):
-                _add(h, f"h{i}: {h}")
-            out = cfg.get("output_size")
-            _add(out or 1, f"out: {out}")
-        elif mtype == "CNN":
-            kernels = cfg.get("kernels")
-            in_ch = cfg.get("in_channels")
-            _add(in_ch or 1, f"in_ch: {in_ch}")
-            for i, ch in enumerate(cfg.get("out_channels") or []):
-                k = None
-                if isinstance(kernels, list) and i < len(kernels):
-                    k = kernels[i]
-                lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
-                _add(ch, lab)
-        else:
-            io_in = cfg.get("input_size")
-            _add(io_in or 8, mtype)
-
-        if sizes:
-            max_sz = max(sizes)
-            dims = [0.6 + 2.4 * (s / max_sz) for s in sizes]
-            z0 = 0.0
-            for idx, (d, lab) in enumerate(zip(dims, labels)):
-                z1, _ = _add_cube(0.0, z0, d, lab, scalar=float(idx))
-                z0 = z1 + 0.3
-
-    if points and texts:
-        try:
-            plotter.add_point_labels(
-                np.array(points, dtype=np.float32),
-                texts,
-                font_size=16,
-                point_size=0,
-                text_color="white",
-                shape=None,
-                fill_shape=False,
-            )
-        except Exception:
-            pass
-
-    if cfg.get("activation") is not None or cfg.get("activations") is not None:
-        # If we can render text labels, include activation info in the title.
-        title = f"{mtype} ({_act_summary()})" if _act_summary() else mtype
-    else:
-        title = mtype
-    try:
-        plotter.add_text(title, position="upper_left", color="white", font_size=12)
-    except Exception:
-        pass
-
-    try:
-        plotter.view_isometric()
-        plotter.camera.zoom(1.35)
-    except Exception:
-        pass
-
-    return plotter
-
-
-def _model_pyvista_png(models: Dict[str, Any], model_id: Optional[str]) -> Optional[bytes]:
-    """Render the model schematic via PyVista offscreen and return PNG bytes.
-
-    This avoids browser WebGL entirely (useful on Raspberry Pi where WebGL Mesh3d
-    and vtk.js can be unreliable).
-    """
-    if pv is None:
-        return None
-    plotter = _model_pyvista_plotter(models, model_id, off_screen=True)
-    if plotter is None:
-        return None
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tmp_path = f.name
-        plotter.show(screenshot=tmp_path, auto_close=True)
-        data = Path(tmp_path).read_bytes()
-        return data
-    except Exception:
-        try:
-            plotter.close()
-        except Exception:
-            pass
-        return None
-    finally:
-        if tmp_path:
-            try:
-                Path(tmp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
-def _model_plotly_2d_figure(models: Dict[str, Any], model_id: Optional[str]):
-    """2D version of the model schematic.
-
-    Uses Plotly 2D primitives (SVG/canvas) rather than WebGL.
-    """
-    if go is None or not model_id or model_id not in models:
-        return None
-
-    plot_bg = "rgba(35,38,45,1.0)"
-    box_fill = "rgba(120,120,140,0.65)"
-    box_line = "rgba(230,230,240,0.55)"
-    box_shadow = "rgba(230,230,240,0.16)"
-    conn_color = "rgba(200,200,200,0.75)"
-
-    md = models.get(model_id) or {}
-    mtype = str(md.get("type", "Unknown"))
-    cfg = md.get("config") or {}
 
     def _coerce_size(v: Any) -> float:
         try:
@@ -964,280 +252,7 @@ def _model_plotly_2d_figure(models: Dict[str, Any], model_id: Optional[str]):
             return "\n".join(bits)
         return f"type={mtype}"
 
-    def _stack_specs_for_model(model_type: str, model_cfg: Dict[str, Any]) -> Tuple[List[float], List[str], List[str]]:
-        sizes: List[float] = []
-        labels: List[str] = []
-        hovers: List[str] = []
-
-        def _add(sz: Any, label: str, hover: Optional[str] = None) -> None:
-            sizes.append(_coerce_size(sz))
-            labels.append(label)
-            hovers.append(hover or label)
-
-        act_s = ""
-        if model_cfg is cfg:
-            act_s = _act_summary()
-
-        if model_type == "MLP":
-            for i, s in enumerate(model_cfg.get("layer_sizes") or []):
-                hover = f"type=MLP<br>layer={i}<br>size={s}"
-                if act_s:
-                    hover += f"<br>{act_s}"
-                _add(s, f"L{i}: {s}", hover=hover)
-        elif model_type == "Linear":
-            inp = model_cfg.get("input_size")
-            hover = f"type=Linear<br>input_size={inp}"
-            if act_s:
-                hover += f"<br>{act_s}"
-            _add(inp or 1, f"in: {inp}", hover=hover)
-            for i, h in enumerate(model_cfg.get("hidden_sizes") or []):
-                hover = f"type=Linear<br>hidden[{i}]={h}"
-                if act_s:
-                    hover += f"<br>{act_s}"
-                _add(h, f"h{i}: {h}", hover=hover)
-            out = model_cfg.get("output_size")
-            hover = f"type=Linear<br>output_size={out}"
-            if act_s:
-                hover += f"<br>{act_s}"
-            _add(out or 1, f"out: {out}", hover=hover)
-        elif model_type == "CNN":
-            kernels = model_cfg.get("kernels")
-            in_ch = model_cfg.get("in_channels")
-            hover = f"type=CNN<br>in_channels={in_ch}"
-            if act_s:
-                hover += f"<br>{act_s}"
-            _add(in_ch or 1, f"in_ch: {in_ch}", hover=hover)
-            for i, ch in enumerate(model_cfg.get("out_channels") or []):
-                k = None
-                if isinstance(kernels, list) and i < len(kernels):
-                    k = kernels[i]
-                lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
-                hover = f"type=CNN<br>out_channels[{i}]={ch}"
-                if k is not None:
-                    hover += f"<br>kernel={k}"
-                if act_s:
-                    hover += f"<br>{act_s}"
-                _add(ch, lab, hover=hover)
-        else:
-            io_in = model_cfg.get("input_size")
-            _add(io_in or 8, model_type, hover=f"type={model_type}<br>input_size={io_in}")
-
-        return sizes, labels, hovers
-
-    fig = go.Figure()
-
-    def _draw_stack(center_x: float, stack_sizes: List[float], stack_labels: List[str], stack_hovers: List[str]) -> Tuple[List[float], List[float]]:
-        if not stack_sizes:
-            return [], []
-
-        max_sz = max(stack_sizes) if stack_sizes else 1.0
-        dims = [0.6 + 2.4 * (s / max_sz) for s in stack_sizes]
-
-        y_top = 0.0
-        gap = 0.45
-        centers_y: List[float] = []
-        centers_x: List[float] = []
-        text_x: List[float] = []
-        text_y: List[float] = []
-        text_t: List[str] = []
-
-        for d, lab, hov in zip(dims, stack_labels, stack_hovers):
-            w = d
-            h = d
-            x0, x1 = center_x - w / 2, center_x + w / 2
-            y0, y1 = y_top, y_top + h
-
-            # Use a filled polygon trace (not a layout shape) so hover works over the box area.
-            fig.add_trace(
-                go.Scatter(
-                    x=[x0, x1, x1, x0, x0],
-                    y=[y0, y0, y1, y1, y0],
-                    mode="lines",
-                    fill="toself",
-                    fillcolor=box_fill,
-                    line=dict(color=box_line, width=1),
-                    hovertext=hov,
-                    hoverinfo="text",
-                    showlegend=False,
-                )
-            )
-
-            cx = center_x
-            cy = (y0 + y1) / 2
-            centers_x.append(cx)
-            centers_y.append(cy)
-            text_x.append(cx)
-            text_y.append(cy)
-            text_t.append(lab)
-
-            y_top = y1 + gap
-
-        # Labels.
-        fig.add_trace(
-            go.Scatter(
-                x=text_x,
-                y=text_y,
-                mode="text",
-                text=text_t,
-                textposition="middle center",
-                textfont=dict(size=16, color="white"),
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-
-        return centers_x, centers_y
-
-    # Special-case Combined(sequential): two stacks + flow indicator.
-    if mtype == "Combined" and str(cfg.get("combine")) == "sequential":
-        a_id = str(cfg.get("model_a_id", ""))
-        b_id = str(cfg.get("model_b_id", ""))
-        a_t = str(cfg.get("model_a_type", "A"))
-        b_t = str(cfg.get("model_b_type", "B"))
-        io_in = cfg.get("input_size")
-        io_out = cfg.get("output_size")
-
-        left_sizes = [_coerce_size(io_in or 8), _coerce_size(io_out or (io_in or 8))]
-        left_labels = [f"A {a_t}", "Combined"]
-        left_hovers = [
-            "type=Combined(sequential)"
-            f"<br>direction=A → B"
-            f"<br>A={a_t} ({a_id[:8] if a_id else '?'})"
-            f"<br>input_size={io_in}",
-            "type=Combined(sequential)"
-            f"<br>direction=A → B"
-            f"<br>output_size={io_out}",
-        ]
-
-        right_sizes = [_coerce_size(io_out or 8)]
-        right_labels = [f"B {b_t}"]
-        right_hovers = [
-            "type=Combined(sequential)"
-            f"<br>direction=A → B"
-            f"<br>B={b_t} ({b_id[:8] if b_id else '?'})"
-            f"<br>output_size={io_out}",
-        ]
-
-        stack_dx = 3.6
-        left_cx, left_cy = _draw_stack(-stack_dx, left_sizes, left_labels, left_hovers)
-        right_cx, right_cy = _draw_stack(stack_dx, right_sizes, right_labels, right_hovers)
-
-        # Connectors.
-        if len(left_cy) >= 2:
-            fig.add_trace(
-                go.Scatter(
-                    x=[-stack_dx + 0.65, -stack_dx + 0.65],
-                    y=[left_cy[0], left_cy[1]],
-                    mode="lines+text",
-                    line=dict(width=4, color=conn_color),
-                    text=["", "A → …"],
-                    textposition="top center",
-                    textfont=dict(size=13, color=conn_color),
-                    hoverinfo="skip",
-                    showlegend=False,
-                )
-            )
-
-        left_flow_y = left_cy[1] if len(left_cy) >= 2 else (left_cy[0] if left_cy else 0.6)
-        right_flow_y = right_cy[0] if right_cy else 0.6
-        fig.add_trace(
-            go.Scatter(
-                x=[-stack_dx + 0.45, stack_dx - 0.45],
-                y=[left_flow_y, right_flow_y],
-                mode="lines+text",
-                line=dict(width=4, color=conn_color),
-                text=["", "A → B"],
-                textposition="top center",
-                textfont=dict(size=13, color=conn_color),
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-
-        # Layout bounds.
-        max_y = 0.0
-        if left_cy:
-            max_y = max(max_y, max(left_cy) + 2.2)
-        if right_cy:
-            max_y = max(max_y, max(right_cy) + 2.2)
-        fig.update_layout(
-            height=520,
-            margin=dict(l=0, r=0, t=10, b=0),
-            paper_bgcolor=plot_bg,
-            plot_bgcolor=plot_bg,
-            hovermode="closest",
-            dragmode="pan",
-            xaxis=dict(visible=False, range=[-7.0, 7.0]),
-            yaxis=dict(visible=False, range=[max_y, -1.0]),
-            showlegend=False,
-        )
-        return fig
-
-    sizes, labels, hovers = _stack_specs_for_model(mtype, cfg)
-    if not sizes:
-        return None
-
-    cx, cy = _draw_stack(0.0, sizes, labels, hovers)
-    max_y = (max(cy) + 2.2) if cy else 6.0
-    fig.update_layout(
-        height=520,
-        margin=dict(l=0, r=0, t=10, b=0),
-        paper_bgcolor=plot_bg,
-        plot_bgcolor=plot_bg,
-        hovermode="closest",
-        dragmode="pan",
-        xaxis=dict(visible=False, range=[-4.2, 4.2]),
-        yaxis=dict(visible=False, range=[max_y, -1.0]),
-        showlegend=False,
-    )
-    return fig
-
-
-def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -> Optional[str]:
-    """Interactive SVG 2D schematic (pan/zoom + hover tooltips).
-
-    Uses no WebGL, so it works on Raspberry Pi browsers where 3D renderers
-    (Plotly Mesh3d / vtk.js) can fail due to missing WebGL extensions.
-    """
-    if not model_id or model_id not in models:
-        return None
-
-    md = models.get(model_id) or {}
-    mtype = str(md.get("type", "Unknown"))
-    cfg = md.get("config") or {}
-
-    plot_bg = "rgba(35,38,45,1.0)"
-    box_fill = "rgba(120,120,140,0.65)"
-    box_line = "rgba(230,230,240,0.55)"
-    conn_color = "rgba(200,200,200,0.75)"
-
-    def _esc(s: Any) -> str:
-        t = str(s)
-        return (
-            t.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&#39;")
-        )
-
-    def _coerce_size(v: Any) -> float:
-        try:
-            fv = float(v)
-        except Exception:
-            fv = 1.0
-        return max(1.0, fv)
-
-    def _act_summary() -> str:
-        acts = cfg.get("activations")
-        act = cfg.get("activation")
-        if isinstance(acts, list) and acts:
-            return "activations=" + ",".join(str(a) for a in acts)
-        if act is not None:
-            return f"activation={act}"
-        return ""
-
-    # Build stack specs.
+    # ── collect layer specs ───────────────────────────────────────────────────
     sizes: List[float] = []
     labels: List[str] = []
     hovers: List[str] = []
@@ -1248,9 +263,8 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
         hovers.append(hover)
 
     act_s = _act_summary()
+    combined_seq = mtype == "Combined" and str(cfg.get("combine")) == "sequential"
 
-    # Combined(sequential): render as two stacks.
-    combined_seq = (mtype == "Combined" and str(cfg.get("combine")) == "sequential")
     if combined_seq:
         a_id = str(cfg.get("model_a_id", ""))
         b_id = str(cfg.get("model_b_id", ""))
@@ -1258,285 +272,370 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
         b_t = str(cfg.get("model_b_type", "B"))
         io_in = cfg.get("input_size")
         io_out = cfg.get("output_size")
-
-        left_sizes = [_coerce_size(io_in or 8), _coerce_size(io_out or (io_in or 8))]
+        left_sizes  = [_coerce_size(io_in or 8), _coerce_size(io_out or (io_in or 8))]
         left_labels = [f"A {a_t}", "Combined"]
         left_hovers = [
-            "type=Combined(sequential)" + f"\nA={a_t} ({a_id[:8] if a_id else '?'})" + f"\ninput_size={io_in}",
-            "type=Combined(sequential)" + f"\noutput_size={io_out}",
+            f"type=Combined(sequential)\nA={a_t} ({a_id[:8] if a_id else '?'})\ninput_size={io_in}",
+            f"type=Combined(sequential)\noutput_size={io_out}",
         ]
-        right_sizes = [_coerce_size(io_out or 8)]
+        right_sizes  = [_coerce_size(io_out or 8)]
         right_labels = [f"B {b_t}"]
-        right_hovers = [
-            "type=Combined(sequential)" + f"\nB={b_t} ({b_id[:8] if b_id else '?'})" + f"\noutput_size={io_out}",
-        ]
+        right_hovers = [f"type=Combined(sequential)\nB={b_t} ({b_id[:8] if b_id else '?'})\noutput_size={io_out}"]
     else:
         if mtype == "MLP":
             for i, s in enumerate(cfg.get("layer_sizes") or []):
-                hover = f"type=MLP\nlayer={i}\nsize={s}" + (f"\n{act_s}" if act_s else "")
-                _add(s, f"L{i}: {s}", hover)
+                _add(s, f"L{i}: {s}", f"type=MLP\nlayer={i}\nsize={s}" + (f"\n{act_s}" if act_s else ""))
         elif mtype == "Linear":
             inp = cfg.get("input_size")
-            hover = f"type=Linear\ninput_size={inp}" + (f"\n{act_s}" if act_s else "")
-            _add(inp or 1, f"in: {inp}", hover)
+            _add(inp or 1, f"in: {inp}", f"type=Linear\ninput_size={inp}" + (f"\n{act_s}" if act_s else ""))
             for i, h in enumerate(cfg.get("hidden_sizes") or []):
-                hover = f"type=Linear\nhidden[{i}]={h}" + (f"\n{act_s}" if act_s else "")
-                _add(h, f"h{i}: {h}", hover)
+                _add(h, f"h{i}: {h}", f"type=Linear\nhidden[{i}]={h}" + (f"\n{act_s}" if act_s else ""))
             out = cfg.get("output_size")
-            hover = f"type=Linear\noutput_size={out}" + (f"\n{act_s}" if act_s else "")
-            _add(out or 1, f"out: {out}", hover)
+            _add(out or 1, f"out: {out}", f"type=Linear\noutput_size={out}" + (f"\n{act_s}" if act_s else ""))
         elif mtype == "CNN":
             kernels = cfg.get("kernels")
             in_ch = cfg.get("in_channels")
-            hover = f"type=CNN\nin_channels={in_ch}" + (f"\n{act_s}" if act_s else "")
-            _add(in_ch or 1, f"in_ch: {in_ch}", hover)
+            _add(in_ch or 1, f"in_ch: {in_ch}", f"type=CNN\nin_channels={in_ch}" + (f"\n{act_s}" if act_s else ""))
             for i, ch in enumerate(cfg.get("out_channels") or []):
-                k = None
-                if isinstance(kernels, list) and i < len(kernels):
-                    k = kernels[i]
+                k = kernels[i] if isinstance(kernels, list) and i < len(kernels) else None
                 lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
-                hover = f"type=CNN\nout_channels[{i}]={ch}" + (f"\nkernel={k}" if k is not None else "")
-                if act_s:
-                    hover += f"\n{act_s}"
-                _add(ch, lab, hover)
+                hov = f"type=CNN\nout_channels[{i}]={ch}" + (f"\nkernel={k}" if k is not None else "") + (f"\n{act_s}" if act_s else "")
+                _add(ch, lab, hov)
         else:
             io_in = cfg.get("input_size")
             _add(io_in or 8, mtype, f"type={mtype}\ninput_size={io_in}")
-
-        left_sizes = sizes
-        left_labels = labels
-        left_hovers = hovers
-        right_sizes = []
-        right_labels = []
-        right_hovers = []
+        left_sizes, left_labels, left_hovers = sizes, labels, hovers
+        right_sizes, right_labels, right_hovers = [], [], []
 
     if not left_sizes:
         return None
 
-    # Geometry in "units" (similar to the Plotly 2D schematic), then scale to pixels.
-    unit = 120.0
-    gap = 0.45
-    box_gap_px = gap * unit
+    # ── isometric geometry constants ──────────────────────────────────────────
+    ISO_DX   = 24.0    # depth x-offset  (right)
+    ISO_DY   = -14.0   # depth y-offset  (up)
+    SLAB_H   = 72.0    # constant slab face height
+    GAP      = 48.0    # gap between slabs
+    MIN_W    = 80.0
+    MAX_W    = 240.0
 
     max_sz = max(left_sizes + right_sizes) if right_sizes else max(left_sizes)
-    left_dims = [0.6 + 2.4 * (s / max_sz) for s in left_sizes]
-    right_dims = [0.6 + 2.4 * (s / max_sz) for s in right_sizes]
 
-    # Layout: one or two stacks.
-    stack_dx_units = 3.6
-    stack_dx_px = stack_dx_units * unit
+    def _w(sz: float) -> float:
+        return MIN_W + (MAX_W - MIN_W) * (sz / max_sz)
 
-    shapes: List[str] = []
-    lines: List[str] = []
-    texts: List[str] = []
+    def _poly(*pts: Tuple[float, float]) -> str:
+        return " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
 
-    depth_dx = 10.0
-    depth_dy = 10.0
+    # Accent palettes: (front_top, front_bot, top_face, right_face)
+    PALETTES = [
+        ("#5b8ce8", "#3a6bcf", "#7aabf5", "#1e3f8a"),   # blue
+        ("#9b6de8", "#7248cf", "#b98af5", "#401e8a"),   # purple
+        ("#3fb8b0", "#288a83", "#5ed4cc", "#145854"),   # teal
+        ("#e87a3f", "#cf5a28", "#f5a06e", "#8a3214"),   # amber
+        ("#5bbf5b", "#3a9a3a", "#7ad47a", "#1e6018"),   # green
+    ]
 
-    def _draw_stack(center_x_px: float, dims: List[float], labs: List[str], hvs: List[str]) -> List[Tuple[float, float]]:
-        y_top = 0.0
+    grad_defs: List[str] = []
+    grad_seen: set = set()
+    shapes_svg: List[str] = []
+    conns_svg: List[str] = []
+
+    def _ensure_palette(idx: int) -> int:
+        pid = idx % len(PALETTES)
+        if pid not in grad_seen:
+            grad_seen.add(pid)
+            fa, fb, tc, rc = PALETTES[pid]
+            grad_defs.append(f"""
+  <linearGradient id="gf{pid}" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%"   stop-color="{fa}" stop-opacity="0.95"/>
+    <stop offset="100%" stop-color="{fb}" stop-opacity="0.88"/>
+  </linearGradient>
+  <linearGradient id="gt{pid}" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0%"   stop-color="{tc}" stop-opacity="0.80"/>
+    <stop offset="100%" stop-color="{tc}" stop-opacity="0.55"/>
+  </linearGradient>
+  <linearGradient id="gr{pid}" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%"   stop-color="{rc}" stop-opacity="0.85"/>
+    <stop offset="100%" stop-color="{rc}" stop-opacity="0.60"/>
+  </linearGradient>""")
+        return pid
+
+    def _draw_slab(cx: float, y0: float, w: float, label: str, hover: str, idx: int) -> Tuple[float, float]:
+        """Draw one isometric slab. Returns (cx, y_bottom_of_front_face)."""
+        pid = _ensure_palette(idx)
+        x0, x1 = cx - w / 2, cx + w / 2
+        y1 = y0 + SLAB_H
+        cy = (y0 + y1) / 2
+
+        top_pts   = _poly((x0, y0), (x1, y0), (x1+ISO_DX, y0+ISO_DY), (x0+ISO_DX, y0+ISO_DY))
+        right_pts = _poly((x1, y0), (x1+ISO_DX, y0+ISO_DY), (x1+ISO_DX, y1+ISO_DY), (x1, y1))
+
+        shapes_svg.append(
+            f'<g class="rt-box" tabindex="0">\n'
+            f'  <title>{_esc(hover)}</title>\n'
+            f'  <polygon class="face-r" points="{right_pts}" fill="url(#gr{pid})"/>\n'
+            f'  <polygon class="face-t" points="{top_pts}"   fill="url(#gt{pid})"/>\n'
+            f'  <rect    class="face-f" x="{x0:.1f}" y="{y0:.1f}" width="{w:.1f}" height="{SLAB_H:.1f}" rx="3" fill="url(#gf{pid})"/>\n'
+            f'  <rect    class="face-g" x="{x0:.1f}" y="{y0:.1f}" width="{w:.1f}" height="{SLAB_H:.1f}" rx="3"/>\n'
+            f'  <text    class="slab-lbl" x="{cx:.1f}" y="{cy:.1f}">{_esc(label)}</text>\n'
+            f'</g>'
+        )
+        return cx, y1
+
+    def _draw_stack(cx: float, szs: List[float], labs: List[str], hvs: List[str], idx_off: int = 0) -> List[Tuple[float, float]]:
         centers: List[Tuple[float, float]] = []
-        for d, lab, hv in zip(dims, labs, hvs):
-            w = d * unit
-            h = d * unit
-            x0 = center_x_px - w / 2
-            y0 = y_top
-            x1 = center_x_px + w / 2
-            y1 = y_top + h
-            cx = center_x_px
-            cy = (y0 + y1) / 2
-            centers.append((cx, cy))
-            shapes.append(
-                "\n".join(
-                    [
-                        f'<g class="rt-box" tabindex="0">',
-                        f'  <title>{_esc(hv)}</title>',
-                        f'  <rect class="shadow" x="{x0 + depth_dx:.1f}" y="{y0 + depth_dy:.1f}" width="{w:.1f}" height="{h:.1f}" rx="8" ry="8"/>',
-                        f'  <rect class="box" x="{x0:.1f}" y="{y0:.1f}" width="{w:.1f}" height="{h:.1f}" rx="8" ry="8"/>',
-                        f'  <text class="label" x="{cx:.1f}" y="{cy:.1f}">{_esc(lab)}</text>',
-                        f'</g>',
-                    ]
+        y = 0.0
+        prev_bot: Optional[float] = None
+        for i, (sz, lab, hov) in enumerate(zip(szs, labs, hvs)):
+            w = _w(sz)
+            box_cx, bot = _draw_slab(cx, y, w, lab, hov, i + idx_off)
+            mid_y = (y + bot) / 2
+            centers.append((box_cx, mid_y))
+            if prev_bot is not None:
+                conns_svg.append(
+                    f'<line class="fc" x1="{cx:.1f}" y1="{prev_bot:.1f}" '
+                    f'x2="{cx:.1f}" y2="{y:.1f}" marker-end="url(#ah)"/>'
                 )
-            )
-            y_top = y1 + box_gap_px
+            prev_bot = bot
+            y = bot + GAP
         return centers
 
-    left_centers = _draw_stack((-stack_dx_px if right_dims else 0.0), left_dims, left_labels, left_hovers)
-    right_centers = _draw_stack((stack_dx_px if right_dims else 0.0), right_dims, right_labels, right_hovers)
+    STACK_SEP = MAX_W + ISO_DX + 80.0
 
-    # Connectors.
     if combined_seq:
-        if len(left_centers) >= 2:
-            a0 = (left_centers[0][0] + 0.65 * unit, left_centers[0][1])
-            a1 = (left_centers[1][0] + 0.65 * unit, left_centers[1][1])
-            lines.append(f'<line class="conn" x1="{a0[0]:.1f}" y1="{a0[1]:.1f}" x2="{a1[0]:.1f}" y2="{a1[1]:.1f}"/>')
+        lcx = -STACK_SEP / 2
+        rcx =  STACK_SEP / 2
+        left_centers  = _draw_stack(lcx, left_sizes,  left_labels,  left_hovers,  idx_off=0)
+        right_centers = _draw_stack(rcx, right_sizes, right_labels, right_hovers, idx_off=len(left_sizes))
         if left_centers and right_centers:
-            b0 = (left_centers[-1][0] + 0.45 * unit, left_centers[-1][1])
-            b1 = (right_centers[0][0] - 0.45 * unit, right_centers[0][1])
-            lines.append(f'<line class="conn" x1="{b0[0]:.1f}" y1="{b0[1]:.1f}" x2="{b1[0]:.1f}" y2="{b1[1]:.1f}"/>')
-            # Arrow label.
-            texts.append(f'<text class="flow" x="{(b0[0]+b1[0])/2:.1f}" y="{(b0[1]+b1[1])/2 - 14:.1f}">A → B</text>')
+            lx, ly = left_centers[-1]
+            rx, ry = right_centers[0]
+            edge_l = lx + _w(left_sizes[-1]) / 2 + 8
+            edge_r = rx - _w(right_sizes[0]) / 2 - 8
+            mid_y  = (ly + ry) / 2
+            conns_svg.append(
+                f'<line class="fc cross" x1="{edge_l:.1f}" y1="{ly:.1f}" '
+                f'x2="{edge_r:.1f}" y2="{ry:.1f}" marker-end="url(#ah)"/>'
+            )
+            conns_svg.append(
+                f'<text class="flow-lbl" x="{(edge_l+edge_r)/2:.1f}" y="{mid_y - 10:.1f}">A → B</text>'
+            )
+    else:
+        left_centers  = _draw_stack(0.0, left_sizes, left_labels, left_hovers)
+        right_centers = []
 
-    content_h = 0.0
-    for g in [left_centers, right_centers]:
-        if g:
-            content_h = max(content_h, max(y for _, y in g) + 2.2 * unit)
-    content_h = max(content_h, 520.0)
+    # ── viewBox ───────────────────────────────────────────────────────────────
+    all_cy = [cy for _, cy in left_centers + right_centers]
+    content_h = (max(all_cy) + SLAB_H + GAP) if all_cy else 480.0
+    content_h = max(content_h, 440.0)
+    content_w = (STACK_SEP + MAX_W + ISO_DX + 40) if combined_seq else (MAX_W + ISO_DX + 40)
+    PAD = 56.0
+    vb_x = -content_w / 2 - PAD
+    vb_y =  ISO_DY - PAD
+    vb_w =  content_w + 2 * PAD
+    vb_h =  content_h + 2 * PAD
 
-    content_w = 8.4 * unit if right_dims else 4.2 * unit
-    pad = 48.0
-    vb_x = -content_w / 2 - pad
-    vb_y = -pad
-    vb_w = content_w + 2 * pad
-    vb_h = content_h + 2 * pad
+    svg_id       = f"rt-iso-{_esc(model_id[:12])}"
+    info_js      = json.dumps(_model_summary())
+    defs_html    = "\n".join(grad_defs)
+    shapes_html  = "\n".join(shapes_svg)
+    conns_html   = "\n".join(conns_svg)
 
-    svg_id = f"rt-structure-svg-{_esc(model_id)}"
+    # HUD / reset positions
+    hud_x  = vb_x + 10
+    hud_y  = vb_y + 10
+    hud_w  = vb_w - 20
+    rst_x  = vb_x + vb_w - 82
+    rst_y  = vb_y + 10
 
-    initial_info_js = json.dumps(_model_summary())
+    return f"""<div style="background:#13151c;border-radius:10px;padding:4px;box-shadow:0 6px 40px #0009;">
+<svg id="{svg_id}" viewBox="{vb_x:.1f} {vb_y:.1f} {vb_w:.1f} {vb_h:.1f}"
+     width="100%" height="560" style="touch-action:none;display:block;font-family:monospace;">
+<defs>
+{defs_html}
+  <filter id="glow"  x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur stdDeviation="5" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="glow2" x="-40%" y="-40%" width="180%" height="180%">
+    <feGaussianBlur stdDeviation="10" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <marker id="ah" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+    <polygon points="0 0,7 2.5,0 5" fill="rgba(150,175,220,0.75)"/>
+  </marker>
+  <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse">
+    <circle cx="1" cy="1" r="1" fill="rgba(255,255,255,0.045)"/>
+  </pattern>
+</defs>
+<style>
+  .bg   {{ fill:#13151c; }}
+  .dots {{ fill:url(#dots); }}
+  /* isometric faces */
+  .face-r,.face-t {{ transition:opacity .15s; }}
+  .face-r {{ opacity:.78; }}
+  .face-t {{ opacity:.82; }}
+  /* front glow overlay */
+  .face-g {{
+    fill:transparent;
+    stroke:rgba(255,255,255,.13);
+    stroke-width:1.5;
+    pointer-events:none;
+    transition:stroke .18s, filter .18s;
+  }}
+  /* box states */
+  .rt-box {{ cursor:pointer; }}
+  .rt-box:hover .face-r,
+  .rt-box:hover .face-t,
+  .rt-box:focus .face-r,
+  .rt-box:focus .face-t {{ opacity:1; }}
+  .rt-box:hover .face-g,
+  .rt-box:focus .face-g {{
+    stroke:rgba(255,255,255,.55);
+    stroke-width:2.5;
+    filter:url(#glow);
+  }}
+  .rt-box.sel .face-g {{
+    stroke:rgba(140,210,255,.95);
+    stroke-width:3;
+    filter:url(#glow2);
+  }}
+  .rt-box.sel .face-r,
+  .rt-box.sel .face-t {{ opacity:1; }}
+  /* label */
+  .slab-lbl {{
+    fill:#fff;
+    font-size:14px;
+    font-weight:700;
+    dominant-baseline:middle;
+    text-anchor:middle;
+    user-select:none;
+    pointer-events:none;
+    paint-order:stroke;
+    stroke:rgba(0,0,0,.65);
+    stroke-width:3px;
+    stroke-linejoin:round;
+  }}
+  /* connectors */
+  .fc {{
+    stroke:rgba(150,175,220,.65);
+    stroke-width:2;
+    stroke-dasharray:6 4;
+    fill:none;
+    animation:dash 1.1s linear infinite;
+  }}
+  .cross {{
+    stroke:rgba(200,155,255,.75);
+    stroke-dasharray:8 5;
+  }}
+  @keyframes dash {{ to {{ stroke-dashoffset:-20; }} }}
+  .flow-lbl {{
+    fill:rgba(200,165,255,.9);
+    font-size:12px;
+    text-anchor:middle;
+    user-select:none;
+    pointer-events:none;
+  }}
+  /* HUD */
+  .hud-bg  {{ fill:rgba(18,20,28,.92); }}
+  .hud-bd  {{ fill:none; stroke:rgba(110,135,180,.3); stroke-width:1; }}
+  .hud-ttl {{ fill:rgba(140,165,210,.85); font-size:10px; letter-spacing:.1em; }}
+  .hud-val {{ fill:rgba(225,235,250,.95); font-size:13px; }}
+  /* reset btn */
+  .rbg {{ fill:rgba(50,60,95,.75); stroke:rgba(110,135,200,.4); stroke-width:1; cursor:pointer; }}
+  .rbg:hover {{ fill:rgba(75,90,145,.9); }}
+  .rlbl {{ fill:rgba(170,195,240,.9); font-size:10px; text-anchor:middle; dominant-baseline:middle; pointer-events:none; user-select:none; }}
+</style>
 
-    lines_html = "\n      ".join(lines)
-    texts_html = "\n      ".join(texts)
-    shapes_html = "\n      ".join(shapes)
+<rect class="bg"   x="{vb_x:.1f}" y="{vb_y:.1f}" width="{vb_w:.1f}" height="{vb_h:.1f}"/>
+<rect class="dots" x="{vb_x:.1f}" y="{vb_y:.1f}" width="{vb_w:.1f}" height="{vb_h:.1f}"/>
 
-    html = f"""
-<div style=\"background:{plot_bg}; border-radius: 0.5rem; padding: 0.25rem;\">
-  <svg id=\"{svg_id}\" viewBox=\"{vb_x:.1f} {vb_y:.1f} {vb_w:.1f} {vb_h:.1f}\" width=\"100%\" height=\"520\" style=\"touch-action:none;\">
-    <style>
-            .shadow {{ fill: {box_shadow}; stroke: none; }}
-      .box {{ fill: {box_fill}; stroke: {box_line}; stroke-width: 1; }}
-      .rt-box {{ cursor: pointer; }}
-      .rt-box:hover .box, .rt-box:focus .box {{ stroke-width: 3; }}
-            .rt-box.selected .box {{ stroke-width: 3; }}
-      .label {{ fill: white; font-size: 18px; font-family: sans-serif; dominant-baseline: middle; text-anchor: middle; user-select: none; pointer-events: none; }}
-      .conn {{ stroke: {conn_color}; stroke-width: 6; stroke-linecap: round; }}
-      .flow {{ fill: {conn_color}; font-size: 14px; font-family: sans-serif; text-anchor: middle; user-select: none; pointer-events: none; }}
-            .hud-bg {{ fill: {plot_bg}; opacity: 0.92; }}
-            .hud-border {{ fill: none; stroke: {box_line}; stroke-width: 1; opacity: 0.6; }}
-            .hud-title {{ fill: white; font-size: 14px; font-family: sans-serif; opacity: 0.95; }}
-            .hud-text {{ fill: white; font-size: 12px; font-family: monospace; opacity: 0.9; }}
-    </style>
-    <rect x=\"{vb_x:.1f}\" y=\"{vb_y:.1f}\" width=\"{vb_w:.1f}\" height=\"{vb_h:.1f}\" fill=\"{plot_bg}\" />
-    <g id=\"viewport\">
-            {lines_html}
-            {texts_html}
-            {shapes_html}
-    </g>
-        <g id=\"hud\">
-            <rect class=\"hud-bg\" x=\"{vb_x + 8:.1f}\" y=\"{vb_y + 8:.1f}\" width=\"{vb_w - 16:.1f}\" height=\"86\" rx=\"10\" ry=\"10\" />
-            <rect class=\"hud-border\" x=\"{vb_x + 8:.1f}\" y=\"{vb_y + 8:.1f}\" width=\"{vb_w - 16:.1f}\" height=\"86\" rx=\"10\" ry=\"10\" />
-            <text class=\"hud-title\" x=\"{vb_x + 20:.1f}\" y=\"{vb_y + 30:.1f}\">Model / Layer Info (hover or click a box)</text>
-            <text id=\"infoText\" class=\"hud-text\" x=\"{vb_x + 20:.1f}\" y=\"{vb_y + 50:.1f}\"></text>
-        </g>
-    <script>
-      (function() {{
-        const svg = document.getElementById('{svg_id}');
-        if (!svg) return;
-        const viewport = svg.querySelector('#viewport');
-        if (!viewport) return;
-                const infoText = svg.querySelector('#infoText');
+<g id="rt-vp">
+  {conns_html}
+  {shapes_html}
+</g>
 
-                function setInfo(raw) {{
-                    if (!infoText) return;
-                    while (infoText.firstChild) infoText.removeChild(infoText.firstChild);
-                    const lines = String(raw || '').split('\n');
-                    lines.forEach((ln, i) => {{
-                        const tspan = document.createElementNS('http://www.w3.org/2000/svg', 'tspan');
-                        tspan.setAttribute('x', infoText.getAttribute('x'));
-                        tspan.setAttribute('dy', i === 0 ? '0' : '1.25em');
-                        tspan.textContent = ln;
-                        infoText.appendChild(tspan);
-                    }});
-                }}
+<!-- HUD -->
+<g id="rt-hud">
+  <rect class="hud-bg" x="{hud_x:.1f}" y="{hud_y:.1f}" width="{hud_w:.1f}" height="68" rx="8"/>
+  <rect class="hud-bd" x="{hud_x:.1f}" y="{hud_y:.1f}" width="{hud_w:.1f}" height="68" rx="8"/>
+  <text class="hud-ttl" x="{hud_x+12:.1f}" y="{hud_y+18:.1f}">LAYER INFO — HOVER OR CLICK A BLOCK</text>
+  <text id="rt-inf" class="hud-val" x="{hud_x+12:.1f}" y="{hud_y+38:.1f}"></text>
+</g>
 
-                setInfo({initial_info_js});
+<!-- Reset button -->
+<g id="rt-rst" style="cursor:pointer;">
+  <rect class="rbg" x="{rst_x:.1f}" y="{rst_y:.1f}" width="70" height="20" rx="5"/>
+  <text class="rlbl" x="{rst_x+35:.1f}" y="{rst_y+10:.1f}">RESET VIEW</text>
+</g>
 
-                let selectedBox = null;
-                function selectBox(g) {{
-                    if (selectedBox && selectedBox !== g) selectedBox.classList.remove('selected');
-                    selectedBox = g;
-                    if (selectedBox) selectedBox.classList.add('selected');
-                }}
+<script>
+(function(){{
+  const svg = document.getElementById('{svg_id}');
+  if (!svg) return;
+  const vp  = svg.getElementById ? svg.getElementById('rt-vp') : svg.querySelector('#rt-vp');
+  const inf = svg.querySelector('#rt-inf');
 
-                const boxes = svg.querySelectorAll('.rt-box');
-                boxes.forEach((g) => {{
-                    const titleEl = g.querySelector('title');
-                    const getText = () => titleEl ? titleEl.textContent : '';
-                    g.addEventListener('pointerenter', () => setInfo(getText()));
-                    g.addEventListener('focus', () => setInfo(getText()));
-                    g.addEventListener('click', (e) => {{
-                        e.stopPropagation();
-                        selectBox(g);
-                        setInfo(getText());
-                    }});
-                }});
+  function setInfo(raw) {{
+    if (!inf) return;
+    while (inf.firstChild) inf.removeChild(inf.firstChild);
+    String(raw||'').split('\\n').slice(0,3).forEach((ln,i)=>{{
+      const ts = document.createElementNS('http://www.w3.org/2000/svg','tspan');
+      ts.setAttribute('x', inf.getAttribute('x'));
+      ts.setAttribute('dy', i===0?'0':'1.4em');
+      ts.textContent = ln;
+      inf.appendChild(ts);
+    }});
+  }}
+  setInfo({info_js});
 
-        let scale = 1.0;
-        let tx = 0.0;
-        let ty = 0.0;
-        let panning = false;
-        let lastX = 0.0;
-        let lastY = 0.0;
+  let sel = null;
+  svg.querySelectorAll('.rt-box').forEach(g => {{
+    const tt = g.querySelector('title');
+    const txt = () => tt ? tt.textContent : '';
+    g.addEventListener('pointerenter', ()=> setInfo(txt()));
+    g.addEventListener('focus',        ()=> setInfo(txt()));
+    g.addEventListener('click', e => {{
+      e.stopPropagation();
+      if (sel && sel !== g) sel.classList.remove('sel');
+      sel = g; g.classList.add('sel');
+      setInfo(txt());
+    }});
+  }});
+  svg.addEventListener('click', ()=>{{ if(sel){{ sel.classList.remove('sel'); sel=null; }} }});
 
-        function apply() {{
-          viewport.setAttribute('transform', `translate(${{tx}} ${{ty}}) scale(${{scale}})`);
-        }}
+  // pan / zoom
+  let sc=1, tx=0, ty=0, pan=false, lx=0, ly=0;
+  const apply = () => vp && vp.setAttribute('transform',`translate(${{tx}} ${{ty}}) scale(${{sc}})`);
 
-                svg.addEventListener('pointerdown', (e) => {{
-                    if (e.target && e.target.closest && (e.target.closest('.rt-box') || e.target.closest('#hud'))) return;
-          panning = true;
-          lastX = e.clientX;
-          lastY = e.clientY;
-          svg.setPointerCapture(e.pointerId);
-        }});
+  svg.addEventListener('pointerdown', e => {{
+    const t = e.target;
+    if (t.closest && (t.closest('.rt-box')||t.closest('#rt-hud')||t.closest('#rt-rst'))) return;
+    pan=true; lx=e.clientX; ly=e.clientY; svg.setPointerCapture(e.pointerId);
+  }});
+  svg.addEventListener('pointerup', e => {{
+    pan=false; try{{svg.releasePointerCapture(e.pointerId);}}catch(_){{}}
+  }});
+  svg.addEventListener('pointermove', e => {{
+    if(!pan) return;
+    tx+=e.clientX-lx; ty+=e.clientY-ly; lx=e.clientX; ly=e.clientY; apply();
+  }});
+  svg.addEventListener('wheel', e => {{
+    e.preventDefault();
+    const r=svg.getBoundingClientRect();
+    const mx=e.clientX-r.left, my=e.clientY-r.top;
+    const z=e.deltaY<0?1.13:1/1.13;
+    const ns=Math.min(5,Math.max(0.2,sc*z)), k=ns/sc;
+    tx=mx-k*(mx-tx); ty=my-k*(my-ty); sc=ns; apply();
+  }},{{passive:false}});
 
-        svg.addEventListener('pointerup', (e) => {{
-          panning = false;
-          try {{ svg.releasePointerCapture(e.pointerId); }} catch (_) {{}}
-        }});
+  const rst = svg.querySelector('#rt-rst');
+  if(rst) rst.addEventListener('click',()=>{{sc=1;tx=0;ty=0;apply();}});
 
-        svg.addEventListener('pointermove', (e) => {{
-          if (!panning) return;
-          const dx = e.clientX - lastX;
-          const dy = e.clientY - lastY;
-          lastX = e.clientX;
-          lastY = e.clientY;
-          tx += dx;
-          ty += dy;
-          apply();
-        }});
-
-        svg.addEventListener('wheel', (e) => {{
-          e.preventDefault();
-          const rect = svg.getBoundingClientRect();
-          const mx = e.clientX - rect.left;
-          const my = e.clientY - rect.top;
-          const delta = Math.max(-1, Math.min(1, e.deltaY));
-          const zoom = delta < 0 ? 1.12 : 1/1.12;
-          const newScale = Math.min(4.0, Math.max(0.35, scale * zoom));
-          const k = newScale / scale;
-          // zoom about mouse position in screen coords
-          tx = mx - k * (mx - tx);
-          ty = my - k * (my - ty);
-          scale = newScale;
-          apply();
-        }}, {{ passive: false }});
-
-        apply();
-      }})();
-    </script>
-  </svg>
-</div>
-"""
-    return html
-
-
-def _model_plotly_structure_figure(models: Dict[str, Any], model_id: Optional[str]) -> Tuple[Any, str] | Tuple[None, str]:
-    """Return (figure, mode) where mode is '3D' or '2D'."""
-    if go is None:
-        return None, ""
-    if _running_on_raspberry_pi():
-        return _model_plotly_2d_figure(models, model_id), "2D"
-    return _model_plotly_3d_figure(models, model_id), "3D"
+  apply();
+}})();
+</script>
+</svg></div>"""
 
 
 def _init_state() -> None:
@@ -2123,73 +1222,13 @@ def _render_models_page() -> None:
             st.subheader("Structure")
             st.markdown(f"```mermaid\n{diagram}\n```")
 
-        forced_3d = bool(str(os.environ.get("RASPTORCH_UI_3D_RENDER", "")).strip())
-        if _running_on_raspberry_pi() and components is not None and not forced_3d:
-            st.subheader("Structure (SVG)")
-            svg = _model_structure_svg_html(cmds.models, selected)
-            if svg:
+        st.subheader("Structure")
+        svg = _model_structure_svg_html(cmds.models, selected)
+        if svg:
+            if components is not None:
                 components.html(svg, height=560)
             else:
-                st.caption("SVG structure diagram unavailable.")
-        else:
-            st.subheader("Structure (3D)")
-
-            mode = _ui_3d_render_mode()
-            rendered = False
-
-            if mode == "pyvista_png":
-                png = _model_pyvista_png(cmds.models, selected)
-                if png is not None:
-                    st.image(png, use_container_width=True)
-                    rendered = True
-                else:
-                    st.caption("PyVista PNG render failed; falling back to Plotly.")
-
-            if not rendered and mode == "pyvista":
-                if pv is None:
-                    st.caption("PyVista renderer requires `pyvista`.")
-                else:
-                    try:
-                        from stpyvista import stpyvista as _stpyvista  # type: ignore
-                    except Exception as e:
-                        st.caption(
-                            "PyVista interactive renderer requires a Streamlit-compatible `stpyvista`. "
-                            "On this environment it failed to import; try upgrading `stpyvista` (and ensure Streamlit version compatibility)."
-                        )
-                        st.caption(f"stpyvista import error: {e}")
-                    else:
-                        plotter = _model_pyvista_plotter(cmds.models, selected, off_screen=False)
-                        if plotter is None:
-                            st.caption("PyVista renderer unavailable for this model.")
-                        else:
-                            _stpyvista(plotter, key=f"pyvista_{selected}")
-                            rendered = True
-
-            if not rendered:
-                fig3d = _model_plotly_3d_figure(cmds.models, selected)
-                if fig3d is not None:
-                    st.plotly_chart(fig3d, use_container_width=True)
-                    rendered = True
-                else:
-                    st.caption("3D structure requires Plotly (install `plotly`).")
-
-            if rendered:
-                st.markdown(
-                """**Legend (3D)**
-
-| Item | Meaning |
-|---|---|
-| Box | One layer/stage in the forward path |
-| Stack direction |  Layer Construction order follows: Top -> Bottom (Bottom → Top: follows the forward order) |
-| Box width/height | Relative magnitude (scaled to the largest layer in this diagram) |
-| Depth (thickness) | Constant (visual spacing only) |
-| Numbers used for sizing | MLP: `layer_sizes`; Linear: `input_size`, `hidden_sizes`, `output_size`; CNN: `in_channels`, `out_channels`; Combined: `input_size`/`output_size` (approx) |
-
-**Combined (sequential)**: the stack shows **A → Combined → B** (A feeds into B). The size is based on the stored `input_size`/`output_size` metadata (approximate).
-
-Note: this is an **approximate schematic**, not exact tensor shapes.
-"""
-                )
+                st.caption("SVG structure diagram unavailable (streamlit.components.v1 not importable).")
 
 
         st.subheader("Save")
