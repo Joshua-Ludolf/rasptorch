@@ -1086,6 +1086,16 @@ class ModelCommands:
         if model_id not in self.models:
             return {"error": f"Model {model_id} not found"}
         try:
+            # Resolve and validate the target path to avoid writing outside the models directory.
+            safe_path = os.path.realpath(self._resolve_model_save_path(path))
+            temp_real = os.path.realpath(tempfile.gettempdir())
+            try:
+                common = os.path.commonpath([temp_real, safe_path])
+            except ValueError:
+                raise ValueError("Resolved model save path is on a different drive or filesystem")
+            if common != temp_real:
+                raise ValueError("Resolved model save path must stay within the system temporary directory")
+
             model_data = self.models[model_id]
             model = self._ensure_model(model_id)
             if model is None:
@@ -1133,13 +1143,13 @@ class ModelCommands:
                 "state_dict": state_dict,
             }
 
-            ext = os.path.splitext(str(path))[1].lower()
+            ext = os.path.splitext(str(safe_path))[1].lower()
             if ext in {".pth", ".pt"}:
-                save_checkpoint(path, save_data)
+                save_checkpoint(safe_path, save_data)
                 fmt = "rasptorch-npz"
             else:
                 import pickle
-                with open(path, "wb") as f:
+                with open(safe_path, "wb") as f:
                     pickle.dump(save_data, f)
                 fmt = "pickle"
             
@@ -1147,12 +1157,46 @@ class ModelCommands:
                 "status": "success",
                 "model_id": model_id,
                 "path": path,
+                "resolved_path": safe_path,
                 "format": fmt,
                 "message": f"Model saved successfully",
             }
         except Exception as e:
             return {"error": str(e)}
 
+    def _resolve_model_save_path(self, path: str) -> str:
+        """Resolve a user-supplied model save path to a safe absolute path.
+
+        Absolute paths that already reside within the system temporary directory
+        are permitted as-is (e.g. paths produced by ``tempfile.NamedTemporaryFile``
+        used by the Streamlit UI download flow).  All other absolute paths are
+        rejected.  Relative paths are confined to the shared ``rasptorch_models``
+        directory under the system temporary directory.
+
+        ``os.path.realpath`` is used throughout so that symlink escapes are caught
+        by the ``os.path.commonpath`` confinement checks.
+        """
+        raw = (path or "").strip()
+        if not raw:
+            raise ValueError("Model save path must not be empty")
+
+        # Resolve the system temp directory (handles any symlinks in /tmp etc.).
+        temp_real = os.path.realpath(tempfile.gettempdir())
+
+        if os.path.isabs(raw):
+            # Allow absolute paths that are already within the system temp dir
+            # (e.g. NamedTemporaryFile paths used by internal/UI callers).
+            candidate_real = os.path.realpath(raw)
+            try:
+                common = os.path.commonpath([temp_real, candidate_real])
+            except ValueError:
+                raise ValueError("Model save path is on a different drive or filesystem")
+            if common != temp_real:
+                raise ValueError("Model save path attempts to escape the system temporary directory")
+            return candidate_real
+
+        # For relative paths, delegate to the shared model path resolver.
+        return self._resolve_model_path(raw)
     def _resolve_model_path(self, path: str) -> str:
         """Resolve a user-provided model path into a confined, normalized path.
 
@@ -1169,17 +1213,19 @@ class ModelCommands:
         # Base directory where models are stored.
         base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
         os.makedirs(base_dir, exist_ok=True)
+        # Use realpath to resolve any symlinks in the base directory itself.
+        base_dir_real = os.path.realpath(base_dir)
 
-        candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, raw)))
-        base_dir_abs = os.path.abspath(base_dir)
+        # Resolve symlinks in the candidate path to guard against symlink escapes.
+        candidate = os.path.realpath(os.path.join(base_dir_real, raw))
 
         # Ensure the candidate path is within base_dir.
         try:
-            common = os.path.commonpath([base_dir_abs, candidate])
+            common = os.path.commonpath([base_dir_real, candidate])
         except ValueError:
             # Different drives on Windows, etc.
             raise ValueError("Invalid model path")
-        if common != base_dir_abs:
+        if common != base_dir_real:
             raise ValueError("Model path escapes allowed directory")
 
         return candidate

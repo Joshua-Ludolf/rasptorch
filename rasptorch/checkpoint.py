@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Mapping
+import tempfile
 
 import numpy as np
 
@@ -41,12 +42,72 @@ def _state_dict_to_numpy(state_dict: Any) -> dict[str, np.ndarray]:
     return out
 
 
+def _resolve_checkpoint_path(path: str) -> str:
+    """Resolve a user-supplied checkpoint path to a safe absolute path.
+
+    For relative paths, the result is confined to a dedicated subdirectory
+    inside the system temporary directory.  Absolute paths that already reside
+    within the system temporary directory are permitted as-is (callers such as
+    ``convert_legacy_torch_checkpoint`` need to write to caller-supplied
+    locations in the temp tree).  All other absolute paths are rejected.
+
+    ``os.path.realpath`` is used throughout so that symlink escapes are caught
+    by the ``os.path.commonpath`` confinement checks.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        raise ValueError("Checkpoint path must not be empty")
+
+    # Resolve the system temp directory (handles any symlinks in /tmp etc.).
+    temp_real = os.path.realpath(tempfile.gettempdir())
+
+    if os.path.isabs(raw):
+        # For absolute paths, accept only those that resolve to somewhere inside
+        # the system temporary directory (e.g. pytest tmp_path, NamedTemporaryFile).
+        candidate_real = os.path.realpath(raw)
+        try:
+            common = os.path.commonpath([temp_real, candidate_real])
+        except ValueError:
+            # Different drives on Windows, etc.
+            raise ValueError("Checkpoint path must be within the system temporary directory")
+        if common != temp_real:
+            raise ValueError("Checkpoint path must be within the system temporary directory")
+        return candidate_real
+
+    # For relative paths, confine the result to the rasptorch_checkpoints directory.
+    base_dir = os.path.join(temp_real, "rasptorch_checkpoints")
+    os.makedirs(base_dir, exist_ok=True)
+    base_real = os.path.realpath(base_dir)
+
+    joined = os.path.join(base_real, raw)
+    final_path = os.path.realpath(joined)
+
+    # Ensure the resolved path stays within base_real (guards against '..' and symlinks).
+    try:
+        common = os.path.commonpath([base_real, final_path])
+    except ValueError:
+        raise ValueError("Invalid checkpoint path")
+    if common != base_real:
+        raise ValueError("Checkpoint path escapes allowed directory")
+
+    return final_path
+
+
 def save_checkpoint(path: str, payload: Mapping[str, Any]) -> str:
     """Save a checkpoint without requiring torch.
 
     For `.pt`/`.pth`, this writes a NumPy compressed archive that can be loaded
     back by `load_checkpoint` with `allow_pickle=False`.
     """
+
+    safe_path = os.path.realpath(_resolve_checkpoint_path(path))
+    temp_real = os.path.realpath(tempfile.gettempdir())
+    try:
+        common = os.path.commonpath([temp_real, safe_path])
+    except ValueError:
+        raise ValueError("Resolved checkpoint path is on a different drive or filesystem")
+    if common != temp_real:
+        raise ValueError("Resolved checkpoint path must stay within the system temporary directory")
 
     state_dict = _state_dict_to_numpy(payload.get("state_dict", {}))
     payload_meta = {k: _json_safe(v) for k, v in dict(payload).items() if k != "state_dict"}
@@ -62,7 +123,7 @@ def save_checkpoint(path: str, payload: Mapping[str, Any]) -> str:
     for i, key in enumerate(state_keys):
         archive_items[f"arr_{i}"] = state_dict[key]
 
-    with open(path, "wb") as f:
+    with open(safe_path, "wb") as f:
         np.savez_compressed(f, **archive_items)
     return "rasptorch-npz"
 
@@ -73,8 +134,10 @@ def load_checkpoint(path: str) -> dict[str, Any]:
     Raises ValueError if the file is not a rasptorch npz checkpoint.
     """
 
+    safe_path = _resolve_checkpoint_path(path)
+
     try:
-        archive = np.load(path, allow_pickle=False)
+        archive = np.load(safe_path, allow_pickle=False)
     except Exception as e:
         raise ValueError(f"Not a rasptorch checkpoint archive: {e}") from e
 
@@ -102,7 +165,7 @@ def load_checkpoint(path: str) -> dict[str, Any]:
             state_dict[str(key)] = np.asarray(archive[arr_key], dtype=np.float32)
 
     payload["state_dict"] = state_dict
-    payload["_checkpoint_path"] = os.path.abspath(path)
+    payload["_checkpoint_path"] = safe_path
     return payload
 
 
