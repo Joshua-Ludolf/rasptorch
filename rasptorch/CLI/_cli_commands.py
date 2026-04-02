@@ -1087,14 +1087,7 @@ class ModelCommands:
             return {"error": f"Model {model_id} not found"}
         try:
             # Resolve and validate the target path to avoid writing outside the models directory.
-            safe_path = os.path.realpath(self._resolve_model_save_path(path))
-            temp_real = os.path.realpath(tempfile.gettempdir())
-            try:
-                common = os.path.commonpath([temp_real, safe_path])
-            except ValueError:
-                raise ValueError("Resolved model save path is on a different drive or filesystem")
-            if common != temp_real:
-                raise ValueError("Resolved model save path must stay within the system temporary directory")
+            safe_path = self._resolve_model_save_path(path)
 
             model_data = self.models[model_id]
             model = self._ensure_model(model_id)
@@ -1167,36 +1160,22 @@ class ModelCommands:
     def _resolve_model_save_path(self, path: str) -> str:
         """Resolve a user-supplied model save path to a safe absolute path.
 
-        Absolute paths that already reside within the system temporary directory
-        are permitted as-is (e.g. paths produced by ``tempfile.NamedTemporaryFile``
-        used by the Streamlit UI download flow).  All other absolute paths are
-        rejected.  Relative paths are confined to the shared ``rasptorch_models``
-        directory under the system temporary directory.
-
-        ``os.path.realpath`` is used throughout so that symlink escapes are caught
-        by the ``os.path.commonpath`` confinement checks.
+        All user-provided paths (including those coming from the UI/CLI) are
+        confined to the shared ``rasptorch_models`` directory under the system
+        temporary directory.  Absolute paths are rejected outright; relative
+        paths are normalized and symlink-resolved via ``_resolve_model_path``.
         """
         raw = (path or "").strip()
         if not raw:
             raise ValueError("Model save path must not be empty")
-
-        # Resolve the system temp directory (handles any symlinks in /tmp etc.).
-        temp_real = os.path.realpath(tempfile.gettempdir())
-
         if os.path.isabs(raw):
-            # Allow absolute paths that are already within the system temp dir
-            # (e.g. NamedTemporaryFile paths used by internal/UI callers).
-            candidate_real = os.path.realpath(raw)
-            try:
-                common = os.path.commonpath([temp_real, candidate_real])
-            except ValueError:
-                raise ValueError("Model save path is on a different drive or filesystem")
-            if common != temp_real:
-                raise ValueError("Model save path attempts to escape the system temporary directory")
-            return candidate_real
+            # Disallow absolute paths from untrusted sources; callers should
+            # pass a simple file name or relative path instead.
+            raise ValueError("Absolute model save paths are not allowed")
 
         # For relative paths, delegate to the shared model path resolver.
         return self._resolve_model_path(raw)
+
     def _resolve_model_path(self, path: str) -> str:
         """Resolve a user-provided model path into a confined, normalized path.
 
