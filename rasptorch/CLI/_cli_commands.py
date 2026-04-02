@@ -1158,19 +1158,37 @@ class ModelCommands:
             return {"error": str(e)}
 
     def _resolve_model_save_path(self, path: str) -> str:
-        """
-        Resolve a user-supplied model save path using the same confinement logic
-        as `_resolve_model_path`.
+        """Resolve a user-supplied model save path to a safe absolute path.
 
-        This ensures that both loading and saving models share a single, consistent
-        path-validation implementation.
+        Absolute paths that already reside within the system temporary directory
+        are permitted as-is (e.g. paths produced by ``tempfile.NamedTemporaryFile``
+        used by the Streamlit UI download flow).  All other absolute paths are
+        rejected.  Relative paths are confined to the shared ``rasptorch_models``
+        directory under the system temporary directory.
+
+        ``os.path.realpath`` is used throughout so that symlink escapes are caught
+        by the ``os.path.commonpath`` confinement checks.
         """
         raw = (path or "").strip()
         if not raw:
             raise ValueError("Model save path must not be empty")
 
-        # Delegate to the shared model path resolver to avoid duplicated and
-        # potentially divergent validation logic.
+        # Resolve the system temp directory (handles any symlinks in /tmp etc.).
+        temp_real = os.path.realpath(tempfile.gettempdir())
+
+        if os.path.isabs(raw):
+            # Allow absolute paths that are already within the system temp dir
+            # (e.g. NamedTemporaryFile paths used by internal/UI callers).
+            candidate_real = os.path.realpath(raw)
+            try:
+                common = os.path.commonpath([temp_real, candidate_real])
+            except ValueError:
+                raise ValueError("Model save path must be within the system temporary directory")
+            if common != temp_real:
+                raise ValueError("Model save path must be within the system temporary directory")
+            return candidate_real
+
+        # For relative paths, delegate to the shared model path resolver.
         return self._resolve_model_path(raw)
     def _resolve_model_path(self, path: str) -> str:
         """Resolve a user-provided model path into a confined, normalized path.
