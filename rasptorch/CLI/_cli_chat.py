@@ -25,6 +25,17 @@ class ChatREPL:
     """Interactive chat-like REPL for rasptorch."""
 
     def __init__(self, *, device: str = "cpu"):
+        # Some Windows terminals / redirected streams default to encodings that
+        # cannot represent certain Unicode symbols (e.g., ✓/✗). Ensure the REPL
+        # never crashes when printing status messages.
+        try:
+            if hasattr(sys.stdout, "reconfigure"):
+                sys.stdout.reconfigure(errors="replace")
+            if hasattr(sys.stderr, "reconfigure"):
+                sys.stderr.reconfigure(errors="replace")
+        except Exception:
+            pass
+
         self.history_file = os.path.expanduser("~/.rasptorch_history")
         self.session: Optional[PromptSession] = None
         resolved_device = "cpu"

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 import sys
 
 from rasptorch.CLI._cli_chat import ChatREPL
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_chat_info_reports_active_device(capsys) -> None:
@@ -37,7 +41,7 @@ print(f'reason={vk.disabled_reason()}')
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        cwd="/home/josh-ludolf/Documents/rasptorch",
+        cwd=REPO_ROOT,
         check=True,
     )
 
@@ -68,7 +72,7 @@ print(f'after_gpu={after_gpu}')
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
-        cwd="/home/josh-ludolf/Documents/rasptorch",
+        cwd=REPO_ROOT,
         check=True,
     )
 
