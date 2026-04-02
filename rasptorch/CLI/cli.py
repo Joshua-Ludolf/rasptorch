@@ -531,11 +531,13 @@ def info(ctx):
     try:
         import numpy
         from .. import vulkan_backend as vk
+
+        active_device = "gpu (Vulkan)" if vk.using_vulkan() else "cpu"
         
         info_data = {
             "rasptorch_version": __version__,
             "numpy_version": numpy.__version__,
-            "device": ctx.obj.get("device", "cpu"),
+            "active_device": active_device,
             "vulkan_available": vk.is_available(),
             "vulkan_using_real_gpu": vk.using_vulkan(),
         }
@@ -547,14 +549,11 @@ def info(ctx):
         else:
             click.echo(f"rasptorch: {info_data['rasptorch_version']}")
             click.echo(f"numpy: {info_data['numpy_version']}")
-            click.echo(f"device: {info_data['device']}")
+            click.echo(f"device: {active_device}")
             if info_data["vulkan_using_real_gpu"]:
                 click.echo(f"vulkan: ✓ Using GPU")
             else:
                 click.echo(f"vulkan: ✗ Not using GPU")
-                reason = vk.disabled_reason()
-                if reason:
-                    click.echo(f"  Reason: {reason}")
     except Exception as e:
         if ctx.obj.get("json_output"):
             click.echo(format_json_output(format_error(str(e))))

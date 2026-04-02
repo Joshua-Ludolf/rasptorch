@@ -500,7 +500,7 @@ Type 'help <command>' for more details.
             import rasptorch
             from .. import vulkan_backend as vk
 
-            device = self.context.get("device", "cpu")
+            active_device = "gpu (Vulkan)" if vk.using_vulkan() else "cpu"
 
             print(f"rasptorch version: {rasptorch.__version__}")
             print(f"numpy version: {np.__version__}")
@@ -508,14 +508,8 @@ Type 'help <command>' for more details.
                 print("vulkan: ✓ Using GPU")
             else:
                 print("vulkan: ✗ Not using GPU")
-                reason = vk.disabled_reason()
-                if reason:
-                    print(f"  Reason: {reason}")
 
-            if device == "gpu" and not vk.using_vulkan():
-                print("device: gpu (requested, but Vulkan not active)")
-            else:
-                print(f"device: {device}")
+            print(f"device: {active_device}")
 
         except Exception as e:
             print(f"✗ Error: {e}")
@@ -1034,7 +1028,13 @@ Type 'help <command>' for more details.
         
         if subcmd == "cpu":
             self.context["device"] = "cpu"
-            print(f"✓ Device set to: CPU")
+            try:
+                from .. import vulkan_backend as vk
+
+                vk.force_cpu()
+                print("✓ Device set to CPU")
+            except Exception:
+                print("✓ Device set to CPU")
         
         elif subcmd == "gpu":
             try:
@@ -1059,20 +1059,15 @@ Type 'help <command>' for more details.
             print("✓ Device set to: GPU (Vulkan)")
         
         elif subcmd == "status":
-            device = self.context.get("device", "cpu")
-            print(f"Current device: {device.upper()}")
             try:
                 from .. import vulkan_backend as vk
 
                 if vk.using_vulkan():
-                    print("Vulkan: ✓ Using GPU")
+                    print("device: gpu (Vulkan)")
                 else:
-                    print("Vulkan: ✗ Not using GPU")
-                    reason = vk.disabled_reason()
-                    if reason:
-                        print(f"  Reason: {reason}")
+                    print("device: cpu")
             except Exception as e:
-                print(f"Vulkan: ? (error checking status: {e})")
+                print("device: cpu")
         
         else:
             print(f"✗ Unknown device command: {subcmd}")

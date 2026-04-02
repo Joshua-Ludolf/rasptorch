@@ -1535,6 +1535,153 @@ class _VulkanContext:
         vkQueueSubmit(self.queue, 1, [submit], self._fence)
         vkWaitForFences(self.device, 1, [self._fence], VK_TRUE, 10_000_000_000)  # 10s
 
+    def shutdown(self) -> None:
+        """Destroy Vulkan resources and clear the live context."""
+
+        if self.device is None and self.instance is None:
+            return
+
+        try:
+            if self.device is not None:
+                try:
+                    vkDeviceWaitIdle(self.device)
+                except Exception:
+                    pass
+
+            if self._cmd_recording:
+                try:
+                    self.flush()
+                except Exception:
+                    pass
+                self._cmd_recording = False
+                self._batch_depth = 0
+
+            device = self.device
+
+            if device is not None:
+                for pooled in self._buffer_pool.values():
+                    for buf, mem in pooled:
+                        try:
+                            if buf != VK_NULL_HANDLE:
+                                vkDestroyBuffer(device, buf, None)
+                        except Exception:
+                            pass
+                        try:
+                            if mem != VK_NULL_HANDLE:
+                                vkFreeMemory(device, mem, None)
+                        except Exception:
+                            pass
+                self._buffer_pool.clear()
+
+                for value in list(self.__dict__.values()):
+                    if not isinstance(value, _Pipeline):
+                        continue
+                    try:
+                        if value.pipeline != VK_NULL_HANDLE:
+                            vkDestroyPipeline(device, value.pipeline, None)
+                    except Exception:
+                        pass
+                    try:
+                        if value.pipeline_layout != VK_NULL_HANDLE:
+                            vkDestroyPipelineLayout(device, value.pipeline_layout, None)
+                    except Exception:
+                        pass
+                    try:
+                        if value.descriptor_set_layout != VK_NULL_HANDLE:
+                            vkDestroyDescriptorSetLayout(device, value.descriptor_set_layout, None)
+                    except Exception:
+                        pass
+                    try:
+                        if value.descriptor_pool != VK_NULL_HANDLE:
+                            vkDestroyDescriptorPool(device, value.descriptor_pool, None)
+                    except Exception:
+                        pass
+
+                if self._fence is not None:
+                    try:
+                        vkDestroyFence(device, self._fence, None)
+                    except Exception:
+                        pass
+                    self._fence = None
+
+                if self.command_pool is not None:
+                    try:
+                        vkDestroyCommandPool(device, self.command_pool, None)
+                    except Exception:
+                        pass
+                    self.command_pool = None
+
+                try:
+                    vkDestroyDevice(device, None)
+                except Exception:
+                    pass
+
+            if self.instance is not None:
+                try:
+                    vkDestroyInstance(self.instance, None)
+                except Exception:
+                    pass
+        finally:
+            self._ds_cache.clear()
+            self.p_add = None
+            self.p_mul = None
+            self.p_relu = None
+            self.p_mul_add_relu = None
+            self.p_matmul = None
+            self.p_neg = None
+            self.p_add_scalar = None
+            self.p_mul_scalar = None
+            self.p_transpose2d = None
+            self.p_reduce_sum_stage = None
+            self.p_scale_fill = None
+            self.p_add_rowvec = None
+            self.p_mul_rowvec = None
+            self.p_relu_backward = None
+            self.p_reduce_sum_rows = None
+            self.p_mse_grad = None
+            self.p_sgd_update = None
+            self.p_matmul_at_b = None
+            self.p_matmul_a_bt = None
+            self.p_im2col_nchw = None
+            self.p_col2im_nchw = None
+            self.p_nchw2mat = None
+            self.p_mat2nchw = None
+            self.p_softmax_xent_loss_vec = None
+            self.p_softmax_xent_backward = None
+            self.p_sgd_momentum_update = None
+            self.p_softmax2d = None
+            self.p_softmax2d_backward = None
+            self.p_log_softmax2d = None
+            self.p_log_softmax2d_backward = None
+            self.p_layernorm2d = None
+            self.p_layernorm2d_backward = None
+            self.p_permute_nd = None
+            self.p_add_broadcast = None
+            self.p_mul_broadcast = None
+            self.p_broadcast_to = None
+            self.p_sum_to_shape = None
+            self.p_gelu = None
+            self.p_gelu_backward = None
+            self.p_silu = None
+            self.p_silu_backward = None
+            self.p_leaky_relu = None
+            self.p_leaky_relu_backward = None
+            self.p_elu = None
+            self.p_elu_backward = None
+            self.p_adam_update = None
+            self.p_adamw_update = None
+            self.p_rmsprop_update = None
+            self.instance = None
+            self.physical_device = None
+            self.device = None
+            self.queue = None
+            self.queue_family_index = None
+            self.command_pool = None
+            self.command_buffer = None
+            self._fence = None
+            self._cmd_recording = False
+            self._batch_depth = 0
+
 
 _CTX: Optional[_VulkanContext] = None
 
@@ -1565,6 +1712,19 @@ def _disable_vulkan(reason: str) -> None:
     _HAS_VULKAN = False
     _VULKAN_DISABLED_REASON = reason
     _CTX = None
+
+
+def force_cpu(reason: str = "Forced CPU mode by user") -> None:
+    """Destroy any live Vulkan context so the process runs on CPU for now."""
+
+    global _VULKAN_DISABLED_REASON, _CTX
+    ctx = _CTX
+    if ctx is not None:
+        try:
+            ctx.shutdown()
+        finally:
+            _CTX = None
+    _VULKAN_DISABLED_REASON = None
 
 
 def _ctx() -> _VulkanContext:
