@@ -100,14 +100,10 @@ def save_checkpoint(path: str, payload: Mapping[str, Any]) -> str:
     back by `load_checkpoint` with `allow_pickle=False`.
     """
 
-    safe_path = os.path.realpath(_resolve_checkpoint_path(path))
-    temp_real = os.path.realpath(tempfile.gettempdir())
-    try:
-        common = os.path.commonpath([temp_real, safe_path])
-    except ValueError:
-        raise ValueError("Resolved checkpoint path is on a different drive or filesystem")
-    if common != temp_real:
-        raise ValueError("Resolved checkpoint path must stay within the system temporary directory")
+    # Resolve and validate the checkpoint path once; this enforces confinement
+    # to the system temporary directory (and the rasptorch_checkpoints subdir
+    # for relative paths) and rejects any escaping or cross-device issues.
+    safe_path = _resolve_checkpoint_path(path)
 
     state_dict = _state_dict_to_numpy(payload.get("state_dict", {}))
     payload_meta = {k: _json_safe(v) for k, v in dict(payload).items() if k != "state_dict"}
