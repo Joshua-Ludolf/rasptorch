@@ -1164,26 +1164,31 @@ class ModelCommands:
         This prevents saving models outside the intended directory via absolute
         paths or '..' segments.
         """
+        raw = (path or "").strip()
+        if not raw:
+            raise ValueError("Model save path must not be empty")
+        if os.path.isabs(raw):
+            # Do not allow absolute paths; callers must use relative paths under the models directory.
+            raise ValueError("Absolute model save paths are not allowed")
+
         # Base directory for saved models – use a directory under the current
         # working directory to avoid writing to arbitrary locations.
-        base_dir = os.path.abspath(os.path.join(os.getcwd(), "models"))
+        base_dir = os.path.join(os.getcwd(), "models")
         os.makedirs(base_dir, exist_ok=True)
 
-        # If the user gave an absolute path, interpret it relative to base_dir by
-        # stripping any leading path separator.
-        # This keeps behaviour similar (subdirectories still work) but confines
-        # writes to base_dir.
-        rel_path = str(path)
-        if os.path.isabs(rel_path):
-            rel_path = rel_path.lstrip(os.sep)
-
         # Join and normalize, then ensure the result stays within base_dir.
-        joined = os.path.join(base_dir, rel_path)
-        safe_path = os.path.abspath(os.path.normpath(joined))
-        if not safe_path.startswith(base_dir + os.sep) and safe_path != base_dir:
-            raise ValueError("Invalid model save path")
+        candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, raw)))
+        base_dir_abs = os.path.abspath(base_dir)
 
-        return safe_path
+        try:
+            common = os.path.commonpath([base_dir_abs, candidate])
+        except ValueError:
+            # Different drives on Windows, invalid paths, etc.
+            raise ValueError("Invalid model save path")
+        if common != base_dir_abs:
+            raise ValueError("Model save path escapes allowed directory")
+
+        return candidate
 
     def _resolve_model_path(self, path: str) -> str:
         """Resolve a user-provided model path into a confined, normalized path.
