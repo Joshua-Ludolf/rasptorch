@@ -48,6 +48,10 @@ def save_checkpoint(path: str, payload: Mapping[str, Any]) -> str:
     back by `load_checkpoint` with `allow_pickle=False`.
     """
 
+    # Normalize the path to an absolute path. Callers are responsible for any
+    # additional validation or confinement to a safe directory.
+    safe_path = os.path.abspath(os.path.normpath(str(path)))
+
     state_dict = _state_dict_to_numpy(payload.get("state_dict", {}))
     payload_meta = {k: _json_safe(v) for k, v in dict(payload).items() if k != "state_dict"}
     state_keys = sorted(state_dict.keys())
@@ -62,7 +66,7 @@ def save_checkpoint(path: str, payload: Mapping[str, Any]) -> str:
     for i, key in enumerate(state_keys):
         archive_items[f"arr_{i}"] = state_dict[key]
 
-    with open(path, "wb") as f:
+    with open(safe_path, "wb") as f:
         np.savez_compressed(f, **archive_items)
     return "rasptorch-npz"
 
