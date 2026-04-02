@@ -1086,6 +1086,9 @@ class ModelCommands:
         if model_id not in self.models:
             return {"error": f"Model {model_id} not found"}
         try:
+            # Resolve and validate the target path to avoid writing outside the models directory.
+            safe_path = self._resolve_model_save_path(path)
+
             model_data = self.models[model_id]
             model = self._ensure_model(model_id)
             if model is None:
@@ -1133,25 +1136,54 @@ class ModelCommands:
                 "state_dict": state_dict,
             }
 
-            ext = os.path.splitext(str(path))[1].lower()
+            ext = os.path.splitext(str(safe_path))[1].lower()
             if ext in {".pth", ".pt"}:
-                save_checkpoint(path, save_data)
+                save_checkpoint(safe_path, save_data)
                 fmt = "rasptorch-npz"
             else:
                 import pickle
-                with open(path, "wb") as f:
+                with open(safe_path, "wb") as f:
                     pickle.dump(save_data, f)
                 fmt = "pickle"
             
             return {
                 "status": "success",
                 "model_id": model_id,
-                "path": path,
+                "path": safe_path,
                 "format": fmt,
                 "message": f"Model saved successfully",
             }
         except Exception as e:
             return {"error": str(e)}
+
+    def _resolve_model_save_path(self, path: str) -> str:
+        """
+        Resolve a user-supplied model save path to a safe absolute path within a
+        dedicated models directory.
+
+        This prevents saving models outside the intended directory via absolute
+        paths or '..' segments.
+        """
+        # Base directory for saved models – use a directory under the current
+        # working directory to avoid writing to arbitrary locations.
+        base_dir = os.path.abspath(os.path.join(os.getcwd(), "models"))
+        os.makedirs(base_dir, exist_ok=True)
+
+        # If the user gave an absolute path, interpret it relative to base_dir by
+        # stripping any leading path separator.
+        # This keeps behaviour similar (subdirectories still work) but confines
+        # writes to base_dir.
+        rel_path = str(path)
+        if os.path.isabs(rel_path):
+            rel_path = rel_path.lstrip(os.sep)
+
+        # Join and normalize, then ensure the result stays within base_dir.
+        joined = os.path.join(base_dir, rel_path)
+        safe_path = os.path.abspath(os.path.normpath(joined))
+        if not safe_path.startswith(base_dir + os.sep) and safe_path != base_dir:
+            raise ValueError("Invalid model save path")
+
+        return safe_path
 
     def _resolve_model_path(self, path: str) -> str:
         """Resolve a user-provided model path into a confined, normalized path.
