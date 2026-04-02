@@ -13,3 +13,6 @@ wheels/
 
 # text files
 pypi_*.txt
+
+# VsCode settings
+.vscode/

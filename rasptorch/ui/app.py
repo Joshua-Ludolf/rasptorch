@@ -693,6 +693,29 @@ def _parse_builder_args(tokens: List[str]) -> Dict[str, Any]:
     return {"activation": activation, "activations": activations}
 
 
+def _strip_redundant_activation(obj: Any) -> Any:
+    """Remove legacy/single `activation` keys when per-layer `activations` exist.
+
+    This runs recursively so Combined-model snapshots don't show both.
+    """
+    try:
+        if isinstance(obj, dict):
+            has_activations = "activations" in obj
+            out: Dict[Any, Any] = {}
+            for k, v in obj.items():
+                if k == "activation" and has_activations:
+                    continue
+                out[k] = _strip_redundant_activation(v)
+            return out
+        if isinstance(obj, list):
+            return [_strip_redundant_activation(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_strip_redundant_activation(v) for v in obj)
+    except Exception:
+        return obj
+    return obj
+
+
 def _safe_vulkan_status() -> Tuple[bool, Optional[str]]:
     if not _HAS_RASPTORCH or _vulkan_backend is None:
         return False, "rasptorch not available"
@@ -1204,10 +1227,7 @@ def _render_models_page() -> None:
     if selected is not None and selected in cmds.models:
         st.subheader("Info")
         md = cmds.models[selected]
-        cfg = dict(md.get("config", {}) or {})
-        # Avoid showing both `activation` and per-layer `activations` in the UI.
-        if "activations" in cfg and "activation" in cfg:
-            cfg.pop("activation", None)
+        cfg = _strip_redundant_activation(dict(md.get("config", {}) or {}))
         st.code(
             json.dumps(
                 {

@@ -83,6 +83,33 @@ def test_info_config_filtering_logic_removes_activation_when_activations_present
     assert "activations" in cfg
 
 
+def test_info_config_filtering_is_recursive_for_combined_snapshots() -> None:
+    ui = _import_ui_app()
+
+    cfg = {
+        "combine": "sequential",
+        "model_a_snapshot": {
+            "type": "MLP",
+            "config": {"activation": "relu", "activations": ["relu", "none"], "layer_sizes": [10, 8, 2]},
+        },
+        "model_b_snapshot": {
+            "type": "GRU",
+            "config": {"activation": "tanh"},
+        },
+    }
+
+    cleaned = ui._strip_redundant_activation(cfg)
+
+    # Nested snapshot config should not show both keys.
+    a_cfg = cleaned["model_a_snapshot"]["config"]
+    assert "activations" in a_cfg
+    assert "activation" not in a_cfg
+
+    # If there is no per-layer list, keep the single activation.
+    b_cfg = cleaned["model_b_snapshot"]["config"]
+    assert b_cfg.get("activation") == "tanh"
+
+
 def test_uploaded_name_stored_in_config_for_display() -> None:
     # UI stores a user friendly name under config['name'].
     models = {"id123456": {"type": "MLP", "config": {"name": "my_model"}}}

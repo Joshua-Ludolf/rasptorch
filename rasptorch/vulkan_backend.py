@@ -150,6 +150,10 @@ class _VulkanContext:
 
         # Lazy-created extension kernels so startup does not require compiling them.
         self.p_permute_nd: Optional[_Pipeline] = None
+        self.p_add_broadcast: Optional[_Pipeline] = None
+        self.p_mul_broadcast: Optional[_Pipeline] = None
+        self.p_broadcast_to: Optional[_Pipeline] = None
+        self.p_sum_to_shape: Optional[_Pipeline] = None
         self.p_gelu: Optional[_Pipeline] = None
         self.p_gelu_backward: Optional[_Pipeline] = None
         self.p_silu: Optional[_Pipeline] = None
@@ -416,6 +420,166 @@ class _VulkanContext:
             VkDescriptorPoolSize(
                 type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 descriptorCount=3 * max_sets,
+            )
+        ]
+        dpci = VkDescriptorPoolCreateInfo(
+            sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            maxSets=max_sets,
+            poolSizeCount=len(pool_sizes),
+            pPoolSizes=pool_sizes,
+        )
+        dp = vkCreateDescriptorPool(self.device, dpci, None)
+
+        spv = self._ensure_spv(name)
+        sm = self._create_shader_module(spv)
+        stage = VkPipelineShaderStageCreateInfo(
+            sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage=VK_SHADER_STAGE_COMPUTE_BIT,
+            module=sm,
+            pName=b"main",
+        )
+        cpci = VkComputePipelineCreateInfo(
+            sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            stage=stage,
+            layout=pll,
+        )
+        pipeline = vkCreateComputePipelines(self.device, VK_NULL_HANDLE, 1, [cpci], None)[0]
+        vkDestroyShaderModule(self.device, sm, None)
+
+        return _Pipeline(
+            pipeline=pipeline,
+            pipeline_layout=pll,
+            descriptor_set_layout=dsl,
+            descriptor_pool=dp,
+        )
+
+    def _create_pipeline_vec3_pc104(self, name: str) -> _Pipeline:
+        """Compute pipeline with 3 storage buffers and a 104-byte push constant range."""
+        assert self.device is not None
+
+        bindings = [
+            VkDescriptorSetLayoutBinding(
+                binding=0,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=1,
+                stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=1,
+                stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding=2,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=1,
+                stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            ),
+        ]
+        dsci = VkDescriptorSetLayoutCreateInfo(
+            sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            bindingCount=len(bindings),
+            pBindings=bindings,
+        )
+        dsl = vkCreateDescriptorSetLayout(self.device, dsci, None)
+
+        pcr = VkPushConstantRange(
+            stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            offset=0,
+            size=104,
+        )
+        plci = VkPipelineLayoutCreateInfo(
+            sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount=1,
+            pSetLayouts=[dsl],
+            pushConstantRangeCount=1,
+            pPushConstantRanges=[pcr],
+        )
+        pll = vkCreatePipelineLayout(self.device, plci, None)
+
+        max_sets = 4096
+        pool_sizes = [
+            VkDescriptorPoolSize(
+                type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=3 * max_sets,
+            )
+        ]
+        dpci = VkDescriptorPoolCreateInfo(
+            sType=VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            maxSets=max_sets,
+            poolSizeCount=len(pool_sizes),
+            pPoolSizes=pool_sizes,
+        )
+        dp = vkCreateDescriptorPool(self.device, dpci, None)
+
+        spv = self._ensure_spv(name)
+        sm = self._create_shader_module(spv)
+        stage = VkPipelineShaderStageCreateInfo(
+            sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage=VK_SHADER_STAGE_COMPUTE_BIT,
+            module=sm,
+            pName=b"main",
+        )
+        cpci = VkComputePipelineCreateInfo(
+            sType=VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            stage=stage,
+            layout=pll,
+        )
+        pipeline = vkCreateComputePipelines(self.device, VK_NULL_HANDLE, 1, [cpci], None)[0]
+        vkDestroyShaderModule(self.device, sm, None)
+
+        return _Pipeline(
+            pipeline=pipeline,
+            pipeline_layout=pll,
+            descriptor_set_layout=dsl,
+            descriptor_pool=dp,
+        )
+
+    def _create_pipeline_vec2_pc72(self, name: str) -> _Pipeline:
+        """Compute pipeline with 2 storage buffers and a 72-byte push constant range."""
+        assert self.device is not None
+
+        bindings = [
+            VkDescriptorSetLayoutBinding(
+                binding=0,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=1,
+                stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            ),
+            VkDescriptorSetLayoutBinding(
+                binding=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=1,
+                stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            ),
+        ]
+        dsci = VkDescriptorSetLayoutCreateInfo(
+            sType=VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            bindingCount=len(bindings),
+            pBindings=bindings,
+        )
+        dsl = vkCreateDescriptorSetLayout(self.device, dsci, None)
+
+        pcr = VkPushConstantRange(
+            stageFlags=VK_SHADER_STAGE_COMPUTE_BIT,
+            offset=0,
+            size=72,
+        )
+        plci = VkPipelineLayoutCreateInfo(
+            sType=VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount=1,
+            pSetLayouts=[dsl],
+            pushConstantRangeCount=1,
+            pPushConstantRanges=[pcr],
+        )
+        pll = vkCreatePipelineLayout(self.device, plci, None)
+
+        max_sets = 4096
+        pool_sizes = [
+            VkDescriptorPoolSize(
+                type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=2 * max_sets,
             )
         ]
         dpci = VkDescriptorPoolCreateInfo(
@@ -2012,6 +2176,288 @@ def _ensure_vulkan_or_numpy(a: VulkanBuffer, b: Optional[VulkanBuffer] = None) -
     return True
 
 
+def _contiguous_strides(shape: tuple[int, ...]) -> list[int]:
+    if not shape:
+        return []
+    strides: list[int] = [0] * len(shape)
+    stride = 1
+    for i in range(len(shape) - 1, -1, -1):
+        strides[i] = int(stride)
+        stride *= int(shape[i])
+    return strides
+
+
+def _broadcast_shape(a_shape: tuple[int, ...], b_shape: tuple[int, ...]) -> tuple[int, ...]:
+    # NumPy broadcasting rules.
+    out = []
+    i = len(a_shape) - 1
+    j = len(b_shape) - 1
+    while i >= 0 or j >= 0:
+        a_dim = int(a_shape[i]) if i >= 0 else 1
+        b_dim = int(b_shape[j]) if j >= 0 else 1
+        if a_dim == b_dim or a_dim == 1 or b_dim == 1:
+            out.append(max(a_dim, b_dim))
+        else:
+            raise ValueError(f"operands could not be broadcast together with shapes {a_shape} {b_shape}")
+        i -= 1
+        j -= 1
+    return tuple(reversed(out))
+
+
+def _aligned_broadcast_strides(in_shape: tuple[int, ...], out_shape: tuple[int, ...]) -> list[int]:
+    out_rank = len(out_shape)
+    in_rank = len(in_shape)
+    in_strides = _contiguous_strides(in_shape)
+    aligned: list[int] = [0] * out_rank
+    for d in range(out_rank):
+        out_dim = int(out_shape[d])
+        in_d = d - (out_rank - in_rank)
+        if in_d < 0:
+            in_dim = 1
+            in_stride = 0
+        else:
+            in_dim = int(in_shape[in_d])
+            in_stride = int(in_strides[in_d]) if in_rank > 0 else 0
+        if in_dim == out_dim:
+            aligned[d] = in_stride
+        elif in_dim == 1:
+            aligned[d] = 0
+        else:
+            raise ValueError(f"shape {in_shape} is not broadcastable to {out_shape}")
+    return aligned
+
+
+def _sum_to_shape_np(x: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
+    """Sum-reduce a broadcasted array back down to target_shape.
+
+    Mirrors PyTorch/NumPy broadcasting gradient semantics.
+    """
+
+    target_shape = tuple(int(s) for s in target_shape)
+    if x.shape == target_shape:
+        return x
+
+    out_shape = x.shape
+    if len(target_shape) > len(out_shape):
+        raise ValueError(f"cannot reduce grad shape {out_shape} to larger shape {target_shape}")
+
+    padded_target = (1,) * (len(out_shape) - len(target_shape)) + target_shape
+    reduce_axes: list[int] = []
+    for i, (out_d, tgt_d) in enumerate(zip(out_shape, padded_target)):
+        if tgt_d == 1 and out_d != 1:
+            reduce_axes.append(i)
+        elif tgt_d != out_d:
+            raise ValueError(f"grad shape {out_shape} is not compatible with target {target_shape}")
+
+    if reduce_axes:
+        x = x.sum(axis=tuple(reduce_axes), keepdims=True)
+    if len(out_shape) != len(target_shape):
+        x = x.reshape(padded_target)
+    return x.reshape(target_shape)
+
+
+def sum_to_shape(buf: VulkanBuffer, target_shape: tuple[int, ...]) -> VulkanBuffer:
+    """Sum-reduce a broadcasted buffer back down to target_shape.
+
+    This is the GPU counterpart to the autograd helper used for broadcasted
+    elementwise ops (e.g. gradients for `a + b` when `a`/`b` were broadcast).
+    """
+
+    target_shape = tuple(int(s) for s in target_shape)
+    if buf.shape == target_shape:
+        return view(buf, target_shape)
+
+    out_shape = tuple(int(s) for s in buf.shape)
+    if len(target_shape) > len(out_shape):
+        raise ValueError(f"cannot reduce grad shape {out_shape} to larger shape {target_shape}")
+
+    out_rank = int(len(out_shape))
+    padded_target = (1,) * (out_rank - len(target_shape)) + target_shape
+    for out_d, tgt_d in zip(out_shape, padded_target):
+        if tgt_d == 1 and out_d != 1:
+            continue
+        if tgt_d == out_d:
+            continue
+        raise ValueError(f"grad shape {out_shape} is not compatible with target {target_shape}")
+
+    if not _ensure_vulkan_or_numpy(buf, None):
+        src = buf.host if buf.host is not None else to_cpu(buf)
+        return _fallback_buf(_sum_to_shape_np(src, target_shape))
+
+    # Shader path is limited to rank <= 8.
+    if out_rank > 8:
+        return _fallback_buf(_sum_to_shape_np(to_cpu(buf), target_shape))
+
+    try:
+        ctx = _ctx()
+        assert ctx.device is not None
+        assert ctx.command_buffer is not None
+        if ctx.p_sum_to_shape is None:
+            ctx.p_sum_to_shape = ctx._create_pipeline_vec2_pc72("sum_to_shape")
+    except Exception:
+        # Shader compilation unavailable: do the reduction on CPU and re-upload.
+        return to_gpu(_sum_to_shape_np(to_cpu(buf), target_shape))
+
+    out = empty(target_shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_sum_to_shape)
+    infos = [
+        VkDescriptorBufferInfo(buffer=buf.buffer, offset=0, range=buf.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    n = int(np.prod(target_shape))
+    out_sizes = [int(s) for s in out_shape] + [1] * (8 - out_rank)
+    tgt_sizes = [int(s) for s in padded_target] + [1] * (8 - out_rank)
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new(
+        "uint32_t[18]",
+        [int(n), int(out_rank), *out_sizes, *tgt_sizes],
+    )
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_sum_to_shape.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_sum_to_shape.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_sum_to_shape.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        72,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
+    return out
+
+
+def broadcast_to(buf: VulkanBuffer, out_shape: tuple[int, ...]) -> VulkanBuffer:
+    """Broadcast a buffer to a target shape (Vulkan if available, else NumPy)."""
+
+    out_shape = tuple(int(s) for s in out_shape)
+    if buf.shape == out_shape:
+        return view(buf, out_shape)
+
+    # Validate broadcast compatibility.
+    if _broadcast_shape(buf.shape, out_shape) != out_shape:
+        raise ValueError(f"cannot broadcast shape {buf.shape} to {out_shape}")
+
+    if not _ensure_vulkan_or_numpy(buf, None):
+        src = buf.host if buf.host is not None else np.zeros(buf.shape, dtype=np.float32)
+        return _fallback_buf(np.broadcast_to(src, out_shape))
+
+    if len(out_shape) > 8:
+        return _fallback_buf(np.broadcast_to(to_cpu(buf), out_shape))
+
+    try:
+        ctx = _ctx()
+        assert ctx.device is not None
+        assert ctx.command_buffer is not None
+        if ctx.p_broadcast_to is None:
+            ctx.p_broadcast_to = ctx._create_pipeline_vec2_pc72("broadcast_to")
+    except Exception:
+        # If Vulkan is initialized but shader compilation isn't available (missing glslc),
+        # keep results on GPU by doing a CPU fallback + re-upload.
+        return to_gpu(np.broadcast_to(to_cpu(buf), out_shape))
+
+    out = empty(out_shape)
+    ds = ctx._alloc_descriptor_set(ctx.p_broadcast_to)
+    infos = [
+        VkDescriptorBufferInfo(buffer=buf.buffer, offset=0, range=buf.nbytes),
+        VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+    ]
+    writes = [
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[0]],
+        ),
+        VkWriteDescriptorSet(
+            sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=1,
+            descriptorCount=1,
+            descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[infos[1]],
+        ),
+    ]
+    vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+
+    out_rank = int(len(out_shape))
+    n = int(np.prod(out_shape))
+    out_sizes = [int(s) for s in out_shape] + [1] * (8 - out_rank)
+    stride_in = _aligned_broadcast_strides(buf.shape, out_shape) + [0] * (8 - out_rank)
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new(
+        "uint32_t[18]",
+        [int(n), int(out_rank), *out_sizes, *[int(s) for s in stride_in]],
+    )
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_broadcast_to.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_broadcast_to.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_broadcast_to.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        72,
+        pc,
+    )
+    group_count_x = (n + 255) // 256
+    vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
+    ctx._end_commands()
+    return out
+
+
 def add(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     """Elementwise add using Vulkan compute (falls back to NumPy if needed)."""
 
@@ -2022,15 +2468,32 @@ def add(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
             return _fallback_buf(aa + bb)
         return _fallback_buf(a.host + b.host)
 
-    ctx = _ctx()
-    assert ctx.device is not None
-    assert ctx.command_buffer is not None
-    assert ctx.p_add is not None
+    out_shape = a.shape
+    use_broadcast = False
+    if a.shape != b.shape:
+        out_shape = _broadcast_shape(a.shape, b.shape)
+        use_broadcast = True
 
-    # Output buffer (no need to upload zeros)
-    out = empty(a.shape)
+    if use_broadcast and len(out_shape) > 8:
+        return _fallback_buf(to_cpu(a) + to_cpu(b))
 
-    ds = ctx._alloc_descriptor_set(ctx.p_add)
+    try:
+        ctx = _ctx()
+        assert ctx.device is not None
+        assert ctx.command_buffer is not None
+        if use_broadcast:
+            if ctx.p_add_broadcast is None:
+                ctx.p_add_broadcast = ctx._create_pipeline_vec3_pc104("add_broadcast")
+            pipeline = ctx.p_add_broadcast
+        else:
+            assert ctx.p_add is not None
+            pipeline = ctx.p_add
+    except Exception:
+        # Fallback for systems without shader compilation tools.
+        return to_gpu(to_cpu(a) + to_cpu(b))
+
+    out = empty(out_shape)
+    ds = ctx._alloc_descriptor_set(pipeline)
 
     infos = [
         VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
@@ -2069,11 +2532,11 @@ def add(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     vkResetCommandBuffer(ctx.command_buffer, 0)
     begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
     vkBeginCommandBuffer(ctx.command_buffer, begin)
-    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_add.pipeline)
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
     vkCmdBindDescriptorSets(
         ctx.command_buffer,
         VK_PIPELINE_BIND_POINT_COMPUTE,
-        ctx.p_add.pipeline_layout,
+        pipeline.pipeline_layout,
         0,
         1,
         [ds],
@@ -2081,18 +2544,37 @@ def add(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
         None,
     )
 
-    n = int(np.prod(a.shape))
     import vulkan as _vk  # type: ignore
 
-    pc = _vk.ffi.new("uint32_t[1]", [n])
-    vkCmdPushConstants(
-        ctx.command_buffer,
-        ctx.p_add.pipeline_layout,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        4,
-        pc,
-    )
+    n = int(np.prod(out_shape))
+    if use_broadcast:
+        out_rank = int(len(out_shape))
+        out_sizes = [int(s) for s in out_shape] + [1] * (8 - out_rank)
+        stride_a = _aligned_broadcast_strides(a.shape, out_shape) + [0] * (8 - out_rank)
+        stride_b = _aligned_broadcast_strides(b.shape, out_shape) + [0] * (8 - out_rank)
+        pc = _vk.ffi.new(
+            "uint32_t[26]",
+            [int(n), int(out_rank), *out_sizes, *[int(s) for s in stride_a], *[int(s) for s in stride_b]],
+        )
+        vkCmdPushConstants(
+            ctx.command_buffer,
+            pipeline.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            104,
+            pc,
+        )
+    else:
+        pc = _vk.ffi.new("uint32_t[1]", [n])
+        vkCmdPushConstants(
+            ctx.command_buffer,
+            pipeline.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            4,
+            pc,
+        )
+
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
     vkEndCommandBuffer(ctx.command_buffer)
@@ -2111,13 +2593,32 @@ def mul(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
             return _fallback_buf(aa * bb)
         return _fallback_buf(a.host * b.host)
 
-    ctx = _ctx()
-    assert ctx.device is not None
-    assert ctx.command_buffer is not None
-    assert ctx.p_mul is not None
+    out_shape = a.shape
+    use_broadcast = False
+    if a.shape != b.shape:
+        out_shape = _broadcast_shape(a.shape, b.shape)
+        use_broadcast = True
 
-    out = empty(a.shape)
-    ds = ctx._alloc_descriptor_set(ctx.p_mul)
+    if use_broadcast and len(out_shape) > 8:
+        return _fallback_buf(to_cpu(a) * to_cpu(b))
+
+    try:
+        ctx = _ctx()
+        assert ctx.device is not None
+        assert ctx.command_buffer is not None
+        if use_broadcast:
+            if ctx.p_mul_broadcast is None:
+                ctx.p_mul_broadcast = ctx._create_pipeline_vec3_pc104("mul_broadcast")
+            pipeline = ctx.p_mul_broadcast
+        else:
+            assert ctx.p_mul is not None
+            pipeline = ctx.p_mul
+    except Exception:
+        # Fallback for systems without shader compilation tools.
+        return to_gpu(to_cpu(a) * to_cpu(b))
+
+    out = empty(out_shape)
+    ds = ctx._alloc_descriptor_set(pipeline)
 
     infos = [
         VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
@@ -2155,11 +2656,11 @@ def mul(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     vkResetCommandBuffer(ctx.command_buffer, 0)
     begin = VkCommandBufferBeginInfo(sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
     vkBeginCommandBuffer(ctx.command_buffer, begin)
-    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_mul.pipeline)
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline)
     vkCmdBindDescriptorSets(
         ctx.command_buffer,
         VK_PIPELINE_BIND_POINT_COMPUTE,
-        ctx.p_mul.pipeline_layout,
+        pipeline.pipeline_layout,
         0,
         1,
         [ds],
@@ -2167,18 +2668,37 @@ def mul(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
         None,
     )
 
-    n = int(np.prod(a.shape))
     import vulkan as _vk  # type: ignore
 
-    pc = _vk.ffi.new("uint32_t[1]", [n])
-    vkCmdPushConstants(
-        ctx.command_buffer,
-        ctx.p_mul.pipeline_layout,
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        0,
-        4,
-        pc,
-    )
+    n = int(np.prod(out_shape))
+    if use_broadcast:
+        out_rank = int(len(out_shape))
+        out_sizes = [int(s) for s in out_shape] + [1] * (8 - out_rank)
+        stride_a = _aligned_broadcast_strides(a.shape, out_shape) + [0] * (8 - out_rank)
+        stride_b = _aligned_broadcast_strides(b.shape, out_shape) + [0] * (8 - out_rank)
+        pc = _vk.ffi.new(
+            "uint32_t[26]",
+            [int(n), int(out_rank), *out_sizes, *[int(s) for s in stride_a], *[int(s) for s in stride_b]],
+        )
+        vkCmdPushConstants(
+            ctx.command_buffer,
+            pipeline.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            104,
+            pc,
+        )
+    else:
+        pc = _vk.ffi.new("uint32_t[1]", [n])
+        vkCmdPushConstants(
+            ctx.command_buffer,
+            pipeline.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            4,
+            pc,
+        )
+
     group_count_x = (n + 255) // 256
     vkCmdDispatch(ctx.command_buffer, group_count_x, 1, 1)
     vkEndCommandBuffer(ctx.command_buffer)

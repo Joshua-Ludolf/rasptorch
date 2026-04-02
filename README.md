@@ -175,8 +175,9 @@ Currently supported (GPU) in autograd:
 
 - `+`, `*`, `-` (scalar and tensor forms), `@` (matmul)
 - scalar ops: `tensor + s`, `tensor * s`, `tensor / s`, plus `s + tensor`, `s * tensor`, `s - tensor`
-- `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu`, `sum`, `mean`, `T` (2D transpose)
+- `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu`, `sigmoid`, `tanh`, `sum`, `mean`, `T` (2D transpose)
 - tensor shape/join helpers: `unsqueeze`, `squeeze`, `flatten`, `permute` (common tensors up to 4D), `transpose(dim0, dim1)`, `cat`, `stack`, `split`, `chunk`
+- axis-based `sum(axis=...)` / `mean(axis=...)` for 2D tensors with `axis=0/1` (GPU-native forward and backward)
 - `functional.softmax` / `functional.log_softmax` (2D row-wise, `dim=-1/1`)
 - `nn.LayerNorm` (2D inputs, 1D `normalized_shape`; `eps=1e-5` stays on GPU, other `eps` values fall back to CPU)
 - `nn.BatchNorm1d`, `nn.BatchNorm2d`, `nn.Embedding`, `nn.MultiheadAttention`
@@ -248,6 +249,37 @@ Notes:
 - `uv run main.py --device gpu` now **requires Vulkan**. If Vulkan init or shader compilation fails, it raises a clear error instead of silently falling back.
 - Broadcasting is still limited; common 2D + 1D row-vector forms like `(N,M) + (M,)` and `(N,M) * (M,)` are supported.
 
+## PyTorch Bridge (Vulkan-Optimized Inference)
+
+`rasptorch.torch_bridge` enables efficient inference of PyTorch models with GPU acceleration:
+
+```python
+from rasptorch.torch_bridge import convert_torch_model
+import torch
+
+# Convert a PyTorch model for GPU inference
+torch_model = torch.nn.Sequential(
+    torch.nn.Linear(10, 64),
+    torch.nn.ReLU(),
+    torch.nn.Linear(64, 10)
+).eval()
+
+rasp_model = convert_torch_model(torch_model, device="gpu")
+
+# Forward pass: compatible layers run on GPU, unsupported layers fall back to CPU
+x = torch.randn(32, 10, dtype=torch.float32)
+y = rasp_model(x)
+```
+
+**Key optimizations:**
+
+- **Parameter caching**: Model weights are cached as GPU buffers at initialization (one-time cost).
+- **Direct GPU streaming**: Tensor data flows CPU → Vulkan GPU without intermediate numpy materialization.
+- **Zero-copy Vulkan dispatch**: Buffers are reused across kernel invocations.
+- **Automatic layer fallback**: Unsupported layers transparently use CPU.
+
+**Supported layers:** Conv2d, Linear, ReLU, GELU, Sigmoid, Tanh, BatchNorm2d, LayerNorm, MaxPool2d, AvgPool2d, Dropout
+
 ## Additional APIs
 
 Optimization:
@@ -298,14 +330,15 @@ If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
 
 ## Current Limitations
 
-- GPU autograd is still **incomplete**. Core MLP/classification paths are covered, but full PyTorch-like operator coverage is not there yet.
-- Some newer APIs use CPU-backed math internally when no dedicated Vulkan/autograd kernel exists yet. The public API works, but not every path is fully GPU-native.
-- The newer GPU-native tensor helper coverage is strongest for practical tensors up to 4D; generic higher-rank permutation is not on a dedicated Vulkan path yet.
+- GPU autograd for core operations (elementwise, matmul, reductions, most activations) is fully implemented and GPU-native.
+- GPU-native tensor helper coverage is strongest for practical tensors up to 4D; generic higher-rank permutation is not on a dedicated Vulkan path yet.
 - `GRU` autograd is currently CPU-backed; there is no dedicated Vulkan GRU autograd path yet.
 - The mixed-precision API surface exists, but true fp16 Vulkan storage/compute kernels are not implemented yet. `autocast()` and `GradScaler` are currently preparatory/experimental.
-- GPU reductions still focus on the common paths: global `sum()` / `mean()` are GPU-native, while axis-based reductions currently fall back to CPU.
-- PyTorch integration is experimental: `rasptorch.torch_bridge` currently supports a small inference subset
-  (`Conv2d`, `Linear`, `ReLU`, `BatchNorm2d`, `MaxPool2d`, `Sigmoid`, `Tanh`, `GELU`, `Dropout`) and may copy tensors CPU<->GPU.
+- GPU reductions: global `sum()` / `mean()` are GPU-native, and **2D** axis reductions (`axis=0/1`) are GPU-native for both forward **and backward** (using GPU broadcast operations). For higher-rank `sum(axis=...)` / `mean(axis=...)`, the forward currently uses CPU (then uploads), but the backward gradient broadcasting is GPU-native.
+- PyTorch integration is optimized for Vulkan inference: `rasptorch.torch_bridge` supports 
+  (`Conv2d`, `Linear`, `ReLU`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d`, `LayerNorm`, `Sigmoid`, `Tanh`, `GELU`, `Dropout`). 
+  Model weights are cached as GPU buffers with **no per-forward CPU transfers**. Unsupported layers fall back to CPU automatically.
+- Broadcasting: GPU elementwise `+` / `*` support NumPy-style broadcasting up to 8D for forward. Backward gradient *reduction* for broadcasted operands is GPU-native for ranks up to 8 (the optimized 2D row-vector path remains GPU-native as well).
 
 ## Development & Tests
 

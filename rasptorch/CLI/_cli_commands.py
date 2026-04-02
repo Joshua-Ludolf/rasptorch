@@ -127,6 +127,29 @@ class ModelCommands:
         self.optimizers: Dict[str, Any] = {}
         self.lora_adapters: Dict[str, Any] = {}
 
+    @staticmethod
+    def _strip_redundant_activation(obj: Any) -> Any:
+        """Remove legacy/single `activation` keys when per-layer `activations` exist.
+
+        This applies recursively so Combined-model snapshots don't show/persist both.
+        """
+        try:
+            if isinstance(obj, dict):
+                has_activations = "activations" in obj
+                out: Dict[Any, Any] = {}
+                for k, v in obj.items():
+                    if k == "activation" and has_activations:
+                        continue
+                    out[k] = ModelCommands._strip_redundant_activation(v)
+                return out
+            if isinstance(obj, list):
+                return [ModelCommands._strip_redundant_activation(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(ModelCommands._strip_redundant_activation(v) for v in obj)
+        except Exception:
+            return obj
+        return obj
+
     def _get_session_file(self, model_id: str) -> str:
         """Get session file path for model."""
         return os.path.join(_SESSION_DIR, f"model_{model_id}.pkl")
@@ -148,7 +171,7 @@ class ModelCommands:
                             models[extracted_id] = {
                                 "model_id": extracted_id,
                                 "type": data.get("type", "Unknown"),
-                                "config": data.get("config", {}),
+                                "config": self._strip_redundant_activation(data.get("config", {})),
                                 "state_dict": data.get("state_dict", {}),
                             }
                     except Exception:
@@ -159,11 +182,17 @@ class ModelCommands:
         """Save model to session storage."""
         import pickle
         try:
+            clean_config = self._strip_redundant_activation(model_data.get("config", {}) or {})
+            # Keep in-memory model metadata in sync with persisted metadata.
+            try:
+                model_data["config"] = clean_config
+            except Exception:
+                pass
             # Save without the model object to avoid pickling issues
             save_data = {
                 "model_id": model_id,
                 "type": model_data.get("type"),
-                "config": model_data.get("config", {}),
+                "config": clean_config,
                 "state_dict": model_data.get("model").state_dict() if model_data.get("model") else {},
             }
             self.models[model_id] = model_data
@@ -1094,9 +1123,11 @@ class ModelCommands:
 
             state_dict = model.state_dict()
 
+            clean_config = self._strip_redundant_activation(model_data.get("config", {}) or {})
+
             save_data = {
                 "model_type": model_data.get("type", "Unknown"),
-                "config": model_data.get("config", {}),
+                "config": clean_config,
                 "state_dict": state_dict,
             }
 

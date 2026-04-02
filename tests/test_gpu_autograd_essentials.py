@@ -56,6 +56,19 @@ def test_gpu_softmax_forward_matches_cpu() -> None:
     np.testing.assert_allclose(y_gpu.sum(axis=1), np.ones((x_np.shape[0],), dtype=np.float32), rtol=2e-3, atol=2e-3)
 
 
+def test_gpu_sum_mean_axis_2d_match_cpu() -> None:
+    rng = np.random.default_rng(123)
+    x_np = rng.standard_normal((9, 11), dtype=np.float32)
+
+    x_cpu = Tensor(x_np.copy(), requires_grad=False)
+    x_gpu = Tensor(x_np.copy(), requires_grad=False).to("gpu")
+
+    np.testing.assert_allclose(x_gpu.sum(axis=0).numpy(), x_cpu.sum(axis=0).numpy(), rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(x_gpu.sum(axis=1).numpy(), x_cpu.sum(axis=1).numpy(), rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(x_gpu.mean(axis=0).numpy(), x_cpu.mean(axis=0).numpy(), rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(x_gpu.mean(axis=1).numpy(), x_cpu.mean(axis=1).numpy(), rtol=2e-3, atol=2e-3)
+
+
 def test_gpu_layernorm_affine_grads_match_cpu() -> None:
     rng = np.random.default_rng(2)
     N, H = 10, 12
@@ -110,6 +123,31 @@ def test_no_grad_and_detach_on_gpu_block_grads() -> None:
     assert x.grad_vkbuf is None
 
     # no_grad should avoid tracking entirely
+
+
+def test_gpu_broadcasted_add_mul_grads_match_cpu() -> None:
+    rng = np.random.default_rng(1234)
+
+    # Use shapes that require *general* broadcast reduction in backward
+    # (not the optimized 2D row-vector path).
+    a_np = rng.standard_normal((2, 1, 4), dtype=np.float32)
+    b_np = rng.standard_normal((1, 3, 1), dtype=np.float32)
+
+    # CPU reference
+    a_cpu = Tensor(a_np.copy(), requires_grad=True)
+    b_cpu = Tensor(b_np.copy(), requires_grad=True)
+    y_cpu = ((a_cpu + b_cpu) * (a_cpu * b_cpu)).sum()
+    y_cpu.backward()
+
+    # GPU path (Vulkan if available, otherwise NumPy fallback)
+    a_gpu = Tensor(a_np.copy(), requires_grad=True).to("gpu")
+    b_gpu = Tensor(b_np.copy(), requires_grad=True).to("gpu")
+    y_gpu = ((a_gpu + b_gpu) * (a_gpu * b_gpu)).sum()
+    y_gpu.backward()
+
+    np.testing.assert_allclose(y_gpu.numpy(), y_cpu.numpy(), rtol=2e-3, atol=2e-3)
+    np.testing.assert_allclose(_grad_to_numpy(a_gpu), a_cpu.grad, rtol=5e-2, atol=5e-2)
+    np.testing.assert_allclose(_grad_to_numpy(b_gpu), b_cpu.grad, rtol=5e-2, atol=5e-2)
     w = Tensor(rng.standard_normal((4, 4), dtype=np.float32), requires_grad=True).to("gpu")
     with rasptorch.no_grad():
         loss = (w * w).mean()

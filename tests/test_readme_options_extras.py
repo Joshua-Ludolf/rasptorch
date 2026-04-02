@@ -109,6 +109,7 @@ def test_torch_bridge_extended_modules() -> None:
     model = torch.nn.Sequential(
         torch.nn.BatchNorm2d(2),
         torch.nn.MaxPool2d(2),
+        torch.nn.AvgPool2d(2),
         torch.nn.Sigmoid(),
         torch.nn.Tanh(),
         torch.nn.GELU(),
@@ -117,6 +118,39 @@ def test_torch_bridge_extended_modules() -> None:
     model.eval()
 
     x = torch.randn(2, 2, 4, 4, dtype=torch.float32)
+    ref = model(x)
+    bridged = convert_torch_model(model, device="cpu")
+    bridged.eval()
+    out = bridged(x)
+
+    np.testing.assert_allclose(out.detach().cpu().numpy(), ref.detach().cpu().numpy(), rtol=3e-2, atol=3e-2)
+
+
+def test_torch_bridge_layernorm_and_avgpool() -> None:
+    try:
+        import torch  # type: ignore
+    except ModuleNotFoundError:
+        from rasptorch import torch_bridge
+
+        try:
+            torch_bridge.convert_torch_model(object(), device="cpu")
+        except RuntimeError as e:
+            msg = str(e).lower()
+            assert "pytorch" in msg or "torch" in msg
+        else:
+            raise AssertionError("expected RuntimeError when torch is not installed")
+        return
+
+    from rasptorch.torch_bridge import convert_torch_model
+
+    torch.manual_seed(1)
+
+    ln = torch.nn.LayerNorm(6)
+    pool = torch.nn.AvgPool2d(kernel_size=2, stride=2)
+    model = torch.nn.Sequential(ln, pool)
+    model.eval()
+
+    x = torch.randn(2, 1, 6, 6, dtype=torch.float32)
     ref = model(x)
     bridged = convert_torch_model(model, device="cpu")
     bridged.eval()

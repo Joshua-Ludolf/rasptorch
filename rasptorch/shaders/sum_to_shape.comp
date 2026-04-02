@@ -1,0 +1,84 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufIn { float x[]; } bufin;
+layout(set = 0, binding = 1, std430) writeonly buffer BufOut { float y[]; } bufout;
+
+// Sum-reduce a broadcasted gradient buffer back down to a target shape.
+//
+// Given an input buffer with shape `out_sizes` and a target shape `tgt_sizes`
+// (padded with leading 1s so it has the same rank as out_sizes), this computes:
+//   y = sum_{broadcasted axes} x
+// where broadcasted axes are those with tgt_sizes[d] == 1 and out_sizes[d] != 1.
+//
+// Rank is limited to 8.
+layout(push_constant) uniform Push {
+    uint n;              // number of output elements (product(tgt_sizes))
+    uint rank;           // rank of out_sizes / tgt_sizes
+    uint out_sizes[8];
+    uint tgt_sizes[8];   // padded target sizes (same rank as out_sizes)
+} pc;
+
+void main() {
+    uint out_idx = gl_GlobalInvocationID.x;
+    if (out_idx >= pc.n) return;
+
+    // Decode out_idx into coordinates for the padded target shape.
+    uint coord_out[8];
+    uint rem = out_idx;
+    for (uint d = 0; d < pc.rank; d++) {
+        uint stride_out = 1;
+        for (uint k = d + 1; k < pc.rank; k++) {
+            stride_out *= pc.tgt_sizes[k];
+        }
+        uint coord = 0;
+        if (stride_out > 0) {
+            coord = rem / stride_out;
+            rem = rem - coord * stride_out;
+        }
+        coord_out[d] = coord;
+    }
+
+    // Compute number of elements being reduced.
+    uint reduce_numel = 1;
+    for (uint d = 0; d < pc.rank; d++) {
+        if (pc.tgt_sizes[d] == 1 && pc.out_sizes[d] != 1) {
+            reduce_numel *= pc.out_sizes[d];
+        }
+    }
+
+    float acc = 0.0;
+
+    // Iterate over all combinations of the reduced axes.
+    for (uint r = 0; r < reduce_numel; r++) {
+        uint rrem = r;
+        uint off = 0;
+
+        for (uint d = 0; d < pc.rank; d++) {
+            // Compute contiguous stride for input `out_sizes`.
+            uint stride_in = 1;
+            for (uint k = d + 1; k < pc.rank; k++) {
+                stride_in *= pc.out_sizes[k];
+            }
+
+            uint c = 0;
+            if (pc.tgt_sizes[d] == 1 && pc.out_sizes[d] != 1) {
+                // This dim was broadcasted; take coordinate from reduction index.
+                uint dim = pc.out_sizes[d];
+                if (dim > 0) {
+                    c = rrem % dim;
+                    rrem = rrem / dim;
+                }
+            } else {
+                c = coord_out[d];
+            }
+
+            off += c * stride_in;
+        }
+
+        acc += bufin.x[off];
+    }
+
+    bufout.y[out_idx] = acc;
+}

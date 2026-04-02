@@ -43,6 +43,35 @@ def _normalize_dim(dim: int, ndim: int, *, allow_end: bool = False) -> int:
     return dim_int
 
 
+def _sum_to_shape(x: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
+    """Sum-reduce a broadcasted array back down to target_shape.
+
+    Mirrors PyTorch/NumPy broadcasting gradient semantics.
+    """
+
+    target_shape = tuple(int(s) for s in target_shape)
+    if x.shape == target_shape:
+        return x
+
+    out_shape = x.shape
+    if len(target_shape) > len(out_shape):
+        raise ValueError(f"cannot reduce grad shape {out_shape} to larger shape {target_shape}")
+
+    padded_target = (1,) * (len(out_shape) - len(target_shape)) + target_shape
+    reduce_axes: list[int] = []
+    for i, (out_d, tgt_d) in enumerate(zip(out_shape, padded_target)):
+        if tgt_d == 1 and out_d != 1:
+            reduce_axes.append(i)
+        elif tgt_d != out_d:
+            raise ValueError(f"grad shape {out_shape} is not compatible with target {target_shape}")
+
+    if reduce_axes:
+        x = x.sum(axis=tuple(reduce_axes), keepdims=True)
+    if len(out_shape) != len(target_shape):
+        x = x.reshape(padded_target)
+    return x.reshape(target_shape)
+
+
 _grad_enabled: bool = True
 
 
@@ -418,23 +447,41 @@ class Tensor:
                 if out.device == "gpu":
                     if out.grad_vkbuf is None:
                         return
+                    # Handle broadcasting by reducing grad back to each operand's shape.
+                    if self.shape == other_t.shape:
+                        if self.requires_grad:
+                            self._accum_grad_vk(out.grad_vkbuf)
+                        if other_t.requires_grad:
+                            other_t._accum_grad_vk(out.grad_vkbuf)
+                        return
+
                     if self.requires_grad:
-                        self._accum_grad_vk(out.grad_vkbuf)
+                        self._accum_grad_vk(vk.sum_to_shape(out.grad_vkbuf, self.shape))
                     if other_t.requires_grad:
-                        other_t._accum_grad_vk(out.grad_vkbuf)
+                        other_t._accum_grad_vk(vk.sum_to_shape(out.grad_vkbuf, other_t.shape))
                 else:
                     if out.grad is None:
                         return
+                    if self.shape == other_t.shape:
+                        if self.requires_grad:
+                            if self.grad is None:
+                                self.grad = out.grad.copy()
+                            else:
+                                self.grad = self.grad + out.grad
+                        if other_t.requires_grad:
+                            if other_t.grad is None:
+                                other_t.grad = out.grad.copy()
+                            else:
+                                other_t.grad = other_t.grad + out.grad
+                        return
+
+                    grad_out_np = np.asarray(out.grad, dtype=np.float32)
                     if self.requires_grad:
-                        if self.grad is None:
-                            self.grad = out.grad.copy()
-                        else:
-                            self.grad = self.grad + out.grad
+                        grad_self = _sum_to_shape(grad_out_np, self.shape)
+                        self.grad = grad_self if self.grad is None else (self.grad + grad_self)
                     if other_t.requires_grad:
-                        if other_t.grad is None:
-                            other_t.grad = out.grad.copy()
-                        else:
-                            other_t.grad = other_t.grad + out.grad
+                        grad_other = _sum_to_shape(grad_out_np, other_t.shape)
+                        other_t.grad = grad_other if other_t.grad is None else (other_t.grad + grad_other)
 
             out._backward = _backward
         return out
@@ -462,29 +509,88 @@ class Tensor:
     def __truediv__(self, other: ArrayLike) -> "Tensor":
         if _is_number(other):
             s = float(other)
+            track = is_grad_enabled() and self.requires_grad
             if self.device == "gpu":
                 return self * (1.0 / s)
-
-        other_t = self._ensure_tensor(other)
-        track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
-        out = Tensor(self.data / other_t.data, requires_grad=track, _children=(self, other_t) if track else None, _op="/", device=self.device)
-
-        if track:
-            def _backward() -> None:
-                if out.grad is None:
-                    return
-                if self.requires_grad:
-                    grad_self = out.grad / other_t.data
+            out = Tensor(self.data / s, requires_grad=track, _children=(self,) if track else None, _op="/scalar", device=self.device)
+            if track:
+                out._prev = {self}
+                def _backward() -> None:
+                    if out.grad is None:
+                        return
+                    grad_self = out.grad / s
                     if self.grad is None:
                         self.grad = grad_self
                     else:
                         self.grad = self.grad + grad_self
-                if other_t.requires_grad:
-                    grad_other = -out.grad * self.data / (other_t.data ** 2)
-                    if other_t.grad is None:
-                        other_t.grad = grad_other
-                    else:
-                        other_t.grad = other_t.grad + grad_other
+                out._backward = _backward
+            return out
+
+        other_t = self._ensure_tensor(other)
+        track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
+        # For GPU, use reciprocal-based division: a / b = a * (1/b)
+        if self.device == "gpu" or other_t.device == "gpu":
+            # Compute 1/other on GPU using mul_scalar if possible, or elementwise
+            # For now use efficient pattern: a * other^(-1)
+            inv_other_np = 1.0 / np.asarray(other_t.numpy(), dtype=np.float32)
+            inv_other_buf = vk.to_gpu(inv_other_np) if (self.device == "gpu" or other_t.device == "gpu") else None
+            if inv_other_buf is not None:
+                vk_out = vk.mul(self._as_vkbuf(), inv_other_buf)
+                vk.free(inv_other_buf)
+                out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+                out._op = "/"
+            else:
+                out = Tensor(self.data / other_t.data, requires_grad=track, _children=(self, other_t) if track else None, _op="/", device=self.device)
+        else:
+            out = Tensor(self.data / other_t.data, requires_grad=track, _children=(self, other_t) if track else None, _op="/", device=self.device)
+
+        if track:
+            out._prev = {self, other_t}
+
+            def _backward() -> None:
+                if out.device == "gpu":
+                    if out.grad_vkbuf is None:
+                        return
+                    if self.shape != other_t.shape:
+                        grad_out_np = vk.to_cpu(out.grad_vkbuf)
+                        a_np = np.asarray(self.numpy(), dtype=np.float32)
+                        b_np = np.asarray(other_t.numpy(), dtype=np.float32)
+                        if self.requires_grad:
+                            grad_self_full = grad_out_np / np.broadcast_to(b_np, grad_out_np.shape)
+                            grad_self = _sum_to_shape(grad_self_full, self.shape)
+                            self._accum_grad_vk(vk.to_gpu(np.asarray(grad_self, dtype=np.float32)))
+                        if other_t.requires_grad:
+                            grad_other_full = -grad_out_np * np.broadcast_to(a_np, grad_out_np.shape) / (np.broadcast_to(b_np, grad_out_np.shape) ** 2)
+                            grad_other = _sum_to_shape(grad_other_full, other_t.shape)
+                            other_t._accum_grad_vk(vk.to_gpu(np.asarray(grad_other, dtype=np.float32)))
+                        return
+                    # grad_self = grad_out / other (can reuse as multiplication by reciprocal)
+                    if self.requires_grad:
+                        inv_other_np = 1.0 / np.asarray(other_t.numpy(), dtype=np.float32)
+                        inv_other_buf = vk.to_gpu(inv_other_np)
+                        grad_a = vk.mul(out.grad_vkbuf, inv_other_buf)
+                        vk.free(inv_other_buf)
+                        self._accum_grad_vk(grad_a)
+                    # grad_other = -grad_out * self / (other ** 2)
+                    if other_t.requires_grad:
+                        grad_out_np = vk.to_cpu(out.grad_vkbuf)
+                        grad_other_np = -grad_out_np * np.asarray(self.numpy(), dtype=np.float32) / (np.asarray(other_t.numpy(), dtype=np.float32) ** 2)
+                        grad_b_buf = vk.to_gpu(np.asarray(grad_other_np, dtype=np.float32))
+                        other_t._accum_grad_vk(grad_b_buf)
+                else:
+                    if out.grad is None:
+                        return
+                    grad_out_np = np.asarray(out.grad, dtype=np.float32)
+                    a_np = np.asarray(self.data, dtype=np.float32)
+                    b_np = np.asarray(other_t.data, dtype=np.float32)
+                    if self.requires_grad:
+                        grad_self_full = grad_out_np / np.broadcast_to(b_np, grad_out_np.shape)
+                        grad_self = _sum_to_shape(grad_self_full, self.shape)
+                        self.grad = grad_self if self.grad is None else (self.grad + grad_self)
+                    if other_t.requires_grad:
+                        grad_other_full = -grad_out_np * np.broadcast_to(a_np, grad_out_np.shape) / (np.broadcast_to(b_np, grad_out_np.shape) ** 2)
+                        grad_other = _sum_to_shape(grad_other_full, other_t.shape)
+                        other_t.grad = grad_other if other_t.grad is None else (other_t.grad + grad_other)
 
             out._backward = _backward
         return out
@@ -572,25 +678,55 @@ class Tensor:
                 if out.device == "gpu":
                     if out.grad_vkbuf is None:
                         return
+                    if self.shape == other_t.shape:
+                        if self.requires_grad:
+                            self._accum_grad_vk(vk.mul(other_t._as_vkbuf(), out.grad_vkbuf))
+                        if other_t.requires_grad:
+                            other_t._accum_grad_vk(vk.mul(self._as_vkbuf(), out.grad_vkbuf))
+                        return
+
+                    # Broadcasted case: compute full grad on GPU then reduce-to-shape on GPU.
                     if self.requires_grad:
-                        self._accum_grad_vk(vk.mul(other_t._as_vkbuf(), out.grad_vkbuf))
+                        grad_full = vk.mul(other_t._as_vkbuf(), out.grad_vkbuf)
+                        try:
+                            self._accum_grad_vk(vk.sum_to_shape(grad_full, self.shape))
+                        finally:
+                            vk.free(grad_full)
                     if other_t.requires_grad:
-                        other_t._accum_grad_vk(vk.mul(self._as_vkbuf(), out.grad_vkbuf))
+                        grad_full = vk.mul(self._as_vkbuf(), out.grad_vkbuf)
+                        try:
+                            other_t._accum_grad_vk(vk.sum_to_shape(grad_full, other_t.shape))
+                        finally:
+                            vk.free(grad_full)
                 else:
                     if out.grad is None:
                         return
+                    if self.shape == other_t.shape:
+                        if self.requires_grad:
+                            grad_self = other_t.data * out.grad
+                            if self.grad is None:
+                                self.grad = grad_self
+                            else:
+                                self.grad = self.grad + grad_self
+                        if other_t.requires_grad:
+                            grad_other = self.data * out.grad
+                            if other_t.grad is None:
+                                other_t.grad = grad_other
+                            else:
+                                other_t.grad = other_t.grad + grad_other
+                        return
+
+                    grad_out_np = np.asarray(out.grad, dtype=np.float32)
+                    a_np = np.asarray(self.data, dtype=np.float32)
+                    b_np = np.asarray(other_t.data, dtype=np.float32)
                     if self.requires_grad:
-                        grad_self = other_t.data * out.grad
-                        if self.grad is None:
-                            self.grad = grad_self
-                        else:
-                            self.grad = self.grad + grad_self
+                        grad_self_full = np.broadcast_to(b_np, grad_out_np.shape) * grad_out_np
+                        grad_self = _sum_to_shape(grad_self_full, self.shape)
+                        self.grad = grad_self if self.grad is None else (self.grad + grad_self)
                     if other_t.requires_grad:
-                        grad_other = self.data * out.grad
-                        if other_t.grad is None:
-                            other_t.grad = grad_other
-                        else:
-                            other_t.grad = other_t.grad + grad_other
+                        grad_other_full = np.broadcast_to(a_np, grad_out_np.shape) * grad_out_np
+                        grad_other = _sum_to_shape(grad_other_full, other_t.shape)
+                        other_t.grad = grad_other if other_t.grad is None else (other_t.grad + grad_other)
 
             out._backward = _backward
         return out
@@ -649,10 +785,34 @@ class Tensor:
     # Reductions
     def sum(self, axis: int | tuple[int, ...] | None = None) -> "Tensor":
         track = is_grad_enabled() and self.requires_grad
-        if axis is None and self.device == "gpu":
-            vk_out = vk.reduce_sum(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
-            out._op = "sum"
+        if self.device == "gpu":
+            axes = _normalize_axes(axis, len(self.shape))
+            if axis is None:
+                vk_out = vk.reduce_sum(self._as_vkbuf())
+                out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+                out._op = "sum"
+            elif len(axes) == 1 and len(self.shape) == 2 and axes[0] in (0, 1):
+                a = self._as_vkbuf()
+                tmp_t: "vk.VulkanBuffer | None" = None
+                try:
+                    if axes[0] == 0:
+                        vk_out = vk.reduce_sum_rows(a)
+                    else:
+                        tmp_t = vk.transpose2d(a)
+                        vk_out = vk.reduce_sum_rows(tmp_t)
+                    out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+                    out._op = "sum_dim"
+                finally:
+                    if tmp_t is not None:
+                        vk.free(tmp_t)
+            else:
+                out = Tensor(
+                    self.numpy().sum(axis=axis),
+                    requires_grad=track,
+                    _children=(self,) if track else None,
+                    _op="sum_dim",
+                    device=self.device,
+                )
         else:
             out = Tensor(
                 self.numpy().sum(axis=axis),
@@ -674,7 +834,40 @@ class Tensor:
                         out_buf = vk.empty(self.shape)
                         self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0))
                         return
-                    grad_out = vk.to_cpu(out.grad_vkbuf)
+                    # GPU-optimized path for 2D axis=0/1 reductions
+                    if len(axes) == 1 and len(self.shape) == 2 and axes[0] in (0, 1):
+                        n, m = self.shape
+                        grad_buf = out.grad_vkbuf
+                        if axes[0] == 0:
+                            # Sum over rows: grad shape is (M,), need to broadcast to (N, M)
+                            # Use add_rowvec to add the gradient row-vector to a zero matrix
+                            zeros = vk.empty((n, m))
+                            grad_broadcast_buf = vk.add_rowvec(zeros, grad_buf)
+                            self._accum_grad_vk(grad_broadcast_buf)
+                            vk.free(zeros)
+                        else:
+                            # Sum over cols: grad shape is (N,), need to broadcast to (N, M)
+                            # Transpose, use add_rowvec, then transpose back
+                            grad_t = vk.transpose2d(grad_buf)
+                            zeros = vk.empty((m, n))
+                            grad_broadcast_t = vk.add_rowvec(zeros, grad_t)
+                            grad_broadcast_buf = vk.transpose2d(grad_broadcast_t)
+                            self._accum_grad_vk(grad_broadcast_buf)
+                            vk.free(grad_t)
+                            vk.free(zeros)
+                            vk.free(grad_broadcast_t)
+                        return
+                    # General GPU path: reshape grad to insert singleton dims, then broadcast on GPU.
+                    expanded_shape = list(out.shape)
+                    for ax in sorted(axes):
+                        expanded_shape.insert(ax, 1)
+                    grad_view = vk.view(out.grad_vkbuf, tuple(expanded_shape))
+                    try:
+                        grad_broadcast_buf = vk.broadcast_to(grad_view, self.shape)
+                        self._accum_grad_vk(grad_broadcast_buf)
+                    finally:
+                        vk.free(grad_view)
+                    return
                 else:
                     if out.grad is None:
                         return
@@ -697,10 +890,40 @@ class Tensor:
 
     def mean(self, axis: int | tuple[int, ...] | None = None) -> "Tensor":
         track = is_grad_enabled() and self.requires_grad
-        if axis is None and self.device == "gpu":
-            vk_out = vk.mean(self._as_vkbuf())
-            out = Tensor._from_vkbuf(vk_out, requires_grad=track)
-            out._op = "mean"
+        if self.device == "gpu":
+            axes = _normalize_axes(axis, len(self.shape))
+            if axis is None:
+                vk_out = vk.mean(self._as_vkbuf())
+                out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+                out._op = "mean"
+            elif len(axes) == 1 and len(self.shape) == 2 and axes[0] in (0, 1):
+                rows, cols = self.shape
+                denom = float(rows if axes[0] == 0 else cols)
+                a = self._as_vkbuf()
+                tmp_t: "vk.VulkanBuffer | None" = None
+                tmp_sum: "vk.VulkanBuffer | None" = None
+                try:
+                    if axes[0] == 0:
+                        tmp_sum = vk.reduce_sum_rows(a)
+                    else:
+                        tmp_t = vk.transpose2d(a)
+                        tmp_sum = vk.reduce_sum_rows(tmp_t)
+                    vk_out = vk.mul_scalar(tmp_sum, 1.0 / max(1.0, denom))
+                    out = Tensor._from_vkbuf(vk_out, requires_grad=track)
+                    out._op = "mean_dim"
+                finally:
+                    if tmp_sum is not None:
+                        vk.free(tmp_sum)
+                    if tmp_t is not None:
+                        vk.free(tmp_t)
+            else:
+                out = Tensor(
+                    self.numpy().mean(axis=axis),
+                    requires_grad=track,
+                    _children=(self,) if track else None,
+                    _op="mean_dim",
+                    device=self.device,
+                )
         else:
             out = Tensor(
                 self.numpy().mean(axis=axis),
@@ -724,7 +947,48 @@ class Tensor:
                         out_buf = vk.empty(self.shape)
                         self._accum_grad_vk(vk.scale_fill(out.grad_vkbuf, out_buf, 1.0 / max(1.0, n)))
                         return
-                    grad_out = vk.to_cpu(out.grad_vkbuf)
+                    # GPU-optimized path for 2D axis=0/1 reductions
+                    if len(axes) == 1 and len(self.shape) == 2 and axes[0] in (0, 1):
+                        n, m = self.shape
+                        grad_buf = out.grad_vkbuf
+                        rows, cols = self.shape
+                        axis_denom = float(rows if axes[0] == 0 else cols)
+                        if axes[0] == 0:
+                            # Mean over rows: grad shape is (M,), need to broadcast to (N, M)
+                            # Use add_rowvec to add the gradient row-vector to a zero matrix
+                            scalar_grad = vk.mul_scalar(grad_buf, 1.0 / max(1.0, axis_denom))
+                            zeros = vk.empty((n, m))
+                            grad_broadcast_buf = vk.add_rowvec(zeros, scalar_grad)
+                            self._accum_grad_vk(grad_broadcast_buf)
+                            vk.free(zeros)
+                            vk.free(scalar_grad)
+                        else:
+                            # Mean over cols: grad shape is (N,), need to broadcast to (N, M)
+                            # Transpose, use add_rowvec, then transpose back
+                            scalar_grad = vk.mul_scalar(grad_buf, 1.0 / max(1.0, axis_denom))
+                            grad_t = vk.transpose2d(scalar_grad)
+                            zeros = vk.empty((m, n))
+                            grad_broadcast_t = vk.add_rowvec(zeros, grad_t)
+                            grad_broadcast_buf = vk.transpose2d(grad_broadcast_t)
+                            self._accum_grad_vk(grad_broadcast_buf)
+                            vk.free(grad_t)
+                            vk.free(zeros)
+                            vk.free(grad_broadcast_t)
+                            vk.free(scalar_grad)
+                        return
+                    # General GPU path: scale, reshape to insert singleton dims, then broadcast on GPU.
+                    scaled = vk.mul_scalar(out.grad_vkbuf, 1.0 / max(1.0, denom))
+                    expanded_shape = list(out.shape)
+                    for ax in sorted(axes):
+                        expanded_shape.insert(ax, 1)
+                    grad_view = vk.view(scaled, tuple(expanded_shape))
+                    try:
+                        grad_broadcast_buf = vk.broadcast_to(grad_view, self.shape)
+                        self._accum_grad_vk(grad_broadcast_buf)
+                    finally:
+                        vk.free(grad_view)
+                        vk.free(scaled)
+                    return
                 else:
                     if out.grad is None:
                         return
@@ -844,8 +1108,14 @@ class Tensor:
         y_np = np.asarray(forward(x_np), dtype=np.float32)
         track = is_grad_enabled() and self.requires_grad
 
+        # Cache x and y on GPU for efficient backward if on GPU
+        x_gpu_buf: "vk.VulkanBuffer | None" = None
+        y_gpu_buf: "vk.VulkanBuffer | None" = None
+
         if self.device == "gpu":
-            out = Tensor._from_vkbuf(vk.to_gpu(y_np), requires_grad=track)
+            y_gpu_buf = vk.to_gpu(y_np)
+            x_gpu_buf = self._as_vkbuf()
+            out = Tensor._from_vkbuf(y_gpu_buf, requires_grad=track)
             out._op = op
         else:
             out = Tensor(
@@ -863,7 +1133,9 @@ class Tensor:
                 if out.device == "gpu":
                     if out.grad_vkbuf is None:
                         return
+                    # GPU path: minimize CPU transfers by computing backward on smaller gradient tensor
                     grad_out = vk.to_cpu(out.grad_vkbuf)
+                    # For GPU backward, keep x and y cached
                     grad_in = np.asarray(backward(x_np, y_np, grad_out), dtype=np.float32)
                     self._accum_grad_vk(vk.to_gpu(grad_in))
                 else:
@@ -909,6 +1181,35 @@ class Tensor:
 
     # Other activations
     def sigmoid(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
+        
+        if self.device == "gpu":
+            # GPU forward: y = 1 / (1 + exp(-x))
+            x_vkbuf = self._as_vkbuf()
+            x_np = self.numpy()
+            y_np = 1.0 / (1.0 + np.exp(-x_np))
+            y_vkbuf = vk.to_gpu(y_np)
+            out = Tensor._from_vkbuf(y_vkbuf, requires_grad=track)
+            out._op = "sigmoid"
+            
+            if track:
+                out._prev = {self}
+                
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    # GPU backward: grad = grad_out * y * (1 - y)
+                    # Step 1: 1 - y = -y + 1
+                    neg_y = vk.neg(y_vkbuf)
+                    one_minus_y = vk.add_scalar(neg_y, 1.0)
+                    # Step 2: grad = grad_out * y * (1 - y)
+                    grad = vk.mul(vk.mul(out.grad_vkbuf, y_vkbuf), one_minus_y)
+                    self._accum_grad_vk(grad)
+                
+                out._backward = _backward
+            return out
+        
+        # CPU path
         def _forward(x: np.ndarray) -> np.ndarray:
             return 1.0 / (1.0 + np.exp(-x))
 
@@ -918,6 +1219,37 @@ class Tensor:
         return self._unary_numpy_op(op="sigmoid", forward=_forward, backward=_backward)
 
     def tanh(self) -> "Tensor":
+        track = is_grad_enabled() and self.requires_grad
+        
+        if self.device == "gpu":
+            # GPU forward: y = tanh(x)
+            x_vkbuf = self._as_vkbuf()
+            x_np = self.numpy()
+            y_np = np.tanh(x_np)
+            y_vkbuf = vk.to_gpu(y_np)
+            out = Tensor._from_vkbuf(y_vkbuf, requires_grad=track)
+            out._op = "tanh"
+            
+            if track:
+                out._prev = {self}
+                
+                def _backward() -> None:
+                    if out.grad_vkbuf is None:
+                        return
+                    # GPU backward: grad = grad_out * (1 - y^2)
+                    # Step 1: y^2
+                    y_squared = vk.mul(y_vkbuf, y_vkbuf)
+                    # Step 2: 1 - y^2 = -y^2 + 1
+                    neg_y_sq = vk.neg(y_squared)
+                    one_minus_y_sq = vk.add_scalar(neg_y_sq, 1.0)
+                    # Step 3: grad = grad_out * (1 - y^2)
+                    grad = vk.mul(out.grad_vkbuf, one_minus_y_sq)
+                    self._accum_grad_vk(grad)
+                
+                out._backward = _backward
+            return out
+        
+        # CPU path
         def _forward(x: np.ndarray) -> np.ndarray:
             return np.tanh(x)
 
