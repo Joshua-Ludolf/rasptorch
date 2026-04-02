@@ -1159,38 +1159,19 @@ class ModelCommands:
 
     def _resolve_model_save_path(self, path: str) -> str:
         """
-        Resolve a user-supplied model save path to a safe absolute path within a
-        dedicated models directory.
+        Resolve a user-supplied model save path using the same confinement logic
+        as `_resolve_model_path`.
 
-        This prevents saving models outside the intended directory via absolute
-        paths or '..' segments.
+        This ensures that both loading and saving models share a single, consistent
+        path-validation implementation.
         """
         raw = (path or "").strip()
         if not raw:
             raise ValueError("Model save path must not be empty")
-        if os.path.isabs(raw):
-            # Do not allow absolute paths; callers must use relative paths under the models directory.
-            raise ValueError("Absolute model save paths are not allowed")
 
-        # Base directory for saved models – use a directory under the current
-        # working directory to avoid writing to arbitrary locations.
-        base_dir = os.path.join(os.getcwd(), "models")
-        os.makedirs(base_dir, exist_ok=True)
-
-        # Join and normalize, then ensure the result stays within base_dir.
-        candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, raw)))
-        base_dir_abs = os.path.abspath(base_dir)
-
-        try:
-            common = os.path.commonpath([base_dir_abs, candidate])
-        except ValueError:
-            # Different drives on Windows, invalid paths, etc.
-            raise ValueError("Invalid model save path")
-        if common != base_dir_abs:
-            raise ValueError("Model save path escapes allowed directory")
-
-        return candidate
-
+        # Delegate to the shared model path resolver to avoid duplicated and
+        # potentially divergent validation logic.
+        return self._resolve_model_path(raw)
     def _resolve_model_path(self, path: str) -> str:
         """Resolve a user-provided model path into a confined, normalized path.
 
