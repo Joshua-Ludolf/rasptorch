@@ -1183,9 +1183,9 @@ class ModelCommands:
             try:
                 common = os.path.commonpath([temp_real, candidate_real])
             except ValueError:
-                raise ValueError("Model save path must be within the system temporary directory")
+                raise ValueError("Model save path is on a different drive or filesystem")
             if common != temp_real:
-                raise ValueError("Model save path must be within the system temporary directory")
+                raise ValueError("Model save path attempts to escape the system temporary directory")
             return candidate_real
 
         # For relative paths, delegate to the shared model path resolver.
