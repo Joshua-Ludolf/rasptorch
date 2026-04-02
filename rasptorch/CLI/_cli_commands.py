@@ -1087,7 +1087,14 @@ class ModelCommands:
             return {"error": f"Model {model_id} not found"}
         try:
             # Resolve and validate the target path to avoid writing outside the models directory.
-            safe_path = self._resolve_model_save_path(path)
+            safe_path = os.path.realpath(self._resolve_model_save_path(path))
+            temp_real = os.path.realpath(tempfile.gettempdir())
+            try:
+                common = os.path.commonpath([temp_real, safe_path])
+            except ValueError:
+                raise ValueError("Resolved model save path is on a different drive or filesystem")
+            if common != temp_real:
+                raise ValueError("Resolved model save path must stay within the system temporary directory")
 
             model_data = self.models[model_id]
             model = self._ensure_model(model_id)
