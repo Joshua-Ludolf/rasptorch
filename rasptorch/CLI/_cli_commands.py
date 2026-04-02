@@ -1188,17 +1188,19 @@ class ModelCommands:
         # Base directory where models are stored.
         base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
         os.makedirs(base_dir, exist_ok=True)
+        # Use realpath to resolve any symlinks in the base directory itself.
+        base_dir_real = os.path.realpath(base_dir)
 
-        candidate = os.path.abspath(os.path.normpath(os.path.join(base_dir, raw)))
-        base_dir_abs = os.path.abspath(base_dir)
+        # Resolve symlinks in the candidate path to guard against symlink escapes.
+        candidate = os.path.realpath(os.path.join(base_dir_real, raw))
 
         # Ensure the candidate path is within base_dir.
         try:
-            common = os.path.commonpath([base_dir_abs, candidate])
+            common = os.path.commonpath([base_dir_real, candidate])
         except ValueError:
             # Different drives on Windows, etc.
             raise ValueError("Invalid model path")
-        if common != base_dir_abs:
+        if common != base_dir_real:
             raise ValueError("Model path escapes allowed directory")
 
         return candidate

@@ -45,46 +45,49 @@ def _state_dict_to_numpy(state_dict: Any) -> dict[str, np.ndarray]:
 def _resolve_checkpoint_path(path: str) -> str:
     """Resolve a user-supplied checkpoint path to a safe absolute path.
 
-    Checkpoints are stored under a dedicated directory inside the system
-    temporary directory. Absolute paths that do not already reside under this
-    directory are interpreted relative to it, and any attempt to escape the
-    directory via '..' segments is rejected.
+    For relative paths, the result is confined to a dedicated subdirectory
+    inside the system temporary directory.  Absolute paths that already reside
+    within the system temporary directory are permitted as-is (callers such as
+    ``convert_legacy_torch_checkpoint`` need to write to caller-supplied
+    locations in the temp tree).  All other absolute paths are rejected.
+
+    ``os.path.realpath`` is used throughout so that symlink escapes are caught
+    by the ``os.path.commonpath`` confinement checks.
     """
     raw = str(path or "").strip()
     if not raw:
         raise ValueError("Checkpoint path must not be empty")
 
-    # Base directory for checkpoint files.
-    base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_checkpoints")
-    os.makedirs(base_dir, exist_ok=True)
-    base_abs = os.path.abspath(base_dir)
+    # Resolve the system temp directory (handles any symlinks in /tmp etc.).
+    temp_real = os.path.realpath(tempfile.gettempdir())
 
-    candidate = raw
-    if os.path.isabs(candidate):
-        # If the absolute path is already under base_abs, keep it as-is.
-        abs_candidate = os.path.abspath(os.path.normpath(candidate))
+    if os.path.isabs(raw):
+        # For absolute paths, accept only those that resolve to somewhere inside
+        # the system temporary directory (e.g. pytest tmp_path, NamedTemporaryFile).
+        candidate_real = os.path.realpath(raw)
         try:
-            common = os.path.commonpath([base_abs, abs_candidate])
+            common = os.path.commonpath([temp_real, candidate_real])
         except ValueError:
             # Different drives on Windows, etc.
-            common = ""
-        if common == base_abs:
-            final_path = abs_candidate
-        else:
-            # Treat an external absolute path as relative to base_dir.
-            candidate = candidate.lstrip(os.sep)
-            joined = os.path.join(base_abs, candidate)
-            final_path = os.path.abspath(os.path.normpath(joined))
-    else:
-        joined = os.path.join(base_abs, candidate)
-        final_path = os.path.abspath(os.path.normpath(joined))
+            raise ValueError("Checkpoint path must be within the system temporary directory")
+        if common != temp_real:
+            raise ValueError("Checkpoint path must be within the system temporary directory")
+        return candidate_real
 
-    # Ensure the final path stays within base_abs.
+    # For relative paths, confine the result to the rasptorch_checkpoints directory.
+    base_dir = os.path.join(temp_real, "rasptorch_checkpoints")
+    os.makedirs(base_dir, exist_ok=True)
+    base_real = os.path.realpath(base_dir)
+
+    joined = os.path.join(base_real, raw)
+    final_path = os.path.realpath(joined)
+
+    # Ensure the resolved path stays within base_real (guards against '..' and symlinks).
     try:
-        common = os.path.commonpath([base_abs, final_path])
+        common = os.path.commonpath([base_real, final_path])
     except ValueError:
         raise ValueError("Invalid checkpoint path")
-    if common != base_abs:
+    if common != base_real:
         raise ValueError("Checkpoint path escapes allowed directory")
 
     return final_path
