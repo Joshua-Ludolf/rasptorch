@@ -417,6 +417,29 @@ def load_model(ctx, path):
         sys.exit(1)
 
 
+@model.command("convert-legacy")
+@click.option("--src", "-s", required=True, help="Legacy torch checkpoint (.pt/.pth)")
+@click.option("--dst", "-d", required=True, help="Output rasptorch checkpoint (.pt/.pth)")
+@click.pass_context
+def convert_legacy_model(ctx, src, dst):
+    """Convert a legacy torch checkpoint to rasptorch format."""
+    try:
+        cmds = get_model_commands()
+        result = cmds.convert_legacy_checkpoint(src, dst)
+        if "error" in result:
+            raise ValueError(result["error"])
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(result))
+        else:
+            click.echo(f"✓ Converted {src} -> {dst}")
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
+
+
 @model.command("train")
 @click.option("--model-id", required=True, help="Model ID to train")
 @click.option("--epochs", "-e", type=int, default=10, help="Number of epochs")

@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-import pickle
-
 import numpy as np
 
 from rasptorch import vulkan_backend as vk
+from rasptorch.checkpoint import load_checkpoint
 from rasptorch.gpu_training import GpuMLP
 
 
 def test_gpu_training_model_save_payload(tmp_path) -> None:
     """Covers the README-documented save format.
 
-    If torch is installed, the file should be torch.load()-able.
-    Otherwise, it should be a pickle containing the same keys.
+    The file should be loadable without requiring torch.
     """
 
     path = tmp_path / "model.pth"
@@ -24,13 +22,7 @@ def test_gpu_training_model_save_payload(tmp_path) -> None:
         m.close()
 
     assert path.exists()
-
-    try:
-        import torch  # type: ignore
-
-        payload = torch.load(str(path))
-    except ModuleNotFoundError:
-        payload = pickle.load(open(path, "rb"))
+    payload = load_checkpoint(str(path))
 
     assert isinstance(payload, dict)
     assert "arch" in payload

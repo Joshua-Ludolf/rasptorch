@@ -68,7 +68,7 @@ GPU (Pi 5 Vulkan):
 
 - `pip install "rasptorch[gpu]"`
 
-Optional (for saving/loading `.pth` via real `torch.save`/`torch.load`):
+Optional (for PyTorch bridge features and interop tooling):
 
 - `pip install "rasptorch[torch]"`
 
@@ -90,8 +90,8 @@ Quick GPU validation:
 Quick model saving check:
 
 - `uv run main.py --device cpu --epochs 1 --save model.pth`
-  - If `torch` is installed: `python -c "import torch; print(torch.load('model.pth').keys())"`
-  - If not: `python -c "import pickle; print(pickle.load(open('model.pth','rb')).keys())"`
+  - Works without `torch`; checkpoints are saved in a rasptorch NumPy archive format.
+  - Inspect keys: `python -c "from rasptorch.checkpoint import load_checkpoint; print(load_checkpoint('model.pth').keys())"`
 
 For local development from this repo:
 
@@ -127,6 +127,7 @@ python rasptorch tensor zeros --shape 3,4
 # Manage models
 python rasptorch model list
 python rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
+python rasptorch model convert-legacy --src legacy_model.pth --dst converted_model.pth
 
 # JSON output for scripting/agents
 python rasptorch --json tensor random --shape 2,3,4
@@ -156,11 +157,11 @@ Run it via:
 
 - `uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.1`
 
-Saving weights (PyTorch-style `.pth`):
+Saving weights (`.pth` / `.pt`):
 
 - `uv run main.py --device gpu --epochs 50 --save model.pth`
-- If `torch` is installed, this is a real `torch.save(...)` file loadable via `torch.load("model.pth")`.
-- If `torch` is not installed, rasptorch falls back to writing a pickle payload (same keys, **not** `torch.load` compatible).
+- Saved as a rasptorch NumPy archive checkpoint (works without `torch`).
+- Load with `from rasptorch.checkpoint import load_checkpoint`.
 
 ## GPU Autograd (WIP)
 

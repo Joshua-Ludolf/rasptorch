@@ -14,6 +14,8 @@ import tempfile
 import uuid
 import json
 
+from rasptorch.checkpoint import convert_legacy_torch_checkpoint, load_checkpoint, save_checkpoint
+
 
 class _GRUSequence(rasptorch.nn.Module):
     """Wrap a GRU to return only the full output sequence (Tensor)."""
@@ -1133,25 +1135,8 @@ class ModelCommands:
 
             ext = os.path.splitext(str(path))[1].lower()
             if ext in {".pth", ".pt"}:
-                try:
-                    import torch  # type: ignore
-                except Exception as e:
-                    return {"error": f"Saving {ext} requires torch (import failed: {e})"}
-
-                def _torch_safe(obj: Any) -> Any:
-                    # Make payload compatible with torch.load(weights_only=True).
-                    if isinstance(obj, np.ndarray):
-                        return torch.from_numpy(np.asarray(obj, dtype=np.float32))
-                    if isinstance(obj, (np.floating, np.integer)):
-                        return obj.item()
-                    if isinstance(obj, dict):
-                        return {str(k): _torch_safe(v) for k, v in obj.items()}
-                    if isinstance(obj, (list, tuple)):
-                        return type(obj)(_torch_safe(v) for v in obj)
-                    return obj
-
-                torch.save(_torch_safe(save_data), path)
-                fmt = "torch"
+                save_checkpoint(path, save_data)
+                fmt = "rasptorch-npz"
             else:
                 import pickle
                 with open(path, "wb") as f:
@@ -1250,14 +1235,15 @@ class ModelCommands:
             ext = os.path.splitext(str(safe_path))[1].lower()
             if ext in {".pth", ".pt"}:
                 try:
-                    import torch  # type: ignore
-                except Exception as e:
-                    return {"error": f"Loading {ext} requires torch (import failed: {e})"}
-                try:
-                    save_data = self._safe_torch_load(safe_path)
-                except Exception as e:
-                    return {"error": str(e)}
-                fmt = "torch"
+                    save_data = load_checkpoint(safe_path)
+                    fmt = "rasptorch-npz"
+                except Exception:
+                    # Backward compatibility: allow safe torch checkpoint loads when torch is available.
+                    try:
+                        save_data = self._safe_torch_load(safe_path)
+                        fmt = "torch"
+                    except Exception as e:
+                        return {"error": str(e)}
             else:
                 # Use JSON for non-torch model files to avoid unsafe pickle deserialization.
                 try:
@@ -1288,6 +1274,21 @@ class ModelCommands:
                 "format": fmt,
                 "message": f"Model loaded successfully",
             }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def convert_legacy_checkpoint(self, src_path: str, dst_path: str) -> Dict[str, Any]:
+        """Convert a legacy torch checkpoint to rasptorch checkpoint format."""
+        try:
+            src = (src_path or "").strip()
+            dst = (dst_path or "").strip()
+            if not src:
+                return {"error": "Source path must not be empty"}
+            if not dst:
+                return {"error": "Destination path must not be empty"}
+
+            result = convert_legacy_torch_checkpoint(src, dst)
+            return result
         except Exception as e:
             return {"error": str(e)}
 

@@ -7,6 +7,7 @@ from rasptorch.nn import Linear, ReLU, Sequential
 from rasptorch.optim import SGD
 from rasptorch.tensor import Tensor
 from rasptorch.functional import mse_loss
+from rasptorch.checkpoint import save_checkpoint
 
 
 def main() -> None:
@@ -91,17 +92,7 @@ def main() -> None:
 
     if args.save:
         payload = {"arch": type(model).__name__, "state_dict": model.state_dict()}
-        try:
-            import torch  # type: ignore
-
-            torch.save(payload, args.save)
-        except ModuleNotFoundError:
-            # Fallback: still write a file, but it won't be torch.load()-compatible.
-            import pickle
-
-            with open(args.save, "wb") as f:
-                pickle.dump(payload, f)
-            print("Warning: 'torch' not installed; wrote a pickle file (not torch.load compatible).")
+        save_checkpoint(args.save, payload)
         print(f"Saved model to: {args.save}")
 
     print("Training done.")

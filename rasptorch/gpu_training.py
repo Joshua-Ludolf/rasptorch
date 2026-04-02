@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import vulkan_backend as vk
+from .checkpoint import save_checkpoint
 from .data import DataLoader, TensorDataset
 
 
@@ -75,17 +76,7 @@ class GpuMLP:
             "out_features": self.out_features,
             "state_dict": state_dict,
         }
-        try:
-            import torch  # type: ignore
-
-            payload["state_dict"] = {name: torch.from_numpy(value) for name, value in state_dict.items()}
-            torch.save(payload, path)
-        except ModuleNotFoundError:
-            import pickle
-
-            with open(path, "wb") as f:
-                pickle.dump(payload, f)
-            print("Warning: 'torch' not installed; wrote a pickle file (not torch.load compatible).")
+        save_checkpoint(path, payload)
 
     def close(self) -> None:
         # Free parameter buffers.
