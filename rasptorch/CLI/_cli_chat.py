@@ -498,7 +498,7 @@ Type 'help <command>' for more details.
         """Show system info."""
         try:
             import rasptorch
-            from . import vulkan_backend as vk
+            from .. import vulkan_backend as vk
 
             device = self.context.get("device", "cpu")
 
@@ -1038,7 +1038,7 @@ Type 'help <command>' for more details.
         
         elif subcmd == "gpu":
             try:
-                from . import vulkan_backend as vk
+                from .. import vulkan_backend as vk
 
                 vk.init(strict=True)
             except Exception as e:
@@ -1046,7 +1046,7 @@ Type 'help <command>' for more details.
                 print(f"  {e}")
                 reason = None
                 try:
-                    from . import vulkan_backend as vk
+                    from .. import vulkan_backend as vk
 
                     reason = vk.disabled_reason()
                 except Exception:
@@ -1062,7 +1062,7 @@ Type 'help <command>' for more details.
             device = self.context.get("device", "cpu")
             print(f"Current device: {device.upper()}")
             try:
-                from . import vulkan_backend as vk
+                from .. import vulkan_backend as vk
 
                 if vk.using_vulkan():
                     print("Vulkan: ✓ Using GPU")
