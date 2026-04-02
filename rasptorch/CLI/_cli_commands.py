@@ -1149,7 +1149,8 @@ class ModelCommands:
             return {
                 "status": "success",
                 "model_id": model_id,
-                "path": safe_path,
+                "path": path,
+                "resolved_path": safe_path,
                 "format": fmt,
                 "message": f"Model saved successfully",
             }
