@@ -231,6 +231,11 @@ python -m pip install -U build twine
 python -m build
 ```
 
+Upload to Pypi
+```bash
+python  twine upload --non-interactive dist/*
+```
+
 ## Limitations
 
 - Vulkan support is experimental and focused on the Raspberry Pi 5.

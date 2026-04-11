@@ -12,7 +12,7 @@ wheels/
 .venv
 
 # text files
-pypi_*.txt
+*.txt
 
 # VsCode settings
 .vscode/
