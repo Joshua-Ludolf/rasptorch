@@ -6,6 +6,7 @@ import csv
 import io
 import itertools
 import random
+from urllib.parse import quote
 
 import json
 import sys
@@ -19,11 +20,6 @@ try:
     from PIL import Image
 except Exception:
     Image = None  # type: ignore[assignment]
-
-try:
-    import streamlit.components.v1 as components  # type: ignore
-except Exception:  # pragma: no cover
-    components = None  # type: ignore[assignment]
 
 _UI_BUILD = "2026-04-10-layer-info-v2"
 
@@ -863,7 +859,7 @@ def _render_log_viewer(limit: int = 300) -> None:
                 "message": str(entry.get("message", "")),
             }
         )
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _first_linear_weight(model: Any) -> Optional[np.ndarray]:
@@ -1499,7 +1495,7 @@ def _render_models_page() -> None:
                     break
             disp = _display_name(full_id) if full_id else mid8
             rows.append({"name": disp, "model_id": mid8, "type": m.get("type")})
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.info("No models yet. Create one in Build & Train.")
 
@@ -1592,10 +1588,8 @@ def _render_models_page() -> None:
         st.subheader("Structure")
         svg = _model_structure_svg_html(cmds.models, selected)
         if svg:
-            if components is not None:
-                components.html(svg, height=560)
-            else:
-                st.caption("SVG structure diagram unavailable (streamlit.components.v1 not importable).")
+            data_url = "data:text/html;charset=utf-8," + quote(svg)
+            st.iframe(data_url, height=560, width="stretch")
 
         st.subheader("Explainability (XAI)")
         st.caption("Upload an image to run prediction and generate a Grad-CAM-style overlay.")
@@ -1607,7 +1601,7 @@ def _render_models_page() -> None:
                 try:
                     img = Image.open(io.BytesIO(xai_up.getvalue())).convert("RGB")
                     img_np = np.asarray(img, dtype=np.uint8)
-                    st.image(img_np, caption="Input", use_container_width=True)
+                    st.image(img_np, caption="Input", width="stretch")
 
                     if st.button("Run prediction + XAI", key=f"xai_btn_{selected}"):
                         md0 = cmds.models.get(selected) or {}
@@ -1621,7 +1615,7 @@ def _render_models_page() -> None:
                             _log_event("ERROR", "XAI failed: model reconstruction", model_id=selected)
                         else:
                             overlay, xai_info = _gradcam_like_overlay(img_np, md0, model_obj)
-                            st.image(overlay, caption="Grad-CAM-style overlay", use_container_width=True)
+                            st.image(overlay, caption="Grad-CAM-style overlay", width="stretch")
 
                             # Best-effort prediction.
                             pred_msg = "Prediction unavailable"
@@ -2310,7 +2304,7 @@ def _render_build_train_page() -> None:
         sr = ctx.get("search_runs", [])
         if isinstance(sr, list) and sr:
             st.caption("Search results (latest)")
-            st.dataframe(sr[-50:], use_container_width=True, hide_index=True)
+            st.dataframe(sr[-50:], width="stretch", hide_index=True)
             ok_rows = [r for r in sr if isinstance(r, dict) and r.get("status") == "ok" and r.get("final_loss") is not None]
             if ok_rows:
                 best = min(ok_rows, key=lambda r: float(r.get("final_loss", 1e12)))
@@ -2381,7 +2375,7 @@ def _render_dashboard_page() -> None:
         )
 
     st.subheader("Runs")
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.dataframe(rows, width="stretch", hide_index=True)
 
     # Side-by-side loss curves.
     st.subheader("Loss Curves")
@@ -2393,7 +2387,7 @@ def _render_dashboard_page() -> None:
         series = run.get("loss") if isinstance(run, dict) else None
         if not isinstance(series, list) or not series:
             continue
-        label = f"run{idx}:{str(run.get('model_id', ''))[:8]}"
+        label = f"run{idx}_{str(run.get('model_id', ''))[:8]}".replace(":", "_")
         vals = [float(x) for x in series]
         chart_data[label] = vals
         max_len = max(max_len, len(vals))
