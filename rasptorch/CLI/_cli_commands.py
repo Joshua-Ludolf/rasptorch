@@ -7,6 +7,8 @@ from __future__ import annotations
 
 
 from typing import Any, Dict, Tuple, List, Optional, Callable
+from pathlib import PurePosixPath
+import re
 import numpy as np
 import rasptorch
 import os
@@ -1279,6 +1281,19 @@ class ModelCommands:
         if os.path.isabs(raw):
             raise ValueError("Absolute model paths are not allowed")
 
+        # Validate untrusted input early: only allow safe relative segments.
+        # Normalize backslashes to forward slashes for consistent parsing.
+        raw_posix = raw.replace("\\", "/")
+        p = PurePosixPath(raw_posix)
+        if p.is_absolute():
+            raise ValueError("Absolute model paths are not allowed")
+        allowed_segment = re.compile(r"^[A-Za-z0-9._ -]+$")
+        for part in p.parts:
+            if part in {"", ".", ".."}:
+                raise ValueError("Invalid model path segment")
+            if not allowed_segment.fullmatch(part):
+                raise ValueError("Model path contains unsupported characters")
+
         # Base directory where models are stored.
         base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
         os.makedirs(base_dir, exist_ok=True)
@@ -1286,7 +1301,7 @@ class ModelCommands:
         base_dir_real = os.path.realpath(base_dir)
 
         # Resolve symlinks in the candidate path to guard against symlink escapes.
-        candidate = os.path.realpath(os.path.join(base_dir_real, raw))
+        candidate = os.path.realpath(os.path.join(base_dir_real, str(p)))
 
         # Ensure the candidate path is within base_dir.
         try:
