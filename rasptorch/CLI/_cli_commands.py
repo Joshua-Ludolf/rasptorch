@@ -1232,8 +1232,7 @@ class ModelCommands:
             # This is used only to select the serialisation method; all file
             # operations below use ``safe_path`` which is entirely hash-derived
             # and does not contain any user-controlled data.
-            user_basename = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
-            user_ext = os.path.splitext(user_basename)[1].lower()
+            user_ext = os.path.splitext(os.path.basename(path or ""))[1].lower()
             if user_ext in {".pth", ".pt"}:
                 save_checkpoint(safe_path, save_data)
                 fmt = "rasptorch-npz"
@@ -1371,7 +1370,7 @@ class ModelCommands:
             # because the on-disk filename is now a SHA-256 hash and therefore
             # carries no format information.
             save_data: Any = None
-            fmt: str = "unknown"
+            fmt: str = "pickle"
 
             try:
                 save_data = load_checkpoint(safe_path)
@@ -1394,7 +1393,7 @@ class ModelCommands:
                         save_data = pickle.load(f)
                     fmt = "pickle"
                 except Exception as e:
-                    return {"error": f"Failed to load model file: {e}"}
+                    return {"error": f"Failed to load model file in any supported format (rasptorch-npz, JSON, or pickle): {e}"}
 
             if not isinstance(save_data, dict):
                 return {"error": "Unexpected model file format: expected object payload"}
