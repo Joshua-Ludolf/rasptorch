@@ -1,6 +1,12 @@
 from __future__ import annotations as annotate
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+from datetime import datetime
+import csv
+import io
+import itertools
+import random
+from urllib.parse import quote
 
 import json
 import sys
@@ -11,11 +17,11 @@ import streamlit as st
 import numpy as np
 
 try:
-    import streamlit.components.v1 as components  # type: ignore
-except Exception:  # pragma: no cover
-    components = None  # type: ignore[assignment]
+    from PIL import Image
+except Exception:
+    Image = None  # type: ignore[assignment]
 
-_UI_BUILD = "2026-03-27-activation-conditional-v1"
+_UI_BUILD = "2026-04-10-layer-info-v2"
 
 
 # When running `streamlit run` from inside `rasptorch/ui`, Python's import
@@ -31,10 +37,12 @@ get_model_commands: Any = None
 _vulkan_backend: Any = None
 _HAS_RASPTORCH = False
 _RASPTORCH_IMPORT_ERROR = ""
+validate_dataset_structure: Any = None
 
 try:
     import rasptorch as rasptorch  # type: ignore[no-redef]
     from rasptorch._cli_commands import get_model_commands as get_model_commands  # type: ignore[no-redef]
+    from rasptorch.data_validation import validate_dataset_structure as validate_dataset_structure  # type: ignore[no-redef]
 
     try:
         from rasptorch import vulkan_backend as _vulkan_backend  # type: ignore
@@ -63,7 +71,7 @@ ACTIVATIONS = [
 
 OPTIMIZERS = ["Adam", "AdamW", "SGD", "RMSProp"]
 
-HELP_TEXT = [
+HELP_TEXT_FALLBACK = [
     "Commands:",
     "  help                          Show this help",
     "  info                          Show environment/device info",
@@ -74,6 +82,7 @@ HELP_TEXT = [
     "  model mlp <layers_csv> [act=relu|activations=a,b,c]",
     "  model linear <in> <hidden_csv> <out> [act=relu|activations=a,b,c]",
     "  model cnn <in_ch> <out_ch_csv> [kernels_csv] [act=relu|activations=a,b,c]",
+    "  model transfer <backbone> <num_classes> [freeze=true|false] [fine_tune=true|false]",
     "  combine sequential <a_id> <b_id> [name]",
     "  train epochs|batch-size|lr <value>",
     "  train start                   Train the selected model",
@@ -91,6 +100,44 @@ if _HAS_RASPTORCH:
 
 def _mermaid_escape(text: str) -> str:
     return str(text).replace("\n", " ").replace("\"", "'")
+
+
+def _chat_repl_help_lines() -> List[str]:
+    try:
+        from rasptorch.CLI._cli_chat import ChatREPL
+
+        help_text = ChatREPL.get_help(ChatREPL())
+        lines = [line.rstrip() for line in str(help_text).splitlines() if line.strip()]
+        return lines if lines else list(HELP_TEXT_FALLBACK)
+    except Exception:
+        return [f'Error loading help: {str(Exception)}'] + list(HELP_TEXT_FALLBACK)
+
+
+HELP_TEXT = _chat_repl_help_lines()
+
+
+def _combined_leaf_models(models: Dict[str, Any], model_id: str, seen: Optional[set[str]] = None) -> List[Tuple[str, str, Dict[str, Any]]]:
+    """Return non-combined source models for a potentially nested Combined model."""
+    if seen is None:
+        seen = set()
+    if model_id in seen:
+        return []
+    seen.add(model_id)
+
+    md = models.get(model_id) or {}
+    mtype = str(md.get("type", "Unknown"))
+    cfg = md.get("config") or {}
+    if mtype == "Combined" and str(cfg.get("combine")) == "sequential":
+        out: List[Tuple[str, str, Dict[str, Any]]] = []
+        a_id = str(cfg.get("model_a_id", ""))
+        b_id = str(cfg.get("model_b_id", ""))
+        if a_id:
+            out.extend(_combined_leaf_models(models, a_id, seen))
+        if b_id:
+            out.extend(_combined_leaf_models(models, b_id, seen))
+        if out:
+            return out
+    return [(model_id, mtype, cfg)]
 
 
 def _model_mermaid_diagram(models: Dict[str, Any], model_id: Optional[str]) -> Optional[str]:
@@ -114,17 +161,12 @@ def _model_mermaid_diagram(models: Dict[str, Any], model_id: Optional[str]) -> O
             lines.append(f"  {a} --> {b}")
 
     if mtype == "Combined" and str(cfg.get("combine")) == "sequential":
-        a_id = str(cfg.get("model_a_id", ""))
-        b_id = str(cfg.get("model_b_id", ""))
-        a_type = str(cfg.get("model_a_type", "A"))
-        b_type = str(cfg.get("model_b_type", "B"))
         node(root, f"Combined {model_id[:8]}")
-        a_node = f"{root}_a"
-        b_node = f"{root}_b"
-        node(a_node, f"{a_type} {a_id[:8]}")
-        node(b_node, f"{b_type} {b_id[:8]}")
-        edge(a_node, root, "A")
-        edge(b_node, root, "B")
+        leaf_models = _combined_leaf_models(models, model_id)
+        for i, (leaf_id, leaf_type, _leaf_cfg) in enumerate(leaf_models):
+            src_node = f"{root}_src{i}"
+            node(src_node, f"{leaf_type} {leaf_id[:8]}")
+            edge(src_node, root, f"S{i + 1}")
         io_in = cfg.get("input_size")
         io_out = cfg.get("output_size")
         if io_in is not None or io_out is not None:
@@ -231,13 +273,51 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
             return f"activation={act}"
         return ""
 
+    def _infer_io_sizes(model_type: str, model_cfg: Dict[str, Any]) -> Tuple[Optional[Any], Optional[Any]]:
+        in_size = model_cfg.get("input_size")
+        if in_size is None:
+            in_size = model_cfg.get("in_channels")
+        if in_size is None:
+            layers = model_cfg.get("layer_sizes")
+            if isinstance(layers, list) and layers:
+                in_size = layers[0]
+        if in_size is None and str(model_type) == "Transformer":
+            in_size = model_cfg.get("d_model")
+
+        out_size = model_cfg.get("output_size")
+        if out_size is None:
+            if str(model_type) == "GRU":
+                out_size = model_cfg.get("hidden_size")
+            elif str(model_type) == "CNN":
+                out_ch = model_cfg.get("out_channels")
+                if isinstance(out_ch, list) and out_ch:
+                    out_size = out_ch[-1]
+            elif str(model_type) == "MLP":
+                layers = model_cfg.get("layer_sizes")
+                if isinstance(layers, list) and layers:
+                    out_size = layers[-1]
+            elif str(model_type) == "Linear":
+                hidden = model_cfg.get("hidden_sizes")
+                if isinstance(hidden, list) and hidden:
+                    out_size = hidden[-1]
+            elif str(model_type) == "Transformer":
+                out_size = model_cfg.get("d_model")
+        return in_size, out_size
+
     def _model_summary() -> str:
         if mtype == "Combined" and str(cfg.get("combine")) == "sequential":
-            a_t = str(cfg.get("model_a_type", "A"))
-            b_t = str(cfg.get("model_b_type", "B"))
+            leaf_models = _combined_leaf_models(models, str(model_id))
+            leaf_types = ",".join(f"{t}:{mid[:8]}" for mid, t, _ in leaf_models)
             io_in = cfg.get("input_size")
             io_out = cfg.get("output_size")
-            return f"type=Combined(sequential)\nA={a_t}\nB={b_t}\ninput_size={io_in}\noutput_size={io_out}"
+            return (
+                f"model_id={str(model_id)[:8]}\n"
+                f"type=Combined(sequential)\n"
+                f"source_count={len(leaf_models)}\n"
+                f"source_types={leaf_types or '?'}\n"
+                f"input_size={io_in}\n"
+                f"output_size={io_out}"
+            )
         if mtype in {"Linear", "MLP", "CNN"}:
             bits: List[str] = [f"type={mtype}"]
             if cfg.get("input_size") is not None:
@@ -250,7 +330,7 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
             if act_s0:
                 bits.append(act_s0)
             return "\n".join(bits)
-        return f"type={mtype}"
+        return f"model_id={str(model_id)[:8]}\ntype={mtype}"
 
     # ── collect layer specs ───────────────────────────────────────────────────
     sizes: List[float] = []
@@ -266,21 +346,46 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
     combined_seq = mtype == "Combined" and str(cfg.get("combine")) == "sequential"
 
     if combined_seq:
-        a_id = str(cfg.get("model_a_id", ""))
-        b_id = str(cfg.get("model_b_id", ""))
-        a_t = str(cfg.get("model_a_type", "A"))
-        b_t = str(cfg.get("model_b_type", "B"))
+        leaf_models = _combined_leaf_models(models, str(model_id))
         io_in = cfg.get("input_size")
         io_out = cfg.get("output_size")
-        left_sizes  = [_coerce_size(io_in or 8), _coerce_size(io_out or (io_in or 8))]
-        left_labels = [f"A {a_t}", "Combined"]
+        leaf_types = ",".join(f"{t}:{mid[:8]}" for mid, t, _ in leaf_models)
+        left_sizes  = [_coerce_size(io_out or io_in or 8)]
+        left_labels = ["Combined"]
         left_hovers = [
-            f"type=Combined(sequential)\nA={a_t} ({a_id[:8] if a_id else '?'})\ninput_size={io_in}",
-            f"type=Combined(sequential)\noutput_size={io_out}",
+            f"model_id={str(model_id)[:8]}\n"
+            f"type=Combined(sequential)\n"
+            f"source_count={len(leaf_models)}\n"
+            f"source_types={leaf_types or '?'}\n"
+            f"input_size={io_in}\n"
+            f"output_size={io_out}"
         ]
-        right_sizes  = [_coerce_size(io_out or 8)]
-        right_labels = [f"B {b_t}"]
-        right_hovers = [f"type=Combined(sequential)\nB={b_t} ({b_id[:8] if b_id else '?'})\noutput_size={io_out}"]
+        right_sizes = []
+        right_labels = []
+        right_hovers = []
+        for i, (leaf_id, leaf_type, leaf_cfg) in enumerate(leaf_models):
+            leaf_in_size, leaf_out_size = _infer_io_sizes(str(leaf_type), leaf_cfg)
+            leaf_size = leaf_cfg.get("output_size")
+            if leaf_size is None:
+                leaf_size = leaf_cfg.get("input_size")
+            if leaf_size is None:
+                leaf_size = leaf_cfg.get("in_channels")
+            if leaf_size is None:
+                leaf_size = leaf_out_size
+            if leaf_size is None:
+                leaf_size = leaf_in_size
+            right_sizes.append(_coerce_size(leaf_size or 8))
+            right_labels.append(f"S{i + 1} {leaf_type}")
+            leaf_name = str(leaf_cfg.get("name", "")).strip()
+            leaf_label = leaf_name if leaf_name else leaf_id[:8]
+            right_hovers.append(
+                f"model_id={leaf_id[:8]}\n"
+                f"type={leaf_type}\n"
+                f"name={leaf_label}\n"
+                f"source={i + 1}/{len(leaf_models)}\n"
+                f"input_size={leaf_in_size}\n"
+                f"output_size={leaf_out_size}"
+            )
     else:
         if mtype == "MLP":
             for i, s in enumerate(cfg.get("layer_sizes") or []):
@@ -407,23 +512,14 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
         rcx =  STACK_SEP / 2
         left_centers  = _draw_stack(lcx, left_sizes,  left_labels,  left_hovers,  idx_off=0)
         right_centers = _draw_stack(rcx, right_sizes, right_labels, right_hovers, idx_off=len(left_sizes))
-        # Draw arrows from both A and B to Combined
-        if left_centers:
-            # Arrow from A (left stack top) to Combined (left stack bottom)
-            ax, ay = left_centers[0]  # A block center
-            cx, cy = left_centers[-1] # Combined block center
-            conns_svg.append(
-                f'<line class="fc cross" x1="{ax:.1f}" y1="{ay:.1f}" '
-                f'x2="{cx:.1f}" y2="{cy:.1f}" marker-end="url(#ah)"/>'
-            )
+        # Draw arrows from all source models to Combined.
         if right_centers and left_centers:
-            # Arrow from B (right stack) to Combined (left stack bottom)
-            bx, by = right_centers[0]  # B block center
-            cx, cy = left_centers[-1]  # Combined block center
-            conns_svg.append(
-                f'<line class="fc cross" x1="{bx:.1f}" y1="{by:.1f}" '
-                f'x2="{cx:.1f}" y2="{cy:.1f}" marker-end="url(#ah)"/>'
-            )
+            cx, cy = left_centers[-1]
+            for bx, by in right_centers:
+                conns_svg.append(
+                    f'<line class="fc cross" x1="{bx:.1f}" y1="{by:.1f}" '
+                    f'x2="{cx:.1f}" y2="{cy:.1f}" marker-end="url(#ah)"/>'
+                )
     else:
         left_centers  = _draw_stack(0.0, left_sizes, left_labels, left_hovers)
         right_centers = []
@@ -541,10 +637,14 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
     pointer-events:none;
   }}
   /* HUD */
-  .hud-bg  {{ fill:rgba(18,20,28,.92); }}
-  .hud-bd  {{ fill:none; stroke:rgba(110,135,180,.3); stroke-width:1; }}
-  .hud-ttl {{ fill:rgba(140,165,210,.85); font-size:10px; letter-spacing:.1em; }}
-  .hud-val {{ fill:rgba(225,235,250,.95); font-size:13px; }}
+    .hud-bg  {{ fill:rgba(14,18,30,.95); }}
+    .hud-bd  {{ fill:none; stroke:rgba(125,152,210,.45); stroke-width:1.2; }}
+    .hud-ttl {{ fill:rgba(174,200,255,.95); font-size:10px; font-weight:700; letter-spacing:.14em; }}
+    .hud-sub {{ fill:rgba(130,153,201,.9); font-size:9px; letter-spacing:.09em; }}
+    .hud-val {{ fill:rgba(236,242,255,.96); font-size:12px; }}
+        .hud-grip-hit {{ fill:rgba(0,0,0,0); cursor:grab; }}
+        .hud-grip-dot {{ fill:rgba(174,200,255,.95); opacity:.9; pointer-events:none; }}
+        .hud-grip-line {{ stroke:rgba(130,153,201,.9); stroke-width:1.1; pointer-events:none; }}
   /* reset btn */
   .rbg {{ fill:rgba(50,60,95,.75); stroke:rgba(110,135,200,.4); stroke-width:1; cursor:pointer; }}
   .rbg:hover {{ fill:rgba(75,90,145,.9); }}
@@ -561,16 +661,29 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
 
 <!-- HUD -->
 <g id="rt-hud">
-  <rect class="hud-bg" x="{hud_x:.1f}" y="{hud_y:.1f}" width="{hud_w:.1f}" height="68" rx="8"/>
-  <rect class="hud-bd" x="{hud_x:.1f}" y="{hud_y:.1f}" width="{hud_w:.1f}" height="68" rx="8"/>
-  <text class="hud-ttl" x="{hud_x+12:.1f}" y="{hud_y+18:.1f}">LAYER INFO — HOVER OR CLICK A BLOCK</text>
-  <text id="rt-inf" class="hud-val" x="{hud_x+12:.1f}" y="{hud_y+38:.1f}"></text>
-</g>
+    <rect class="hud-bg" x="{hud_x:.1f}" y="{hud_y:.1f}" width="{hud_w:.1f}" height="156" rx="10"/>
+    <rect class="hud-bd" x="{hud_x:.1f}" y="{hud_y:.1f}" width="{hud_w:.1f}" height="156" rx="10"/>
+        <g id="rt-hud-grip">
+            <rect class="hud-grip-hit" x="{hud_x + hud_w/2 - 12:.1f}" y="{hud_y+12:.1f}" width="24" height="24" rx="4"/>
+            <line class="hud-grip-line" x1="{hud_x + hud_w/2 - 6:.1f}" y1="{hud_y+18:.1f}" x2="{hud_x + hud_w/2 + 6:.1f}" y2="{hud_y+18:.1f}"/>
+            <line class="hud-grip-line" x1="{hud_x + hud_w/2 - 6:.1f}" y1="{hud_y+24:.1f}" x2="{hud_x + hud_w/2 + 6:.1f}" y2="{hud_y+24:.1f}"/>
+            <line class="hud-grip-line" x1="{hud_x + hud_w/2 - 6:.1f}" y1="{hud_y+30:.1f}" x2="{hud_x + hud_w/2 + 6:.1f}" y2="{hud_y+30:.1f}"/>
+            <circle class="hud-grip-dot" cx="{hud_x + hud_w/2 - 8:.1f}" cy="{hud_y+18:.1f}" r="1.1"/>
+            <circle class="hud-grip-dot" cx="{hud_x + hud_w/2 - 8:.1f}" cy="{hud_y+24:.1f}" r="1.1"/>
+            <circle class="hud-grip-dot" cx="{hud_x + hud_w/2 - 8:.1f}" cy="{hud_y+30:.1f}" r="1.1"/>
+            <circle class="hud-grip-dot" cx="{hud_x + hud_w/2 + 8:.1f}" cy="{hud_y+18:.1f}" r="1.1"/>
+            <circle class="hud-grip-dot" cx="{hud_x + hud_w/2 + 8:.1f}" cy="{hud_y+24:.1f}" r="1.1"/>
+            <circle class="hud-grip-dot" cx="{hud_x + hud_w/2 + 8:.1f}" cy="{hud_y+30:.1f}" r="1.1"/>
+        </g>
+    <text class="hud-ttl" x="{hud_x+12:.1f}" y="{hud_y+20:.1f}">LAYER INSPECTOR</text>
+    <text class="hud-sub" x="{hud_x+12:.1f}" y="{hud_y+36:.1f}">HOVER OR CLICK A BLOCK FOR DETAILS</text>
+    <text id="rt-inf" class="hud-val" x="{hud_x+12:.1f}" y="{hud_y+54:.1f}"></text>
 
-<!-- Reset button -->
-<g id="rt-rst" style="cursor:pointer;">
-  <rect class="rbg" x="{rst_x:.1f}" y="{rst_y:.1f}" width="70" height="20" rx="5"/>
-  <text class="rlbl" x="{rst_x+35:.1f}" y="{rst_y+10:.1f}">RESET VIEW</text>
+        <!-- Reset button (inside inspector) -->
+        <g id="rt-rst" style="cursor:pointer;">
+            <rect class="rbg" x="{rst_x:.1f}" y="{rst_y:.1f}" width="70" height="20" rx="5"/>
+            <text class="rlbl" x="{rst_x+35:.1f}" y="{rst_y+10:.1f}">RESET VIEW</text>
+        </g>
 </g>
 
 <script>
@@ -579,19 +692,28 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
   if (!svg) return;
   const vp  = svg.getElementById ? svg.getElementById('rt-vp') : svg.querySelector('#rt-vp');
   const inf = svg.querySelector('#rt-inf');
+    const hud = svg.querySelector('#rt-hud');
+    const modelInfo = String({info_js});
 
   function setInfo(raw) {{
     if (!inf) return;
+        const rows = String(raw || '')
+            .split('\\n')
+            .map(s => s.trim())
+            .filter(Boolean);
     while (inf.firstChild) inf.removeChild(inf.firstChild);
-    String(raw||'').split('\\n').slice(0,3).forEach((ln,i)=>{{
+        rows.slice(0, 8).forEach((ln, i)=>{{
+            const p = ln.split('=');
+            const key = p.length > 1 ? p[0] : '';
+            const val = p.length > 1 ? p.slice(1).join('=') : ln;
       const ts = document.createElementNS('http://www.w3.org/2000/svg','tspan');
       ts.setAttribute('x', inf.getAttribute('x'));
-      ts.setAttribute('dy', i===0?'0':'1.4em');
-      ts.textContent = ln;
+            ts.setAttribute('dy', i===0 ? '0' : '1.12em');
+            ts.textContent = key ? `${{key}}: ${{val}}` : val;
       inf.appendChild(ts);
     }});
   }}
-  setInfo({info_js});
+    setInfo(modelInfo);
 
   let sel = null;
   svg.querySelectorAll('.rt-box').forEach(g => {{
@@ -608,19 +730,46 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
   }});
   svg.addEventListener('click', ()=>{{ if(sel){{ sel.classList.remove('sel'); sel=null; }} }});
 
+    // draggable HUD
+    let hudDrag = false, hdx = 0, hdy = 0, hlx = 0, hly = 0;
+    const applyHud = () => hud && hud.setAttribute('transform', `translate(${{hdx}} ${{hdy}})`);
+    if (hud) {{
+        hud.addEventListener('click', e => e.stopPropagation());
+    }}
+
   // pan / zoom
-  let sc=1, tx=0, ty=0, pan=false, lx=0, ly=0;
+    let sc=1, tx=0, ty=0, pan=false, lx=0, ly=0;
   const apply = () => vp && vp.setAttribute('transform',`translate(${{tx}} ${{ty}}) scale(${{sc}})`);
 
   svg.addEventListener('pointerdown', e => {{
     const t = e.target;
-    if (t.closest && (t.closest('.rt-box')||t.closest('#rt-hud')||t.closest('#rt-rst'))) return;
+        if (t.closest && t.closest('#rt-hud-grip')) {{
+            e.preventDefault();
+            hudDrag = true;
+            hlx = e.clientX;
+            hly = e.clientY;
+            try {{ svg.style.userSelect = 'none'; svg.style.webkitUserSelect = 'none'; }} catch(_) {{}}
+            svg.setPointerCapture(e.pointerId);
+            return;
+        }}
+        if (t.closest && t.closest('#rt-hud')) return;
+        if (t.closest && (t.closest('.rt-box')||t.closest('#rt-rst'))) return;
     pan=true; lx=e.clientX; ly=e.clientY; svg.setPointerCapture(e.pointerId);
   }});
   svg.addEventListener('pointerup', e => {{
-    pan=false; try{{svg.releasePointerCapture(e.pointerId);}}catch(_){{}}
+      pan=false; hudDrag=false;
+      try {{ svg.style.userSelect = ''; svg.style.webkitUserSelect = ''; }} catch(_) {{}}
+      try{{svg.releasePointerCapture(e.pointerId);}}catch(_){{}}
   }});
   svg.addEventListener('pointermove', e => {{
+        if (hudDrag) {{
+            hdx += e.clientX - hlx;
+            hdy += e.clientY - hly;
+            hlx = e.clientX;
+            hly = e.clientY;
+            applyHud();
+            return;
+        }}
     if(!pan) return;
     tx+=e.clientX-lx; ty+=e.clientY-ly; lx=e.clientX; ly=e.clientY; apply();
   }});
@@ -636,6 +785,7 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
   const rst = svg.querySelector('#rt-rst');
   if(rst) rst.addEventListener('click',()=>{{sc=1;tx=0;ty=0;apply();}});
 
+    applyHud();
   apply();
 }})();
 </script>
@@ -646,6 +796,7 @@ def _init_state() -> None:
     ss = st.session_state
     ss.setdefault("nav", "Models")
     ss.setdefault("repl_log", [])
+    ss.setdefault("app_log", [])
     ss.setdefault(
         "repl_context",
         {
@@ -658,8 +809,13 @@ def _init_state() -> None:
             "loaded_files": {},
             "upload_cache": {},
             "last_loaded_hash": None,
+            "preprocessing_pipeline": {
+                "normalize": "none",
+                "resize_hw": None,
+            },
             # Models that have successfully completed at least one training run in this UI session.
             "trained_models": [],
+            "search_runs": [],
         },
     )
 
@@ -669,6 +825,133 @@ def _append_log(lines: List[str] | str) -> None:
         st.session_state.repl_log.append(lines)
     else:
         st.session_state.repl_log.extend(lines)
+
+
+def _log_event(level: str, message: str, **extra: Any) -> None:
+    logs = st.session_state.setdefault("app_log", [])
+    logs.append(
+        {
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "level": str(level).upper(),
+            "message": str(message),
+            "extra": extra or {},
+        }
+    )
+    if len(logs) > 1000:
+        st.session_state["app_log"] = logs[-1000:]
+
+
+def _render_log_viewer(limit: int = 300) -> None:
+    st.subheader("Logs")
+    logs = st.session_state.get("app_log", [])
+    if not isinstance(logs, list) or not logs:
+        st.info("No log entries yet.")
+        return
+
+    rows = []
+    for entry in logs[-int(limit):]:
+        if not isinstance(entry, dict):
+            continue
+        rows.append(
+            {
+                "time": str(entry.get("ts", "")),
+                "level": str(entry.get("level", "INFO")),
+                "message": str(entry.get("message", "")),
+            }
+        )
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _first_linear_weight(model: Any) -> Optional[np.ndarray]:
+    try:
+        layers = getattr(model, "layers", None)
+        if isinstance(layers, list):
+            for layer in layers:
+                w = _first_linear_weight(layer)
+                if w is not None:
+                    return w
+        if hasattr(rasptorch.nn, "Linear") and isinstance(model, rasptorch.nn.Linear):
+            w = getattr(model, "weight", None)
+            if w is None:
+                return None
+            arr = np.asarray(getattr(w, "data", w), dtype=np.float32)
+            if arr.ndim == 2:
+                return arr
+    except Exception:
+        return None
+    return None
+
+
+def _infer_model_input_size(model_data: Dict[str, Any]) -> Optional[int]:
+    cfg = model_data.get("config") or {}
+    try:
+        if cfg.get("input_size") is not None:
+            return int(cfg.get("input_size"))
+        if cfg.get("feature_size") is not None:
+            return int(cfg.get("feature_size"))
+        if cfg.get("vocab_size") is not None:
+            return int(cfg.get("vocab_size"))
+        layers = cfg.get("layer_sizes")
+        if isinstance(layers, list) and layers:
+            return int(layers[0])
+        if cfg.get("in_channels") is not None:
+            return int(cfg.get("in_channels"))
+    except Exception:
+        return None
+    return None
+
+
+def _jet_colormap(v: np.ndarray) -> np.ndarray:
+    x = np.clip(v, 0.0, 1.0)
+    r = np.clip(1.5 - np.abs(4.0 * x - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * x - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * x - 1.0), 0.0, 1.0)
+    return np.stack([r, g, b], axis=-1).astype(np.float32)
+
+
+def _gradcam_like_overlay(image_rgb: np.ndarray, model_data: Dict[str, Any], model_obj: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Create a Grad-CAM-style overlay from model weights and input image.
+
+    This is a lightweight approximation suitable for rasptorch-native models.
+    """
+    img = np.asarray(image_rgb, dtype=np.float32)
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError("Expected RGB image with shape [H,W,3]")
+    img01 = np.clip(img / 255.0, 0.0, 1.0)
+
+    h, w, c = img01.shape
+    gray = img01.mean(axis=2)
+    cam: Optional[np.ndarray] = None
+
+    w0 = _first_linear_weight(model_obj)
+    in_size = _infer_model_input_size(model_data)
+
+    if w0 is not None and in_size is not None:
+        imp = np.mean(np.abs(w0), axis=0)
+        if int(in_size) == h * w * c and imp.size == h * w * c:
+            cam = imp.reshape(h, w, c).mean(axis=2)
+        elif int(in_size) == h * w and imp.size == h * w:
+            cam = imp.reshape(h, w)
+
+    if cam is None:
+        gy, gx = np.gradient(gray)
+        cam = np.abs(gx) + np.abs(gy)
+
+    cam = np.asarray(cam, dtype=np.float32)
+    cam = cam - float(cam.min())
+    denom = float(cam.max()) if float(cam.max()) > 0.0 else 1.0
+    cam = cam / denom
+
+    heat = _jet_colormap(cam)
+    overlay = np.clip(0.60 * img01 + 0.40 * heat, 0.0, 1.0)
+    overlay_u8 = (overlay * 255.0).astype(np.uint8)
+
+    info = {
+        "xai_method": "gradcam_style_approx",
+        "input_shape": [int(h), int(w), int(c)],
+        "used_linear_weight": bool(w0 is not None),
+    }
+    return overlay_u8, info
 
 
 def _parse_csv_ints(raw: str) -> List[int]:
@@ -780,13 +1063,18 @@ def _handle_repl_command(command_str: str) -> None:
     if not command_str:
         return
 
+    _log_event("INFO", "REPL command", command=command_str)
+
     ctx = st.session_state.repl_context
     cmds = get_model_commands()
     parts = command_str.split()
     root = parts[0].lower()
 
-    def out(s: str) -> None:
+    def out(s: List[str] | str) -> None:
         _append_log(s)
+        txt = str(s)
+        lvl = "ERROR" if txt.startswith("✗") else "INFO"
+        _log_event(lvl, txt)
 
     def selected_model() -> Optional[str]:
         mid = ctx.get("current_model")
@@ -796,7 +1084,7 @@ def _handle_repl_command(command_str: str) -> None:
 
     try:
         if root == "help":
-            out(HELP_TEXT)
+            out(_chat_repl_help_lines())
             return
         if root == "info":
             out(_cmd_info())
@@ -902,15 +1190,18 @@ def _handle_repl_command(command_str: str) -> None:
             if len(parts) < 3:
                 out("✗ Usage: tensor create|zeros|ones <shape_csv>")
                 return
+            if TENSORCOMMANDS is None:
+                out("✗ Tensor commands are unavailable in this build")
+                return
             sub = parts[1].lower()
             shape = tuple(int(x.strip()) for x in parts[2].split(",") if x.strip())
             device = str(ctx.get("device", "cpu"))
             if sub == "create":
-                result = TensorCommands.create_random(shape, device=device)
+                result = TENSORCOMMANDS.create_random(shape, device=device)
             elif sub == "zeros":
-                result = TensorCommands.create_zeros(shape, device=device)
+                result = TENSORCOMMANDS.create_zeros(shape, device=device)
             elif sub == "ones":
-                result = TensorCommands.create_ones(shape, device=device)
+                result = TENSORCOMMANDS.create_ones(shape, device=device)
             else:
                 out(f"✗ Unknown tensor command: {sub}")
                 return
@@ -1127,6 +1418,34 @@ def _handle_repl_command(command_str: str) -> None:
                 out(f"✓ Created Transformer: {str(mid)[:8]}")
                 return
 
+            if sub == "transfer":
+                if len(parts) < 4:
+                    out("✗ Usage: model transfer <backbone> <num_classes> [freeze=true|false] [fine_tune=true|false]")
+                    return
+                backbone = str(parts[2]).strip().lower()
+                num_classes = int(parts[3])
+                freeze_backbone = True
+                fine_tune = False
+                for tok in parts[4:]:
+                    t = str(tok).strip().lower()
+                    if t.startswith("freeze="):
+                        freeze_backbone = t.split("=", 1)[1] in {"1", "true", "yes", "y", "on"}
+                    elif t.startswith("fine_tune="):
+                        fine_tune = t.split("=", 1)[1] in {"1", "true", "yes", "y", "on"}
+                res = cmds.create_transfer_model(
+                    backbone,
+                    num_classes,
+                    freeze_backbone=freeze_backbone,
+                    fine_tune=fine_tune,
+                )
+                if "error" in res:
+                    out(f"✗ Error: {res['error']}")
+                    return
+                mid = res.get("model_id")
+                ctx["current_model"] = mid
+                out(f"✓ Created Transfer: {str(mid)[:8]} ({backbone})")
+                return
+
             out(f"✗ Unknown model command: {sub}")
             return
 
@@ -1176,7 +1495,7 @@ def _render_models_page() -> None:
                     break
             disp = _display_name(full_id) if full_id else mid8
             rows.append({"name": disp, "model_id": mid8, "type": m.get("type")})
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.info("No models yet. Create one in Build & Train.")
 
@@ -1205,13 +1524,17 @@ def _render_models_page() -> None:
     except Exception:
         pass
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         if st.button("Refresh"):
             st.rerun()
     with col_b:
         if st.button("Deselect"):
             ctx["current_model"] = None
+            try:
+                st.query_params.pop("model_id", None)
+            except Exception:
+                pass
             st.rerun()
     with col_c:
         if st.button("Delete selected", disabled=(selected is None)):
@@ -1221,8 +1544,24 @@ def _render_models_page() -> None:
                     st.error(res["error"])
                 else:
                     ctx["current_model"] = None
+                    try:
+                        st.query_params.pop("model_id", None)
+                    except Exception:
+                        pass
                     st.success("Deleted")
                     st.rerun()
+    with col_d:
+        if st.button("Delete all models", disabled=(not model_ids)):
+            deleted_ids = list(cmds.models.keys())
+            for mid in deleted_ids:
+                cmds.delete_model(mid)
+            ctx["current_model"] = None
+            try:
+                st.query_params.pop("model_id", None)
+            except Exception:
+                pass
+            st.success(f"Deleted {len(deleted_ids)} model(s)")
+            st.rerun()
 
     if selected is not None and selected in cmds.models:
         st.subheader("Info")
@@ -1249,10 +1588,62 @@ def _render_models_page() -> None:
         st.subheader("Structure")
         svg = _model_structure_svg_html(cmds.models, selected)
         if svg:
-            if components is not None:
-                components.html(svg, height=560)
+            data_url = "data:text/html;charset=utf-8," + quote(svg)
+            st.iframe(data_url, height=560, width="stretch")
+
+        st.subheader("Explainability (XAI)")
+        st.caption("Upload an image to run prediction and generate a Grad-CAM-style overlay.")
+        xai_up = st.file_uploader("Input image", type=["png", "jpg", "jpeg"], key=f"xai_upload_{selected}")
+        if xai_up is not None:
+            if Image is None:
+                st.error("Pillow is required for image-based XAI preview.")
             else:
-                st.caption("SVG structure diagram unavailable (streamlit.components.v1 not importable).")
+                try:
+                    img = Image.open(io.BytesIO(xai_up.getvalue())).convert("RGB")
+                    img_np = np.asarray(img, dtype=np.uint8)
+                    st.image(img_np, caption="Input", width="stretch")
+
+                    if st.button("Run prediction + XAI", key=f"xai_btn_{selected}"):
+                        md0 = cmds.models.get(selected) or {}
+                        model_obj = None
+                        try:
+                            model_obj = cmds._ensure_model(selected)  # type: ignore[attr-defined]
+                        except Exception:
+                            model_obj = md0.get("model")
+                        if model_obj is None:
+                            st.error("Model reconstruction failed for XAI")
+                            _log_event("ERROR", "XAI failed: model reconstruction", model_id=selected)
+                        else:
+                            overlay, xai_info = _gradcam_like_overlay(img_np, md0, model_obj)
+                            st.image(overlay, caption="Grad-CAM-style overlay", width="stretch")
+
+                            # Best-effort prediction.
+                            pred_msg = "Prediction unavailable"
+                            try:
+                                in_size = _infer_model_input_size(md0)
+                                x = np.asarray(img_np, dtype=np.float32).reshape(-1)
+                                if in_size is not None and int(in_size) > 0:
+                                    n = int(in_size)
+                                    if x.size < n:
+                                        x = np.pad(x, (0, n - x.size), mode="constant")
+                                    elif x.size > n:
+                                        x = x[:n]
+                                x = x.reshape(1, -1)
+                                t = rasptorch.Tensor(x.astype(np.float32), device=str(ctx.get("device", "cpu")))
+                                out = model_obj(t)
+                                out_np = out.numpy() if hasattr(out, "numpy") else np.asarray(out)
+                                out_flat = np.asarray(out_np).reshape(1, -1)
+                                pred_idx = int(np.argmax(out_flat, axis=1)[0])
+                                pred_msg = f"Predicted class index: {pred_idx}"
+                            except Exception as e:
+                                pred_msg = f"Prediction unavailable ({e})"
+
+                            st.info(pred_msg)
+                            st.json(xai_info)
+                            _log_event("INFO", "XAI generated", model_id=selected, prediction=pred_msg)
+                except Exception as e:
+                    st.error(f"XAI failed: {e}")
+                    _log_event("ERROR", "XAI failed", model_id=selected, error=str(e))
 
 
         st.subheader("Save")
@@ -1277,14 +1668,25 @@ def _render_models_page() -> None:
             res = cmds.save_model(selected, tmp_out)
             if "error" in res:
                 st.error(res["error"])
+                _log_event("ERROR", "Model save failed", model_id=selected, error=str(res.get("error")))
             else:
-                data = Path(tmp_out).read_bytes()
-                st.download_button(
-                    "Download",
-                    data=data,
-                    file_name=save_name or f"model_{selected}{dl_ext}",
-                    mime="application/octet-stream",
-                )
+                try:
+                    data = Path(tmp_out).read_bytes()
+                    st.download_button(
+                        "Download",
+                        data=data,
+                        file_name=save_name or f"model_{selected}{dl_ext}",
+                        mime="application/octet-stream",
+                    )
+                    _log_event("INFO", "Model saved for download", model_id=selected, format=res.get("format", "?"))
+                except Exception as e:
+                    st.error(f"Failed preparing download: {e}")
+                    _log_event("ERROR", "Failed preparing model download", model_id=selected, error=str(e))
+                finally:
+                    try:
+                        os.remove(tmp_out)
+                    except Exception:
+                        pass
 
     st.subheader("Load")
     up = st.file_uploader("Load a saved model (.pkl/.pth/.pt)", type=["pkl", "pth", "pt"], accept_multiple_files=False)
@@ -1315,6 +1717,7 @@ def _render_models_page() -> None:
         res = cmds.load_model(tmp_path)
         if "error" in res:
             st.error(res["error"])
+            _log_event("ERROR", "Model load failed", source=up.name, error=str(res.get("error")))
             # If load failed, don't keep cached bytes around.
             cache.pop(upload_sig, None)
         else:
@@ -1332,7 +1735,13 @@ def _render_models_page() -> None:
             if res.get("unsafe_load"):
                 msg += " (unsafe_load=True)"
             st.success(msg)
+            _log_event("INFO", "Model loaded", model_id=ctx.get("current_model"), format=res.get("format", "?"))
             st.rerun()
+
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 
@@ -1395,14 +1804,25 @@ def _render_save_page() -> None:
     res = cmds.save_model(selected, tmp_out)
     if "error" in res:
         st.error(res["error"])
+        _log_event("ERROR", "Model save failed", model_id=selected, error=str(res.get("error")))
         return
-    data = Path(tmp_out).read_bytes()
-    st.download_button(
-        "Download",
-        data=data,
-        file_name=save_name or f"model_{selected}{dl_ext}",
-        mime="application/octet-stream",
-    )
+    try:
+        data = Path(tmp_out).read_bytes()
+        st.download_button(
+            "Download",
+            data=data,
+            file_name=save_name or f"model_{selected}{dl_ext}",
+            mime="application/octet-stream",
+        )
+        _log_event("INFO", "Model saved for download", model_id=selected, format=res.get("format", "?"))
+    except Exception as e:
+        st.error(f"Failed preparing download: {e}")
+        _log_event("ERROR", "Failed preparing model download", model_id=selected, error=str(e))
+    finally:
+        try:
+            os.remove(tmp_out)
+        except Exception:
+            pass
 
 def _render_build_train_page() -> None:
     st.header("Build & Train")
@@ -1423,7 +1843,7 @@ def _render_build_train_page() -> None:
         return f"{_display_name(mid)} — {t}"
 
     st.subheader("Build")
-    model_type = st.selectbox("Model type", options=["MLP", "Linear", "CNN", "GRU", "Transformer"], index=0)
+    model_type = st.selectbox("Model type", options=["MLP", "Linear", "CNN", "GRU", "Transformer", "Transfer"], index=0)
 
     activation_mode = st.radio(
         "Activation mode",
@@ -1464,6 +1884,10 @@ def _render_build_train_page() -> None:
     d_model: int = 0
     heads: int = 0
     t_layers: int = 0
+    transfer_backbone: str = "resnet50"
+    transfer_classes: int = 2
+    transfer_freeze: bool = True
+    transfer_finetune: bool = False
 
     with st.form("build_form"):
         if model_type == "MLP":
@@ -1480,18 +1904,26 @@ def _render_build_train_page() -> None:
             gru_in = int(st.number_input("Input size", min_value=1, value=128, step=1))
             gru_hidden = int(st.number_input("Hidden size", min_value=1, value=256, step=1))
             gru_layers = int(st.number_input("Num layers", min_value=1, value=1, step=1))
-        else:
+        elif model_type == "Transformer":
             vocab = int(st.number_input("Vocab size", min_value=2, value=1000, step=1))
             d_model = int(st.number_input("d_model", min_value=1, value=128, step=1))
             heads = int(st.number_input("Num heads", min_value=1, value=4, step=1))
             t_layers = int(st.number_input("Num layers", min_value=1, value=2, step=1))
+        else:
+            transfer_backbone = st.selectbox("Backbone", options=["resnet50", "vgg16", "mobilenet_v2"], index=0)
+            transfer_classes = int(st.number_input("Num classes", min_value=2, value=2, step=1))
+            col_tf1, col_tf2 = st.columns(2)
+            with col_tf1:
+                transfer_freeze = bool(st.checkbox("Freeze backbone", value=True))
+            with col_tf2:
+                transfer_finetune = bool(st.checkbox("Fine-tune backbone", value=False))
 
         submitted = st.form_submit_button("Create")
 
     if submitted:
         activations = None
         if activation_mode.startswith("Per-layer"):
-            activations = [x.strip() for x in per_layer.split(",") if x.strip()] or None
+            activations = [x.strip() for x in str(per_layer or "").split(",") if x.strip()] or None
         if model_type == "MLP":
             try:
                 layers = _parse_csv_ints(layers_csv)
@@ -1513,8 +1945,15 @@ def _render_build_train_page() -> None:
                 res = {"error": str(e)}
         elif model_type == "GRU":
             res = cmds.create_gru(int(gru_in), int(gru_hidden), int(gru_layers))
-        else:
+        elif model_type == "Transformer":
             res = cmds.create_transformer(int(vocab), int(d_model), int(heads), int(t_layers))
+        else:
+            res = cmds.create_transfer_model(
+                str(transfer_backbone),
+                int(transfer_classes),
+                freeze_backbone=bool(transfer_freeze),
+                fine_tune=bool(transfer_finetune),
+            )
 
         if "error" in res:
             st.error(res["error"])
@@ -1552,6 +1991,55 @@ def _render_build_train_page() -> None:
 
     st.divider()
     st.subheader("Train")
+
+    with st.expander("Dataset Validation & Preprocessing", expanded=False):
+        st.caption("Validate CSV schema/labels and set preprocessing metadata used when saving models.")
+        req_cols = st.text_input("Required columns (CSV)", value="", key="ds_required_cols")
+        label_col = st.text_input("Label column (optional)", value="", key="ds_label_col")
+        img_col = st.text_input("Image path column (optional)", value="", key="ds_img_col")
+        csv_up = st.file_uploader("Dataset CSV (optional)", type=["csv"], key="ds_csv_upload")
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            normalize_mode = st.selectbox("Normalize", options=["none", "dataset"], index=0, key="preproc_normalize")
+        with col_p2:
+            resize_raw = st.text_input("Resize (H,W optional)", value="", key="preproc_resize")
+
+        pipeline = {
+            "normalize": normalize_mode,
+            "resize_hw": None,
+        }
+        rr = str(resize_raw or "").strip()
+        if rr:
+            try:
+                hw = [int(x.strip()) for x in rr.split(",") if x.strip()]
+                if len(hw) == 2 and hw[0] > 0 and hw[1] > 0:
+                    pipeline["resize_hw"] = [int(hw[0]), int(hw[1])]
+            except Exception:
+                st.warning("Resize must be CSV like '224,224'.")
+
+        ctx["preprocessing_pipeline"] = pipeline
+
+        if csv_up is not None and validate_dataset_structure is not None:
+            try:
+                raw_text = csv_up.getvalue().decode("utf-8", errors="replace")
+                rows = list(csv.DictReader(io.StringIO(raw_text)))
+                required = [x.strip() for x in str(req_cols).split(",") if x.strip()]
+                report = validate_dataset_structure(
+                    rows,
+                    required_columns=required,
+                    label_column=(label_col.strip() or None),
+                    image_path_column=(img_col.strip() or None),
+                    check_paths=True,
+                )
+                st.json(report)
+                if report.get("ok"):
+                    _log_event("INFO", "Dataset validation passed", rows=int(report.get("rows", 0)))
+                else:
+                    _log_event("WARNING", "Dataset validation reported issues", report=report)
+            except Exception as e:
+                st.error(f"Dataset validation failed: {e}")
+                _log_event("ERROR", "Dataset validation failed", error=str(e))
     model_ids = list(cmds.models.keys())
     if not model_ids:
         st.info("No models available to train.")
@@ -1602,6 +2090,20 @@ def _render_build_train_page() -> None:
     ctx.setdefault("train_runs", [])
 
     if st.button("Train"):
+        pbar = st.progress(0, text="Starting training...")
+        status = st.empty()
+
+        def _on_progress(ev: Dict[str, Any]) -> None:
+            if not isinstance(ev, dict):
+                return
+            if ev.get("event") == "epoch":
+                i = int(ev.get("epoch", 0))
+                n = max(1, int(ev.get("epochs", 1)))
+                loss_v = float(ev.get("loss", 0.0))
+                frac = min(1.0, max(0.0, i / n))
+                pbar.progress(frac, text=f"Epoch {i}/{n}  loss={loss_v:.6f}")
+                status.caption(f"Elapsed this epoch: {float(ev.get('seconds', 0.0)):.3f}s")
+
         with st.spinner("Training..."):
             res = cmds.train_model(
                 sel,
@@ -1610,13 +2112,16 @@ def _render_build_train_page() -> None:
                 batch_size=int(batch),
                 device=str(device),
                 optimizer_type=str(opt),
+                progress_callback=_on_progress,
             )
+        pbar.progress(1.0, text="Training complete")
         if "error" in res:
             err = res.get("error")
             msg = str(err) if err is not None else ""
             if not msg.strip():
                 msg = "Training failed (no error message returned)."
             st.error(msg)
+            _log_event("ERROR", "Training failed", model_id=sel, error=msg)
             with st.expander("Details"):
                 try:
                     import rasptorch as _rt
@@ -1658,9 +2163,21 @@ def _render_build_train_page() -> None:
                         "batch_size": int(batch),
                         "epochs": int(epochs),
                         "loss": [float(x) for x in hist],
+                        "final_loss": float(res.get("final_loss", 0.0)),
+                        "elapsed_seconds": float(res.get("elapsed_seconds", 0.0)),
+                        "source": "manual",
+                        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     }
                 ])[-10:]
             st.success(f"Done. Final loss: {res.get('final_loss', 0.0):.6f}")
+            _log_event(
+                "INFO",
+                "Training complete",
+                model_id=sel,
+                final_loss=float(res.get("final_loss", 0.0)),
+                elapsed_seconds=float(res.get("elapsed_seconds", 0.0)),
+                epochs=int(epochs),
+            )
             try:
                 trained = ctx.get("trained_models")
                 if not isinstance(trained, list):
@@ -1668,6 +2185,8 @@ def _render_build_train_page() -> None:
                 if sel not in trained:
                     trained.append(sel)
                 ctx["trained_models"] = trained
+                if sel in cmds.models:
+                    cmds.models[sel]["preprocessing"] = dict(ctx.get("preprocessing_pipeline", {}))
             except Exception:
                 pass
 
@@ -1680,13 +2199,129 @@ def _render_build_train_page() -> None:
             st.caption("Train loss (most recent run)")
             st.line_chart(loss)
 
+    with st.expander("Hyperparameter Search", expanded=False):
+        st.caption("Run grid/random search across optimizer, LR, batch size, and epochs.")
+        search_mode = st.selectbox("Search mode", options=["grid", "random"], index=0, key="hp_mode")
+        lr_csv = st.text_input("Learning rates (CSV)", value="0.001,0.0005", key="hp_lrs")
+        batch_csv = st.text_input("Batch sizes (CSV)", value="16,32", key="hp_batches")
+        epoch_csv = st.text_input("Epochs (CSV)", value="3,5", key="hp_epochs")
+        opt_list = st.multiselect("Optimizers", options=OPTIMIZERS, default=[str(ctx.get("optimizer", "Adam"))], key="hp_opts")
+        random_trials = int(st.number_input("Random trials", min_value=1, value=4, step=1, key="hp_trials"))
+
+        def _parse_floats(txt: str, default: List[float]) -> List[float]:
+            vals = []
+            for part in str(txt).split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                vals.append(float(p))
+            return vals or default
+
+        def _parse_ints(txt: str, default: List[int]) -> List[int]:
+            vals = []
+            for part in str(txt).split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                vals.append(int(p))
+            return vals or default
+
+        if st.button("Run Hyperparameter Search", key="hp_run_btn"):
+            try:
+                lrs = _parse_floats(lr_csv, [float(ctx.get("learning_rate", 0.001))])
+                batches = _parse_ints(batch_csv, [int(ctx.get("batch_size", 32))])
+                epochs_list = _parse_ints(epoch_csv, [int(ctx.get("train_epochs", 5))])
+                opts = [str(o) for o in (opt_list or [str(ctx.get("optimizer", "Adam"))])]
+                combos = list(itertools.product(lrs, batches, epochs_list, opts))
+                if not combos:
+                    st.warning("No search combinations were generated.")
+                else:
+                    if search_mode == "random" and len(combos) > random_trials:
+                        combos = random.sample(combos, int(random_trials))
+
+                    prog = st.progress(0, text="Starting search...")
+                    results: List[Dict[str, Any]] = []
+                    for i, (lr0, b0, e0, o0) in enumerate(combos, start=1):
+                        prog.progress(i / len(combos), text=f"Run {i}/{len(combos)}: {o0}, lr={lr0}, b={b0}, e={e0}")
+                        r = cmds.train_model(
+                            sel,
+                            epochs=int(e0),
+                            learning_rate=float(lr0),
+                            batch_size=int(b0),
+                            device=str(device),
+                            optimizer_type=str(o0),
+                        )
+                        if "error" in r:
+                            results.append(
+                                {
+                                    "model_id": sel,
+                                    "optimizer": str(o0),
+                                    "learning_rate": float(lr0),
+                                    "batch_size": int(b0),
+                                    "epochs": int(e0),
+                                    "status": "error",
+                                    "error": str(r.get("error")),
+                                }
+                            )
+                            _log_event("ERROR", "Hyperparameter run failed", model_id=sel, error=str(r.get("error")))
+                        else:
+                            hist0 = r.get("training_history")
+                            loss_series = [float(x) for x in hist0] if isinstance(hist0, list) else []
+                            row = {
+                                "model_id": sel,
+                                "optimizer": str(o0),
+                                "learning_rate": float(lr0),
+                                "batch_size": int(b0),
+                                "epochs": int(e0),
+                                "status": "ok",
+                                "final_loss": float(r.get("final_loss", 0.0)),
+                                "elapsed_seconds": float(r.get("elapsed_seconds", 0.0)),
+                            }
+                            results.append(row)
+                            ctx.setdefault("train_runs", []).append(
+                                {
+                                    "model_id": sel,
+                                    "device": str(device),
+                                    "optimizer": str(o0),
+                                    "learning_rate": float(lr0),
+                                    "batch_size": int(b0),
+                                    "epochs": int(e0),
+                                    "loss": loss_series,
+                                    "final_loss": float(r.get("final_loss", 0.0)),
+                                    "elapsed_seconds": float(r.get("elapsed_seconds", 0.0)),
+                                    "source": "search",
+                                    "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                }
+                            )
+                    prog.progress(1.0, text="Search complete")
+                    ctx["search_runs"] = (ctx.get("search_runs", []) + results)[-200:]
+                    _log_event("INFO", "Hyperparameter search complete", runs=len(results), mode=search_mode)
+                    st.success(f"Search complete: {len(results)} run(s)")
+            except Exception as e:
+                st.error(f"Hyperparameter search failed: {e}")
+                _log_event("ERROR", "Hyperparameter search failed", model_id=sel, error=str(e))
+
+        sr = ctx.get("search_runs", [])
+        if isinstance(sr, list) and sr:
+            st.caption("Search results (latest)")
+            st.dataframe(sr[-50:], width="stretch", hide_index=True)
+            ok_rows = [r for r in sr if isinstance(r, dict) and r.get("status") == "ok" and r.get("final_loss") is not None]
+            if ok_rows:
+                best = min(ok_rows, key=lambda r: float(r.get("final_loss", 1e12)))
+                st.info(
+                    "Best run: "
+                    f"opt={best.get('optimizer')}  lr={best.get('learning_rate')}  "
+                    f"batch={best.get('batch_size')}  epochs={best.get('epochs')}  "
+                    f"final_loss={float(best.get('final_loss', 0.0)):.6f}"
+                )
+
 
 def _render_chat_page() -> None:
     st.header("Chat / REPL")
     st.caption("This is a web version of the rasptorch chat-style CLI. Type commands like `model list` or `train start`.")
 
     if st.button("Show help"):
-        _append_log(HELP_TEXT)
+        _append_log(_chat_repl_help_lines())
 
     log = st.session_state.repl_log
     if log:
@@ -1701,6 +2336,78 @@ def _render_chat_page() -> None:
         _append_log(f"> {cmd}")
         _handle_repl_command(cmd)
         st.rerun()
+
+
+def _render_dashboard_page() -> None:
+    st.header("Comparison Dashboard")
+    ctx = st.session_state.repl_context
+
+    runs = ctx.get("train_runs", [])
+    if not isinstance(runs, list) or not runs:
+        st.info("No training runs yet. Train a model first.")
+        return
+
+    rows: List[Dict[str, Any]] = []
+    for i, r in enumerate(runs, start=1):
+        if not isinstance(r, dict):
+            continue
+        loss_series = r.get("loss") or []
+        final_loss = r.get("final_loss")
+        if final_loss is None and isinstance(loss_series, list) and loss_series:
+            try:
+                final_loss = float(loss_series[-1])
+            except Exception:
+                final_loss = None
+        rows.append(
+            {
+                "run": i,
+                "timestamp": r.get("timestamp", ""),
+                "model_id": str(r.get("model_id", ""))[:8],
+                "source": str(r.get("source", "manual")),
+                "optimizer": r.get("optimizer", ""),
+                "learning_rate": r.get("learning_rate", ""),
+                "batch_size": r.get("batch_size", ""),
+                "epochs": r.get("epochs", ""),
+                "final_loss": final_loss,
+                "elapsed_seconds": r.get("elapsed_seconds", ""),
+                "device": r.get("device", ""),
+            }
+        )
+
+    st.subheader("Runs")
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+    # Side-by-side loss curves.
+    st.subheader("Loss Curves")
+    max_runs = int(st.number_input("Curves to overlay", min_value=1, value=min(6, len(runs)), step=1))
+    selected_runs = runs[-max_runs:]
+    chart_data: Dict[str, List[float]] = {}
+    max_len = 0
+    for idx, run in enumerate(selected_runs, start=1):
+        series = run.get("loss") if isinstance(run, dict) else None
+        if not isinstance(series, list) or not series:
+            continue
+        label = f"run{idx}_{str(run.get('model_id', ''))[:8]}".replace(":", "_")
+        vals = [float(x) for x in series]
+        chart_data[label] = vals
+        max_len = max(max_len, len(vals))
+
+    if chart_data and max_len > 0:
+        # Pad shorter curves with last value for a compact overlay chart.
+        padded: Dict[str, List[float]] = {}
+        for k, vals in chart_data.items():
+            if len(vals) < max_len:
+                vals = vals + [vals[-1]] * (max_len - len(vals))
+            padded[k] = vals
+        st.line_chart(padded)
+
+    ok_rows = [r for r in rows if isinstance(r.get("final_loss"), (int, float))]
+    if ok_rows:
+        best = min(ok_rows, key=lambda x: float(x.get("final_loss", 1e12)))
+        st.success(
+            "Best final loss: "
+            f"run={best.get('run')} model={best.get('model_id')} final_loss={float(best.get('final_loss', 0.0)):.6f}"
+        )
 
 
 def main() -> None:
@@ -1719,10 +2426,14 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Navigation")
+        nav_options = ["Models", "Build & Train", "Dashboard", "Chat/REPL", "Logs"]
+        current_nav = str(st.session_state.get("nav", "Models"))
+        if current_nav not in nav_options:
+            current_nav = "Models"
         nav = st.radio(
             "Page",
-            options=["Models", "Build & Train", "Chat/REPL"],
-            index=["Models", "Build & Train", "Chat/REPL"].index(st.session_state.nav),
+            options=nav_options,
+            index=nav_options.index(current_nav),
             label_visibility="collapsed",
         )
         st.session_state.nav = nav
@@ -1739,8 +2450,10 @@ def main() -> None:
             ok, msg = _try_set_device(str(device_choice))
             if not ok:
                 st.error(msg)
+                _log_event("ERROR", "Device switch failed", requested=str(device_choice), error=msg)
             else:
                 st.success(msg)
+                _log_event("INFO", "Device switched", device=str(ctx.get("device", "cpu")))
 
         ok_vk, reason = _safe_vulkan_status()
         effective_device = str(ctx.get("device", "cpu"))
@@ -1755,6 +2468,7 @@ def main() -> None:
         st.write(f"Selected model: {(mid[:8] if mid else '(none)')}")
         if st.button("Reset session state"):
             st.session_state.repl_log = []
+            st.session_state.app_log = []
             st.session_state.repl_context = {
                 "current_model": None,
                 "train_epochs": 5,
@@ -1762,6 +2476,12 @@ def main() -> None:
                 "learning_rate": 0.001,
                 "optimizer": "Adam",
                 "device": "cpu",
+                "loaded_files": {},
+                "upload_cache": {},
+                "last_loaded_hash": None,
+                "preprocessing_pipeline": {"normalize": "none", "resize_hw": None},
+                "trained_models": [],
+                "search_runs": [],
             }
             st.rerun()
 
@@ -1769,6 +2489,10 @@ def main() -> None:
         _render_models_page()
     elif nav == "Build & Train":
         _render_build_train_page()
+    elif nav == "Dashboard":
+        _render_dashboard_page()
+    elif nav == "Logs":
+        _render_log_viewer()
     else:
         _render_chat_page()
 

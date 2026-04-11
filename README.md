@@ -1,227 +1,173 @@
 # rasptorch
 
-rasptorch is an experimental deep learning library inspired by PyTorch,
-with a specific goal: **make training and running neural networks practical on the
-Raspberry Pi 5 while taking advantage of its GPU**.
+rasptorch is an experimental deep learning library inspired by PyTorch, built around a simple goal: make neural networks practical on a Raspberry Pi 5 while taking advantage of its GPU.
 
-The project has two main parts:
+It ships with three layers that work together:
 
-- A small, NumPy-backed autograd engine and `nn` module that runs on the Raspberry Pi CPU.
-- An experimental Vulkan-based backend, wired through a `device` API
-  (`Tensor(..., device="cpu"|"gpu").to("gpu")`), meant to offload core tensor operations
-  (elementwise ops, matmul, activations, reductions, etc.) to the Pi 5's GPU via Vulkan compute.
+1. A NumPy-backed autograd engine and `nn` module for CPU execution.
+2. An experimental Vulkan backend for GPU tensor operations and GPU-focused training paths.
+3. A chat-style CLI and Streamlit UI for interactive model building, training, persistence, and inspection.
 
-The Vulkan backend is implemented with real Vulkan compute shaders (GLSL
-compiled to SPIR-V). It supports a small but useful set of kernels (see
-`rasptorch/shaders/` for the authoritative list).
+## What’s Included
 
-High-level highlights:
+- Tensor ops: elementwise math, matmul, reductions, indexing, reshaping, stacking, and broadcasting.
+- Neural network layers: `Linear`, `MLP`, `CNN`, `GRU`, `Transformer`, normalization layers, activations, pooling, embeddings, and attention.
+- Training tools: optimizers, learning-rate schedulers, gradient clipping, regularization helpers, and reusable training loops.
+- Persistence: save and load rasptorch checkpoints without requiring `torch`.
+- Interfaces: `rasptorch chat` for REPL-style interaction and `rasptorch ui` for the Streamlit dashboard.
 
-- Elementwise ops: `+`, `*`, `-`, `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu` (plus scalar variants)
-- Matmul: `@` (tiled/shared-memory shader)
-- Tensor helpers: indexing/slicing via `tensor[...]`, `unsqueeze`, `squeeze`, `permute`, `transpose`, `flatten`, `max`, `min`, `argmax`, `argmin`, `cat`, `stack`, `split`, `chunk`
-- Reductions: `sum`, `mean` (global and axis-based on CPU; global on GPU)
-- Common broadcast forms: `(N,M) + (M,)` and `(N,M) * (M,)`
-- Losses: `cross_entropy`, `binary_cross_entropy`, `binary_cross_entropy_with_logits`, `nll_loss`, `smooth_l1_loss`, `label_smoothing_cross_entropy`
-- Optimizers and training utilities: `SGD`, `Adam`, `AdamW`, `RMSProp`, LR schedulers, gradient clipping, regularization helpers
-- NN essentials: GPU row-wise `softmax` / `log_softmax`, 2D `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, `MaxPool2d`, `AvgPool2d`, and `GRU`
-
-Performance notes:
-
-- The fastest path is **compute-only**: keep tensors on GPU and avoid per-iteration
-  `.numpy()` / readbacks.
-- Fusing ops and reusing output buffers can make the Vulkan path **faster than NumPy**
-  for certain workloads on Raspberry Pi 5.
-
-See `main.py` for a simple training example and `gpu_demo.py` for a
-focused correctness + benchmark suite for the Vulkan backend.
-
-## Demos
-
-- Essentials demo (softmax/log_softmax, LayerNorm, Dropout, `no_grad`, `detach`):
-  - CPU: `uv run essentials_demo.py --device cpu`
-  - GPU-autograd (Vulkan): `uv run essentials_demo.py --device gpu`
-
-Note: the Vulkan-backed GPU path requires working Vulkan drivers and `glslc` (shader compiler)
-on your `PATH`. Low-level backend helpers can still fall back to NumPy in some environments,
-but `main.py --device gpu` is expected to run with Vulkan (glslc available) and fails clearly if it is not.
-
-## Modes
-
-There are three execution modes exposed via `main.py --device ...`:
-
-- `cpu`: NumPy autograd engine (PyTorch-like, runs on CPU)
-- `gpu`: explicit Vulkan training path (forward + backward + SGD via purpose-built kernels)
-- `gpu-autograd`: experimental GPU autograd (builds a graph on GPU for a growing but still incomplete set of ops)
-
-## Quickstart
-
-- Use a virtual environment for best results (e.g. `.venv`, `.venv + uv`, `.venv + poetry`).
+The Vulkan path uses real compute shaders compiled to SPIR-V. The supported kernels live in [`rasptorch/shaders/`](rasptorch/shaders/).
 
 ## Installation
 
-From PyPI (CPU-only):
+### From PyPI
 
-- `pip install rasptorch`
-
-GPU (Pi 5 Vulkan):
-
-- `pip install "rasptorch[gpu]"`
-
-Optional (for PyTorch bridge features and interop tooling):
-
-- `pip install "rasptorch[torch]"`
-
-Dev/test:
-
-- `pip install -e ".[dev]"`
-
-Notes for GPU mode:
-
-- Requires working Vulkan drivers on your system.
-- Requires `glslc` (shader compiler) available on PATH (for raspberry pi users).
-
-Quick GPU validation:
-
-- `uv run gpu_demo.py --smoke-only` (
-  - Initializes Vulkan strictly and runs fast correctness checks for core kernels.
-  - If this fails, `uv run main.py --device gpu` will also fail.
-
-Quick model saving check:
-
-- `uv run main.py --device cpu --epochs 1 --save model.pth`
-  - Works without `torch`; checkpoints are saved in a rasptorch NumPy archive format.
-  - Inspect keys: `python -c "from rasptorch.checkpoint import load_checkpoint; print(load_checkpoint('model.pth').keys())"`
-
-For local development from this repo:
-
-- `pip install -e .`
-
-
-### CLI Quickstart
-
-rasptorch includes an **agent-native CLI** for tensor operations, model management, and training:
-
-
+Base install:
 
 ```bash
-# To start it
--- uv run rasptorch chat (uv)
--- rasptorch chat (.venv or standalone python)
-
-# GUI (Streamlit-based)
--- uv run rasptorch ui (uv)
--- rasptorch ui (.venv or standalone python)
--- Access the UI at http://localhost:8501
-
-# Show available commands
-rasptorch --help (if using venv alone: rasptorch --help , if using uv: uv run rasptorch --help [follows for all commands in the markdown files])
-
-# chat
-python rasptorch chat (you can type help once the cli is up and running in chat mode)
-
-# Create tensors
-python rasptorch tensor random --shape 2,3,4
-python rasptorch tensor zeros --shape 3,4
-
-# Manage models
-python rasptorch model list
-python rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
-python rasptorch model convert-legacy --src legacy_model.pth --dst converted_model.pth
-
-# JSON output for scripting/agents
-python rasptorch --json tensor random --shape 2,3,4
+pip install rasptorch
 ```
 
-See rasptorch/rasptorch CLI.md for **complete CLI documentation**, including training, saving/loading models, and agent integration.
+This installs the Python Vulkan bindings used by the GPU backend, but it does not by itself guarantee that the Pi 5 GPU path is available.
 
+The optional `gpu` extra currently maps to the same Vulkan Python dependency.
 
-## GPU Training (Vulkan)
+Development install:
 
-There are currently two “modes” of training in this repo:
+```bash
+pip install -e ".[dev]"
+```
 
-- **CPU autograd training** (PyTorch-like): uses the NumPy-backed autograd engine.
-- **Vulkan GPU training** (explicit kernels): runs forward + backward + SGD updates on GPU
-  using purpose-built compute shaders.
+### Requirements for GPU mode
 
-The Vulkan training path lives in `rasptorch/gpu_training.py` and currently supports a
-2-layer MLP:
+- Raspberry Pi 5 with working Vulkan drivers.
+- `glslc` on your `PATH`.
+- Use the GPU-capable device path (`--device gpu` or `--device auto` when Vulkan is working).
 
-`Linear -> ReLU -> Linear` with MSE loss and SGD.
+If either of those is missing, GPU mode will fail clearly instead of silently pretending to work.
 
-The general `gpu-autograd` path supports substantially more model-building pieces than the
-explicit `gpu` trainer, including adaptive optimizers, additional activations, LayerNorm,
-BatchNorm, Embedding, and MultiheadAttention.
+## Quick Start
 
-Run it via:
+Run the chat REPL:
 
-- `uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.1`
+```bash
+uv run rasptorch chat
+```
 
-Saving weights (`.pth` / `.pt`):
+Launch the UI:
 
-- `uv run main.py --device gpu --epochs 50 --save model.pth`
-- Saved as a rasptorch NumPy archive checkpoint (works without `torch`).
-- Load with `from rasptorch.checkpoint import load_checkpoint`.
+```bash
+uv run rasptorch ui
+```
 
-## GPU Autograd (WIP)
+Open the Streamlit app at `http://localhost:8501` unless you pass a different port.
 
-There is now an experimental **gpu-autograd** mode that enables `loss.backward()` even when
-the model and activations live on GPU, for a limited set of ops.
+Show the top-level CLI help:
 
-Run it via:
+```bash
+uv run rasptorch --help
+```
 
-- `uv run main.py --device gpu-autograd --epochs 50 --batch-size 32 --lr 0.1`
+## Execution Modes
 
-Currently supported (GPU) in autograd:
+`main.py` exposes three training/runtime modes:
 
-- `+`, `*`, `-` (scalar and tensor forms), `@` (matmul)
-- scalar ops: `tensor + s`, `tensor * s`, `tensor / s`, plus `s + tensor`, `s * tensor`, `s - tensor`
-- `neg`, `relu`, `gelu`, `silu`, `leaky_relu`, `elu`, `sigmoid`, `tanh`, `sum`, `mean`, `T` (2D transpose)
-- tensor shape/join helpers: `unsqueeze`, `squeeze`, `flatten`, `permute` (common tensors up to 4D), `transpose(dim0, dim1)`, `cat`, `stack`, `split`, `chunk`
-- axis-based `sum(axis=...)` / `mean(axis=...)` for 2D tensors with `axis=0/1` (GPU-native forward and backward)
-- `functional.softmax` / `functional.log_softmax` (2D row-wise, `dim=-1/1`)
-- `nn.LayerNorm` (2D inputs, 1D `normalized_shape`; `eps=1e-5` stays on GPU, other `eps` values fall back to CPU)
-- `nn.BatchNorm1d`, `nn.BatchNorm2d`, `nn.Embedding`, `nn.MultiheadAttention`
-- `Linear` backward (GPU grads for `weight`/`bias`)
-- `SGD.step()` updates GPU parameters in-place (SGD + optional momentum/weight decay)
-- `Adam.step()`, `AdamW.step()`, `RMSProp.step()` update GPU parameters in-place
-- `functional.cross_entropy(logits, target_onehot)` (softmax cross-entropy, mean reduction)
+- `cpu`: NumPy autograd on the CPU.
+- `gpu`: explicit Vulkan training with purpose-built kernels.
+- `gpu-autograd`: experimental GPU autograd for a growing set of ops.
 
-Also available on the CPU autograd path:
+Examples:
 
-- `GRU` backward
-- `Tensor.__getitem__` / slicing
-- axis-based `sum(axis=...)` / `mean(axis=...)`
-- `max(axis=...)` / `min(axis=...)` with autograd
-- `argmax(axis=...)` / `argmin(axis=...)`
-- `nn.MaxPool2d` / `nn.AvgPool2d`
+```bash
+uv run main.py --device cpu --epochs 10
+uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.1
+uv run main.py --device gpu-autograd --epochs 50 --batch-size 32 --lr 0.1
+```
 
-Also available across the library:
+## CLI Examples
 
-- LR schedulers: `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `ReduceLROnPlateau`, `WarmupScheduler`
-- Initialization helpers: `kaiming_*`, `xavier_*`, `orthogonal_`, `uniform_`, `normal_`, `zeros_`, `ones_`, `constant_`
-- Gradient utilities: `clip_grad_norm_`, `clip_grad_value_`, `l1_regularization`, `l2_regularization`, `total_variation_loss`
-- AMP surface: `rasptorch.amp.autocast()` and `rasptorch.amp.GradScaler`
+Create tensors:
 
-Tip: `rasptorch.no_grad()` exists (like PyTorch) to disable graph building during evaluation.
+```bash
+uv run rasptorch tensor random --shape 2,3,4
+uv run rasptorch tensor zeros --shape 3,4
+uv run rasptorch tensor ones --shape 5,10
+```
 
-## Training Loop Utilities
+Build models:
 
-There is now a small, reusable training loop helper in `rasptorch.train` that provides
-PyTorch-like epoch logs (loss, accuracy/metrics, throughput) for **any** model.
+```bash
+uv run rasptorch model linear --input-size 10 --hidden-sizes "32,16" --output-size 2
+uv run rasptorch model mlp --layers "64,32,16,2"
+uv run rasptorch model cnn --in-channels 3 --out-channels "32,64,128"
+uv run rasptorch model transformer --vocab-size 1000 --d-model 128 --num-heads 4 --num-layers 2
+```
 
-Key pieces:
+Manage models:
 
-- `rasptorch.train.fit(...)`: train loop with optional validation
-- `rasptorch.train.Accuracy()`: top-1 classification accuracy
-- `rasptorch.train.classification_target_one_hot(C, device=...)`: converts integer labels -> one-hot
+```bash
+uv run rasptorch model list
+uv run rasptorch model remove --model-id <model-id>
+uv run rasptorch model save --model-id <model-id> --path model.pth
+uv run rasptorch model load --path model.pth
+uv run rasptorch model combine <model-a> <model-b>
+```
 
-Example (classifier):
+Train a model:
+
+```bash
+uv run rasptorch model train --model-id <model-id> --epochs 10 --lr 0.001 --batch-size 32
+```
+
+Use JSON output for scripting or agents:
+
+```bash
+uv run rasptorch --json tensor zeros --shape 3,4
+```
+
+See [`rasptorch/CLI/rasptorch CLI.md`](rasptorch/CLI/rasptorch%20CLI.md) for the full CLI reference.
+
+## UI Overview
+
+The Streamlit UI is organized around a few focused pages:
+
+- Models: browse, inspect, load, save, delete, and visualize model structure.
+- Build & Train: create models, combine models, run training, and launch hyperparameter search.
+- Dashboard: compare training runs and loss curves.
+- Chat/REPL: use the same chat-style commands as the terminal CLI.
+- Logs: review session events and actions.
+
+The UI also includes dataset validation and preprocessing controls, a persistent log viewer, and a lightweight explainability preview for uploaded images.
+
+## GPU Notes
+
+The fast path is compute-only: keep tensors on GPU and avoid unnecessary `.numpy()` readbacks.
+
+Useful checks:
+
+```bash
+uv run gpu_demo.py --smoke-only
+uv run main.py --device gpu --epochs 1 --save model.pth
+```
+
+The first command validates the Vulkan backend. The second produces a rasptorch checkpoint without needing `torch`.
+
+## Training Utilities
+
+`rasptorch.train` provides a small reusable training loop with optional validation and metrics.
+
+Common pieces:
+
+- `rasptorch.train.fit(...)`
+- `rasptorch.train.Accuracy()`
+- `rasptorch.train.classification_target_one_hot(...)`
+
+Example:
 
 ```python
 from rasptorch import functional as F
-from rasptorch.train import fit, Accuracy, classification_target_one_hot
 from rasptorch.optim import SGD
+from rasptorch.train import Accuracy, classification_target_one_hot, fit
 
 model = ...
 opt = SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
@@ -239,123 +185,58 @@ fit(
 )
 ```
 
-Notes:
+## PyTorch Bridge
 
-- Metrics like accuracy call `.numpy()` on logits, which triggers a GPU readback.
-- `rasptorch.no_grad()` exists; evaluation can avoid building graphs.
-- `mse_loss` is now implemented purely via tensor ops (`(pred-target)^2` + `mean()`), so the
-  loss tensor itself is on GPU in `gpu-autograd` mode; training code typically reads it back
-  via `.numpy()` for logging.
-- Parameters and gradients stay on GPU; **loss is read back to CPU for logging**.
-- `uv run main.py --device gpu` now **requires Vulkan**. If Vulkan init or shader compilation fails, it raises a clear error instead of silently falling back.
-- Broadcasting is still limited; common 2D + 1D row-vector forms like `(N,M) + (M,)` and `(N,M) * (M,)` are supported.
-
-## PyTorch Bridge (Vulkan-Optimized Inference)
-
-`rasptorch.torch_bridge` enables efficient inference of PyTorch models with GPU acceleration:
+`rasptorch.torch_bridge` can convert supported PyTorch inference models so compatible layers run on GPU and unsupported layers fall back to CPU.
 
 ```python
 from rasptorch.torch_bridge import convert_torch_model
 import torch
 
-# Convert a PyTorch model for GPU inference
 torch_model = torch.nn.Sequential(
     torch.nn.Linear(10, 64),
     torch.nn.ReLU(),
-    torch.nn.Linear(64, 10)
+    torch.nn.Linear(64, 10),
 ).eval()
 
 rasp_model = convert_torch_model(torch_model, device="gpu")
-
-# Forward pass: compatible layers run on GPU, unsupported layers fall back to CPU
-x = torch.randn(32, 10, dtype=torch.float32)
-y = rasp_model(x)
 ```
 
-**Key optimizations:**
+## Project Layout
 
-- **Parameter caching**: Model weights are cached as GPU buffers at initialization (one-time cost).
-- **Direct GPU streaming**: Tensor data flows CPU → Vulkan GPU without intermediate numpy materialization.
-- **Zero-copy Vulkan dispatch**: Buffers are reused across kernel invocations.
-- **Automatic layer fallback**: Unsupported layers transparently use CPU.
+- [`rasptorch/`](rasptorch/) - core library modules.
+- [`rasptorch/CLI/`](rasptorch/CLI/) - Click CLI and chat REPL.
+- [`rasptorch/ui/app.py`](rasptorch/ui/app.py) - Streamlit UI.
+- [`rasptorch/shaders/`](rasptorch/shaders/) - Vulkan compute shaders.
+- [`tests/`](tests/) - CPU, CLI, UI, and backend tests.
 
-**Supported layers:** Conv2d, Linear, ReLU, GELU, Sigmoid, Tanh, BatchNorm2d, LayerNorm, MaxPool2d, AvgPool2d, Dropout
+## Development
 
-## Additional APIs
+Run the test suite:
 
-Optimization:
+```bash
+pytest
+```
 
-- `rasptorch.optim`: `SGD`, `Adam`, `AdamW`, `RMSProp`
-- `rasptorch.optim_sched`: `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `ReduceLROnPlateau`, `WarmupScheduler`
+Run the Vulkan smoke test:
 
-Initialization:
+```bash
+uv run gpu_demo.py --smoke-only
+```
 
-- `rasptorch.init`: `kaiming_uniform_`, `kaiming_normal_`, `xavier_uniform_`, `xavier_normal_`, `orthogonal_`, `constant_`, `zeros_`, `ones_`, `uniform_`, `normal_`
+Build packaging artifacts:
 
-Regularization and gradient helpers:
+```bash
+python -m pip install -U build twine
+python -m build
+```
 
-- `rasptorch.utils`: `clip_grad_norm_`, `clip_grad_value_`, `l1_regularization`, `l2_regularization`, `total_variation_loss`
+## Limitations
 
-Tensor helpers:
+- Vulkan support is experimental and focused on the Raspberry Pi 5.
+- GPU autograd coverage is growing, but it is not complete.
+- Some higher-level features still fall back to CPU paths depending on the operation and shape.
 
-- `Tensor.unsqueeze()`, `Tensor.squeeze()`, `Tensor.permute()`, `Tensor.transpose()`, `Tensor.flatten()`
-- `Tensor.split()`, `Tensor.chunk()`
-- `rasptorch.cat(...)`, `rasptorch.stack(...)`
+## License
 
-GPU notes for tensor helpers:
-
-- `unsqueeze`, `squeeze`, and `flatten` are view-based on GPU
-- `cat`, `stack`, `split`, and `chunk` now use Vulkan device-to-device buffer copies
-- `permute` / general `transpose(dim0, dim1)` are Vulkan-native for common tensors up to 4D
-
-More modules:
-
-- `rasptorch.nn`: `BatchNorm1d`, `BatchNorm2d`, `Embedding`, `MultiheadAttention`, `GRU`, `MaxPool2d`, `AvgPool2d`, `GELU`, `SiLU`, `LeakyReLU`, `ELU`
-
-Mixed precision surface:
-
-- `rasptorch.amp.autocast()`
-- `rasptorch.amp.GradScaler`
-- `Tensor.half()` / `Tensor.float()`
-
-## Benchmarks
-
-`gpu_demo.py` prints timing stats (min/p50/p95/mean/std) for:
-
-- CPU (NumPy)
-- GPU compute+readback (includes `.numpy()` every iteration)
-- GPU compute-only (no per-iteration readback)
-- GPU fused compute-only and **no-alloc** variants (preallocated output buffers)
-
-If you want the GPU to win, focus on the compute-only + fused/no-alloc numbers.
-
-## Current Limitations
-
-- GPU autograd for core operations (elementwise, matmul, reductions, most activations) is fully implemented and GPU-native.
-- GPU-native tensor helper coverage is strongest for practical tensors up to 4D; generic higher-rank permutation is not on a dedicated Vulkan path yet.
-- `GRU` autograd is currently CPU-backed; there is no dedicated Vulkan GRU autograd path yet.
-- The mixed-precision API surface exists, but true fp16 Vulkan storage/compute kernels are not implemented yet. `autocast()` and `GradScaler` are currently preparatory/experimental.
-- GPU reductions: global `sum()` / `mean()` are GPU-native, and **2D** axis reductions (`axis=0/1`) are GPU-native for both forward **and backward** (using GPU broadcast operations). For higher-rank `sum(axis=...)` / `mean(axis=...)`, the forward currently uses CPU (then uploads), but the backward gradient broadcasting is GPU-native.
-- PyTorch integration is optimized for Vulkan inference: `rasptorch.torch_bridge` supports 
-  (`Conv2d`, `Linear`, `ReLU`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d`, `LayerNorm`, `Sigmoid`, `Tanh`, `GELU`, `Dropout`). 
-  Model weights are cached as GPU buffers with **no per-forward CPU transfers**. Unsupported layers fall back to CPU automatically.
-- Broadcasting: GPU elementwise `+` / `*` support NumPy-style broadcasting up to 8D for forward. Backward gradient *reduction* for broadcasted operands is GPU-native for ranks up to 8 (the optimized 2D row-vector path remains GPU-native as well).
-
-## Development & Tests
-
-- `pytest` runs CPU tests by default.
-- The backend smoke test runs everywhere:
-  - With Vulkan available, it exercises real GPU kernels.
-  - Without Vulkan, it exercises the NumPy fallback path.
-- For a strict Vulkan-only check, run `uv run gpu_demo.py --smoke-only`.
-
-## Publishing (maintainers)
-
-Build:
-
-- `python -m pip install -U build twine`
-- `python -m build`
-
-Upload PyPI:
-
-- `python -m twine upload dist/*`
+MIT. See [`LICENSE`](LICENSE).

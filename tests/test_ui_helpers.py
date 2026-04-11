@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+import numpy as np
 
 
 def _import_ui_app():
@@ -148,6 +149,37 @@ def test_ui_constants_exist_and_are_nonempty() -> None:
     assert hasattr(ui, "OPTIMIZERS")
     assert isinstance(ui.OPTIMIZERS, list)
     assert "Adam" in ui.OPTIMIZERS
+
+
+def test_ui_help_matches_chat_repl_help() -> None:
+    ui = _import_ui_app()
+    from rasptorch.CLI._cli_chat import ChatREPL
+
+    expected = [line.rstrip() for line in ChatREPL.get_help(ChatREPL.__new__(ChatREPL)).splitlines() if line.strip()]
+    assert ui._chat_repl_help_lines() == expected
+
+
+def test_infer_model_input_size_helper() -> None:
+    ui = _import_ui_app()
+
+    md = {"config": {"feature_size": 1280, "num_classes": 4}}
+    out = ui._infer_model_input_size(md)
+    assert out == 1280
+
+
+def test_gradcam_like_overlay_fallback() -> None:
+    ui = _import_ui_app()
+
+    class _DummyModel:
+        pass
+
+    img = (np.random.RandomState(0).rand(32, 32, 3) * 255.0).astype("uint8")
+    md = {"config": {"input_size": 64}}
+    overlay, info = ui._gradcam_like_overlay(img, md, _DummyModel())
+
+    assert overlay.shape == img.shape
+    assert overlay.dtype == img.dtype
+    assert info.get("xai_method") == "gradcam_style_approx"
 
 
 def test_display_name_with_type_prefers_friendly_name() -> None:

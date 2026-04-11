@@ -4,14 +4,15 @@ from .tensor import Tensor, Parameter, cat, stack, no_grad, enable_grad, set_gra
 from .optim import SGD, Adam, AdamW, RMSProp
 from .optim_sched import StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, ReduceLROnPlateau, WarmupScheduler
 from .amp import autocast, GradScaler
-from . import nn, functional, data, train, optim, optim_sched, init, utils, amp
+from .gpu_training import GpuMLP
+from . import nn, functional, data, train, optim, optim_sched, init, utils, amp, data_validation
 from . import torch_bridge
 
 
 try:
 	__version__ = version("rasptorch")
 except PackageNotFoundError:  # pragma: no cover
-	__version__ = "3.0.0"
+	__version__ = "latest"
 
 __all__ = [
 	"Tensor",
@@ -34,6 +35,7 @@ __all__ = [
 	"WarmupScheduler",
 	"autocast",
 	"GradScaler",
+	"GpuMLP",
 	"__version__",
 	"nn",
 	"functional",
@@ -44,5 +46,6 @@ __all__ = [
 	"init",
 	"utils",
 	"amp",
+	"data_validation",
 	"torch_bridge",
 ]

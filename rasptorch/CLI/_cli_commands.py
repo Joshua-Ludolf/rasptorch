@@ -6,13 +6,17 @@ This module re-exports from the implementation module.
 from __future__ import annotations
 
 
-from typing import Any, Dict, Tuple, List, Optional
+from typing import Any, Dict, Tuple, List, Optional, Callable
+from pathlib import PurePosixPath
+import re
+import hashlib
 import numpy as np
 import rasptorch
 import os
 import tempfile
 import uuid
 import json
+import time
 
 from rasptorch.checkpoint import convert_legacy_torch_checkpoint, load_checkpoint, save_checkpoint
 
@@ -443,6 +447,20 @@ class ModelCommands:
                 in_size = input_size if i == 0 else hidden_size
                 layers.append(rasptorch.nn.Linear(in_size, hidden_size * 3))
             return rasptorch.nn.Sequential(*layers)
+        elif model_type == "Transfer":
+            backbone = str(config.get("backbone", "resnet50")).lower()
+            feat_size = int(config.get("feature_size") or 512)
+            num_classes = int(config.get("num_classes") or 2)
+            hidden = max(64, feat_size // 2)
+            if backbone.startswith("vgg"):
+                hidden = max(128, feat_size // 2)
+            elif backbone.startswith("mobilenet"):
+                hidden = max(64, feat_size // 3)
+            return rasptorch.nn.Sequential(
+                rasptorch.nn.Linear(feat_size, hidden),
+                rasptorch.nn.ReLU(),
+                rasptorch.nn.Linear(hidden, num_classes),
+            )
         else:
             return None
 
@@ -561,6 +579,11 @@ class ModelCommands:
                     in_features = int(config.get("vocab_size"))
                 if "d_model" in config:
                     out_features = int(config.get("d_model"))
+            elif model_type == "Transfer":
+                if "feature_size" in config:
+                    in_features = int(config.get("feature_size"))
+                if "num_classes" in config:
+                    out_features = int(config.get("num_classes"))
             elif model_type == "Combined":
                 # Prefer stored metadata if present.
                 if "input_size" in config:
@@ -991,6 +1014,72 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
+    def create_transfer_model(
+        self,
+        backbone: str,
+        num_classes: int,
+        *,
+        freeze_backbone: bool = True,
+        fine_tune: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a transfer-learning style classifier head.
+
+        This uses a lightweight rasptorch-native surrogate backbone descriptor
+        and a trainable classifier head so it can run without PyTorch.
+        """
+        try:
+            b = str(backbone).strip().lower()
+            presets = {
+                "resnet50": 2048,
+                "vgg16": 4096,
+                "mobilenet_v2": 1280,
+            }
+            if b not in presets:
+                return {"error": f"Unsupported backbone: {backbone}"}
+            feat_size = int(presets[b])
+            classes = int(num_classes)
+            if classes <= 1:
+                return {"error": "num_classes must be > 1"}
+
+            hidden = max(128, feat_size // 4)
+            model = rasptorch.nn.Sequential(
+                rasptorch.nn.Linear(feat_size, hidden),
+                rasptorch.nn.ReLU(),
+                rasptorch.nn.Linear(hidden, classes),
+            )
+            model_id = str(uuid.uuid4())[:8]
+
+            model_data = {
+                "model_id": model_id,
+                "model": model,
+                "type": "Transfer",
+                "config": {
+                    "backbone": b,
+                    "feature_size": feat_size,
+                    "num_classes": classes,
+                    "freeze_backbone": bool(freeze_backbone),
+                    "fine_tune": bool(fine_tune),
+                    # Alias to simplify existing input-size inference in training.
+                    "input_size": feat_size,
+                    "output_size": classes,
+                },
+            }
+            self._save_session_model(model_id, model_data)
+            return {
+                "status": "success",
+                "model_id": model_id,
+                "type": "Transfer",
+                "architecture": {
+                    "backbone": b,
+                    "feature_size": feat_size,
+                    "num_classes": classes,
+                    "freeze_backbone": bool(freeze_backbone),
+                    "fine_tune": bool(fine_tune),
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
     def create_lora_adapter(self, model_id: str, rank: int = 8, alpha: float = 16.0) -> Dict[str, Any]:
         """Create LoRA adapter."""
         if model_id not in self.models:
@@ -1129,15 +1218,22 @@ class ModelCommands:
             state_dict = model.state_dict()
 
             clean_config = self._strip_redundant_activation(model_data.get("config", {}) or {})
+            preprocessing = model_data.get("preprocessing", {}) or {}
 
             save_data = {
                 "model_type": model_data.get("type", "Unknown"),
                 "config": clean_config,
+                "preprocessing": preprocessing,
                 "state_dict": state_dict,
+                "schema_version": 2,
             }
 
-            ext = os.path.splitext(str(safe_path))[1].lower()
-            if ext in {".pth", ".pt"}:
+            # Determine save format from the user-supplied path extension.
+            # This is used only to select the serialisation method; all file
+            # operations below use ``safe_path`` which is entirely hash-derived
+            # and does not contain any user-controlled data.
+            user_ext = os.path.splitext(os.path.basename(path or ""))[1].lower()
+            if user_ext in {".pth", ".pt"}:
                 save_checkpoint(safe_path, save_data)
                 fmt = "rasptorch-npz"
             else:
@@ -1158,12 +1254,12 @@ class ModelCommands:
             return {"error": str(e)}
 
     def _resolve_model_save_path(self, path: str) -> str:
-        """Resolve a user-supplied model save path to a safe absolute path.
+        """Resolve a user-supplied model save path to a safe, hash-derived storage path.
 
         All user-provided paths (including those coming from the UI/CLI) are
-        confined to the shared ``rasptorch_models`` directory under the system
-        temporary directory.  Absolute paths are rejected outright; relative
-        paths are normalized and symlink-resolved via ``_resolve_model_path``.
+        validated and then hashed so that the returned path contains no
+        user-controlled data.  Absolute paths are rejected outright; relative
+        paths are validated and hashed via ``_resolve_model_path``.
         """
         raw = (path or "").strip()
         if not raw:
@@ -1177,11 +1273,14 @@ class ModelCommands:
         return self._resolve_model_path(raw)
 
     def _resolve_model_path(self, path: str) -> str:
-        """Resolve a user-provided model path into a confined, normalized path.
+        """Resolve a user-provided model path into a safe, hash-derived storage path.
 
-        The resulting path is guaranteed to reside within a dedicated models
-        directory under the system temporary directory. Absolute paths and
-        paths that escape this directory are rejected.
+        The user-supplied path is validated against an allowlist of safe characters
+        and then hashed with SHA-256.  The returned path is constructed entirely
+        from the trusted base directory and the hash digest, so it does *not*
+        contain any user-controlled data.  This prevents path-injection
+        vulnerabilities while keeping the mapping deterministic (save and load
+        of the same name resolve to the same on-disk location).
         """
         raw = (path or "").strip()
         if not raw:
@@ -1189,25 +1288,31 @@ class ModelCommands:
         if os.path.isabs(raw):
             raise ValueError("Absolute model paths are not allowed")
 
+        # Validate untrusted input early: only allow safe relative segments.
+        # Normalize backslashes to forward slashes for consistent parsing.
+        raw_posix = raw.replace("\\", "/")
+        p = PurePosixPath(raw_posix)
+        if p.is_absolute():
+            raise ValueError("Absolute model paths are not allowed")
+        allowed_segment = re.compile(r"^[A-Za-z0-9._ -]+$")
+        for part in p.parts:
+            if part in {"", ".", ".."}:
+                raise ValueError("Invalid model path segment")
+            if not allowed_segment.fullmatch(part):
+                raise ValueError("Model path contains unsupported characters")
+
         # Base directory where models are stored.
         base_dir = os.path.join(tempfile.gettempdir(), "rasptorch_models")
         os.makedirs(base_dir, exist_ok=True)
         # Use realpath to resolve any symlinks in the base directory itself.
         base_dir_real = os.path.realpath(base_dir)
 
-        # Resolve symlinks in the candidate path to guard against symlink escapes.
-        candidate = os.path.realpath(os.path.join(base_dir_real, raw))
-
-        # Ensure the candidate path is within base_dir.
-        try:
-            common = os.path.commonpath([base_dir_real, candidate])
-        except ValueError:
-            # Different drives on Windows, etc.
-            raise ValueError("Invalid model path")
-        if common != base_dir_real:
-            raise ValueError("Model path escapes allowed directory")
-
-        return candidate
+        # Hash the validated path to obtain a storage key that is entirely
+        # independent of the user-supplied value.  SHA-256 output is a fixed
+        # 64-character hex string that cannot contain path-traversal sequences,
+        # so it is safe to use directly as a filename component.
+        name_hash = hashlib.sha256(raw_posix.encode("utf-8", errors="replace")).hexdigest()
+        return os.path.join(base_dir_real, name_hash)
 
     def _safe_torch_load(self, path: str) -> Dict[str, Any]:
         """Safely load a torch checkpoint, using weights_only=True to avoid
@@ -1257,31 +1362,45 @@ class ModelCommands:
         """Load model from file."""
         try:
             safe_path = self._resolve_model_path(path)
-            ext = os.path.splitext(str(safe_path))[1].lower()
-            if ext in {".pth", ".pt"}:
-                try:
-                    save_data = load_checkpoint(safe_path)
-                    fmt = "rasptorch-npz"
-                except Exception:
-                    # Backward compatibility: allow safe torch checkpoint loads when torch is available.
-                    try:
-                        save_data = self._safe_torch_load(safe_path)
-                        fmt = "torch"
-                    except Exception as e:
-                        return {"error": str(e)}
-            else:
-                # Use JSON for non-torch model files to avoid unsafe pickle deserialization.
+            if not os.path.exists(safe_path):
+                return {"error": f"Model file not found: {path}"}
+
+            # Try loading formats in order: rasptorch checkpoint (NPZ), JSON,
+            # then pickle.  We do not rely on the file extension of ``safe_path``
+            # because the on-disk filename is now a SHA-256 hash and therefore
+            # carries no format information.
+            save_data: Any = None
+            fmt: str = "pickle"
+
+            try:
+                save_data = load_checkpoint(safe_path)
+                fmt = "rasptorch-npz"
+            except Exception:
+                pass
+
+            if save_data is None:
                 try:
                     with open(safe_path, "r", encoding="utf-8") as f:
                         save_data = json.load(f)
+                    fmt = "json"
+                except Exception:
+                    pass
+
+            if save_data is None:
+                try:
+                    import pickle
+                    with open(safe_path, "rb") as f:
+                        save_data = pickle.load(f)
+                    fmt = "pickle"
                 except Exception as e:
-                    return {"error": f"Failed to load JSON model file: {e}"}
-                if not isinstance(save_data, dict):
-                    return {"error": "Unexpected model file format: expected JSON object"}
-                fmt = "json"
+                    return {"error": f"Failed to load model file in any supported format (rasptorch-npz, JSON, or pickle): {e}"}
+
+            if not isinstance(save_data, dict):
+                return {"error": "Unexpected model file format: expected object payload"}
 
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
+            preprocessing = save_data.get("preprocessing", {})
             state_dict = self._state_dict_to_numpy(save_data.get("state_dict", {}))
 
             model_id = str(uuid.uuid4())[:8]
@@ -1289,6 +1408,7 @@ class ModelCommands:
                 "model": None,
                 "type": model_type,
                 "config": config,
+                "preprocessing": preprocessing,
                 "state_dict": state_dict,
             }
 
@@ -1325,10 +1445,17 @@ class ModelCommands:
         batch_size: int = 32,
         device: str = "cpu",
         optimizer_type: str = "Adam",
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Train a model."""
         if model_id not in self.models:
             return {"error": f"Model {model_id} not found"}
+        if int(epochs) <= 0:
+            return {"error": "epochs must be > 0"}
+        if int(batch_size) <= 0:
+            return {"error": "batch_size must be > 0"}
+        if float(learning_rate) <= 0:
+            return {"error": "learning_rate must be > 0"}
         
         try:
             model_data = self.models[model_id]
@@ -1400,8 +1527,30 @@ class ModelCommands:
             label_shape = tuple(int(s) for s in y_probe.shape)
             
             training_history = []
+            epoch_times = []
+            t_train_start = time.perf_counter()
+
+            def _emit_progress(payload: Dict[str, Any]) -> None:
+                if progress_callback is None:
+                    return
+                try:
+                    progress_callback(payload)
+                except Exception:
+                    # Progress reporting should never interrupt training.
+                    pass
+
+            _emit_progress(
+                {
+                    "event": "start",
+                    "model_id": model_id,
+                    "epochs": int(epochs),
+                    "device": str(device),
+                    "optimizer": str(optimizer_type),
+                }
+            )
             
             for epoch in range(epochs):
+                epoch_start = time.perf_counter()
                 # Generate random batch
                 X_batch = rasptorch.Tensor(
                     np.random.randn(*input_shape).astype(np.float32),
@@ -1435,9 +1584,33 @@ class ModelCommands:
                 else:
                     loss_value = float(loss_np)
                 training_history.append(loss_value)
+                elapsed_epoch = float(time.perf_counter() - epoch_start)
+                epoch_times.append(elapsed_epoch)
+
+                _emit_progress(
+                    {
+                        "event": "epoch",
+                        "model_id": model_id,
+                        "epoch": int(epoch + 1),
+                        "epochs": int(epochs),
+                        "loss": float(loss_value),
+                        "seconds": elapsed_epoch,
+                    }
+                )
             
             # Save updated model
             self._save_session_model(model_id, model_data)
+            total_seconds = float(time.perf_counter() - t_train_start)
+
+            _emit_progress(
+                {
+                    "event": "done",
+                    "model_id": model_id,
+                    "epochs": int(epochs),
+                    "final_loss": float(training_history[-1]) if training_history else 0.0,
+                    "seconds": total_seconds,
+                }
+            )
             
             return {
                 "status": "success",
@@ -1448,6 +1621,8 @@ class ModelCommands:
                 "optimizer": optimizer_type,
                 "final_loss": float(training_history[-1]) if training_history else 0.0,
                 "training_history": training_history,
+                "epoch_times": epoch_times,
+                "elapsed_seconds": total_seconds,
             }
         except Exception as e:
             import traceback
@@ -1455,6 +1630,9 @@ class ModelCommands:
             msg = str(e) if e is not None else ""
             if not msg.strip():
                 msg = f"{type(e).__name__}: {repr(e)}"
+            lo = msg.lower()
+            if "out of memory" in lo or "memoryerror" in lo:
+                msg = "Training failed due to memory pressure (possible OOM). Try smaller batch size or CPU device."
             tb = traceback.format_exc(limit=8)
             return {
                 "error": msg,

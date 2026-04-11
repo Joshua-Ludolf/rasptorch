@@ -8,7 +8,32 @@ from .data import DataLoader, TensorDataset
 
 
 class GpuMLP:
-    def __init__(self, in_features: int, hidden: int, out_features: int, *, seed: int = 0) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        hidden: int,
+        out_features: int,
+        *,
+        seed: int = 0,
+        strict: bool = False,
+        optimizer: str = "sgd",
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+    ) -> None:
+        # Vulkan is optional; when strict=False we allow a CPU fallback.
+        vk.init(strict=bool(strict))
+
+        opt = str(optimizer).lower().strip()
+        if opt not in {"sgd", "adam"}:
+            raise ValueError(f"Unsupported optimizer for GpuMLP: {optimizer}")
+        self.optimizer = opt
+        self.lr = float(lr)
+        self.betas = (float(betas[0]), float(betas[1]))
+        self.eps = float(eps)
+        self.weight_decay = float(weight_decay)
+        self._adam_step = 0
         self.in_features = int(in_features)
         self.hidden = int(hidden)
         self.out_features = int(out_features)
@@ -37,6 +62,26 @@ class GpuMLP:
         self._grad_b2 = vk.empty((self.out_features,))
         self._grad_w1 = vk.empty((self.in_features, self.hidden))
         self._grad_b1 = vk.empty((self.hidden,))
+
+        # Adam state (allocated lazily if needed)
+        self._m_w1 = None
+        self._v_w1 = None
+        self._m_b1 = None
+        self._v_b1 = None
+        self._m_w2 = None
+        self._v_w2 = None
+        self._m_b2 = None
+        self._v_b2 = None
+
+        if self.optimizer == "adam":
+            self._m_w1 = vk.zeros_like(self.w1)
+            self._v_w1 = vk.zeros_like(self.w1)
+            self._m_b1 = vk.zeros_like(self.b1)
+            self._v_b1 = vk.zeros_like(self.b1)
+            self._m_w2 = vk.zeros_like(self.w2)
+            self._v_w2 = vk.zeros_like(self.w2)
+            self._m_b2 = vk.zeros_like(self.b2)
+            self._v_b2 = vk.zeros_like(self.b2)
 
     def _get_batch_buffers(self, batch: int) -> dict[str, vk.VulkanBuffer]:
         batch = int(batch)
@@ -97,10 +142,37 @@ class GpuMLP:
         vk.free(self._grad_w1)
         vk.free(self._grad_b1)
 
-    def train_step(self, x_np: np.ndarray, y_np: np.ndarray, *, lr: float) -> float:
+        # Free Adam state buffers if allocated
+        for buf in (
+            self._m_w1,
+            self._v_w1,
+            self._m_b1,
+            self._v_b1,
+            self._m_w2,
+            self._v_w2,
+            self._m_b2,
+            self._v_b2,
+        ):
+            if buf is not None:
+                vk.free(buf)
+
+    def __enter__(self) -> "GpuMLP":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
+        self.close()
+
+    def train_step(self, x_np: np.ndarray, y_np: np.ndarray, *, lr: float | None = None) -> float:
         x_np = np.asarray(x_np, dtype=np.float32)
         y_np = np.asarray(y_np, dtype=np.float32)
         bufs = self._get_batch_buffers(x_np.shape[0])
+
+        lr_eff = float(self.lr if lr is None else lr)
 
         # Upload batch into preallocated buffers.
         vk.write(bufs["x"], x_np)
@@ -132,11 +204,70 @@ class GpuMLP:
         vk.matmul_at_b_out(bufs["x"], bufs["dZ1"], self._grad_w1)  # [in, hidden]
         vk.reduce_sum_rows_out(bufs["dZ1"], self._grad_b1)  # [hidden]
 
-        # SGD update (in-place)
-        vk.sgd_update_inplace(self.w2, self._grad_w2, lr)
-        vk.sgd_update_inplace(self.b2, self._grad_b2, lr)
-        vk.sgd_update_inplace(self.w1, self._grad_w1, lr)
-        vk.sgd_update_inplace(self.b1, self._grad_b1, lr)
+        if self.optimizer == "adam":
+            self._adam_step += 1
+            beta1, beta2 = self.betas
+            bc1 = 1.0 - beta1 ** self._adam_step
+            bc2 = 1.0 - beta2 ** self._adam_step
+
+            vk.adam_update_inplace(
+                self.w2,
+                self._grad_w2,
+                self._m_w2,
+                self._v_w2,
+                lr=lr_eff,
+                beta1=beta1,
+                beta2=beta2,
+                eps=self.eps,
+                bias_correction1=bc1,
+                bias_correction2=bc2,
+                weight_decay=self.weight_decay,
+            )
+            vk.adam_update_inplace(
+                self.b2,
+                self._grad_b2,
+                self._m_b2,
+                self._v_b2,
+                lr=lr_eff,
+                beta1=beta1,
+                beta2=beta2,
+                eps=self.eps,
+                bias_correction1=bc1,
+                bias_correction2=bc2,
+                weight_decay=self.weight_decay,
+            )
+            vk.adam_update_inplace(
+                self.w1,
+                self._grad_w1,
+                self._m_w1,
+                self._v_w1,
+                lr=lr_eff,
+                beta1=beta1,
+                beta2=beta2,
+                eps=self.eps,
+                bias_correction1=bc1,
+                bias_correction2=bc2,
+                weight_decay=self.weight_decay,
+            )
+            vk.adam_update_inplace(
+                self.b1,
+                self._grad_b1,
+                self._m_b1,
+                self._v_b1,
+                lr=lr_eff,
+                beta1=beta1,
+                beta2=beta2,
+                eps=self.eps,
+                bias_correction1=bc1,
+                bias_correction2=bc2,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            # SGD update (in-place)
+            vk.sgd_update_inplace(self.w2, self._grad_w2, lr_eff)
+            vk.sgd_update_inplace(self.b2, self._grad_b2, lr_eff)
+            vk.sgd_update_inplace(self.w1, self._grad_w1, lr_eff)
+            vk.sgd_update_inplace(self.b1, self._grad_b1, lr_eff)
         vk.end_batch()
 
         return loss
