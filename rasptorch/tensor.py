@@ -11,6 +11,13 @@ from . import vulkan_backend as vk
 ArrayLike = Any
 
 
+def _normalize_device(device: str) -> str:
+    d = str(device).lower().strip()
+    if d in {"vulkan", "vk"}:
+        return "gpu"
+    return d
+
+
 def _is_number(x: object) -> bool:
     return isinstance(x, (int, float, np.floating, np.integer))
 
@@ -121,6 +128,7 @@ class Tensor:
         device: str = "cpu",
         _vkbuf: "vk.VulkanBuffer | None" = None,
     ) -> None:
+        device = _normalize_device(device)
         if isinstance(data, Tensor):
             data = data.data
 
@@ -1606,6 +1614,7 @@ class Tensor:
     # Device handling
     def to(self, device: str) -> "Tensor":
         """Return a copy of this Tensor on the given device."""
+        device = _normalize_device(device)
         if device == self.device:
             return self
 
@@ -1641,6 +1650,7 @@ class Parameter(Tensor):
         super().__init__(data, requires_grad=True, device=device, _vkbuf=_vkbuf)
 
     def to(self, device: str) -> "Parameter":
+        device = _normalize_device(device)
         if device == self.device:
             return self
         if device == "cpu":

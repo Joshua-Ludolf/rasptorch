@@ -6,13 +6,14 @@ This module re-exports from the implementation module.
 from __future__ import annotations
 
 
-from typing import Any, Dict, Tuple, List, Optional
+from typing import Any, Dict, Tuple, List, Optional, Callable
 import numpy as np
 import rasptorch
 import os
 import tempfile
 import uuid
 import json
+import time
 
 from rasptorch.checkpoint import convert_legacy_torch_checkpoint, load_checkpoint, save_checkpoint
 
@@ -443,6 +444,20 @@ class ModelCommands:
                 in_size = input_size if i == 0 else hidden_size
                 layers.append(rasptorch.nn.Linear(in_size, hidden_size * 3))
             return rasptorch.nn.Sequential(*layers)
+        elif model_type == "Transfer":
+            backbone = str(config.get("backbone", "resnet50")).lower()
+            feat_size = int(config.get("feature_size") or 512)
+            num_classes = int(config.get("num_classes") or 2)
+            hidden = max(64, feat_size // 2)
+            if backbone.startswith("vgg"):
+                hidden = max(128, feat_size // 2)
+            elif backbone.startswith("mobilenet"):
+                hidden = max(64, feat_size // 3)
+            return rasptorch.nn.Sequential(
+                rasptorch.nn.Linear(feat_size, hidden),
+                rasptorch.nn.ReLU(),
+                rasptorch.nn.Linear(hidden, num_classes),
+            )
         else:
             return None
 
@@ -561,6 +576,11 @@ class ModelCommands:
                     in_features = int(config.get("vocab_size"))
                 if "d_model" in config:
                     out_features = int(config.get("d_model"))
+            elif model_type == "Transfer":
+                if "feature_size" in config:
+                    in_features = int(config.get("feature_size"))
+                if "num_classes" in config:
+                    out_features = int(config.get("num_classes"))
             elif model_type == "Combined":
                 # Prefer stored metadata if present.
                 if "input_size" in config:
@@ -991,6 +1011,72 @@ class ModelCommands:
         except Exception as e:
             return {"error": str(e)}
 
+    def create_transfer_model(
+        self,
+        backbone: str,
+        num_classes: int,
+        *,
+        freeze_backbone: bool = True,
+        fine_tune: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a transfer-learning style classifier head.
+
+        This uses a lightweight rasptorch-native surrogate backbone descriptor
+        and a trainable classifier head so it can run without PyTorch.
+        """
+        try:
+            b = str(backbone).strip().lower()
+            presets = {
+                "resnet50": 2048,
+                "vgg16": 4096,
+                "mobilenet_v2": 1280,
+            }
+            if b not in presets:
+                return {"error": f"Unsupported backbone: {backbone}"}
+            feat_size = int(presets[b])
+            classes = int(num_classes)
+            if classes <= 1:
+                return {"error": "num_classes must be > 1"}
+
+            hidden = max(128, feat_size // 4)
+            model = rasptorch.nn.Sequential(
+                rasptorch.nn.Linear(feat_size, hidden),
+                rasptorch.nn.ReLU(),
+                rasptorch.nn.Linear(hidden, classes),
+            )
+            model_id = str(uuid.uuid4())[:8]
+
+            model_data = {
+                "model_id": model_id,
+                "model": model,
+                "type": "Transfer",
+                "config": {
+                    "backbone": b,
+                    "feature_size": feat_size,
+                    "num_classes": classes,
+                    "freeze_backbone": bool(freeze_backbone),
+                    "fine_tune": bool(fine_tune),
+                    # Alias to simplify existing input-size inference in training.
+                    "input_size": feat_size,
+                    "output_size": classes,
+                },
+            }
+            self._save_session_model(model_id, model_data)
+            return {
+                "status": "success",
+                "model_id": model_id,
+                "type": "Transfer",
+                "architecture": {
+                    "backbone": b,
+                    "feature_size": feat_size,
+                    "num_classes": classes,
+                    "freeze_backbone": bool(freeze_backbone),
+                    "fine_tune": bool(fine_tune),
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
     def create_lora_adapter(self, model_id: str, rank: int = 8, alpha: float = 16.0) -> Dict[str, Any]:
         """Create LoRA adapter."""
         if model_id not in self.models:
@@ -1129,11 +1215,14 @@ class ModelCommands:
             state_dict = model.state_dict()
 
             clean_config = self._strip_redundant_activation(model_data.get("config", {}) or {})
+            preprocessing = model_data.get("preprocessing", {}) or {}
 
             save_data = {
                 "model_type": model_data.get("type", "Unknown"),
                 "config": clean_config,
+                "preprocessing": preprocessing,
                 "state_dict": state_dict,
+                "schema_version": 2,
             }
 
             ext = os.path.splitext(str(safe_path))[1].lower()
@@ -1142,6 +1231,7 @@ class ModelCommands:
                 fmt = "rasptorch-npz"
             else:
                 import pickle
+                os.makedirs(os.path.dirname(safe_path), exist_ok=True)
                 with open(safe_path, "wb") as f:
                     pickle.dump(save_data, f)
                 fmt = "pickle"
@@ -1257,6 +1347,8 @@ class ModelCommands:
         """Load model from file."""
         try:
             safe_path = self._resolve_model_path(path)
+            if not os.path.exists(safe_path):
+                return {"error": f"Model file not found: {path}"}
             ext = os.path.splitext(str(safe_path))[1].lower()
             if ext in {".pth", ".pt"}:
                 try:
@@ -1270,18 +1362,25 @@ class ModelCommands:
                     except Exception as e:
                         return {"error": str(e)}
             else:
-                # Use JSON for non-torch model files to avoid unsafe pickle deserialization.
+                # Prefer JSON for non-torch model files, but support legacy pickle files.
                 try:
                     with open(safe_path, "r", encoding="utf-8") as f:
                         save_data = json.load(f)
+                    fmt = "json"
                 except Exception as e:
-                    return {"error": f"Failed to load JSON model file: {e}"}
+                    try:
+                        import pickle
+                        with open(safe_path, "rb") as f:
+                            save_data = pickle.load(f)
+                        fmt = "pickle"
+                    except Exception as e2:
+                        return {"error": f"Failed to load model file as JSON ({e}) or pickle ({e2})"}
                 if not isinstance(save_data, dict):
-                    return {"error": "Unexpected model file format: expected JSON object"}
-                fmt = "json"
+                    return {"error": "Unexpected model file format: expected object payload"}
 
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
+            preprocessing = save_data.get("preprocessing", {})
             state_dict = self._state_dict_to_numpy(save_data.get("state_dict", {}))
 
             model_id = str(uuid.uuid4())[:8]
@@ -1289,6 +1388,7 @@ class ModelCommands:
                 "model": None,
                 "type": model_type,
                 "config": config,
+                "preprocessing": preprocessing,
                 "state_dict": state_dict,
             }
 
@@ -1325,10 +1425,17 @@ class ModelCommands:
         batch_size: int = 32,
         device: str = "cpu",
         optimizer_type: str = "Adam",
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """Train a model."""
         if model_id not in self.models:
             return {"error": f"Model {model_id} not found"}
+        if int(epochs) <= 0:
+            return {"error": "epochs must be > 0"}
+        if int(batch_size) <= 0:
+            return {"error": "batch_size must be > 0"}
+        if float(learning_rate) <= 0:
+            return {"error": "learning_rate must be > 0"}
         
         try:
             model_data = self.models[model_id]
@@ -1400,8 +1507,30 @@ class ModelCommands:
             label_shape = tuple(int(s) for s in y_probe.shape)
             
             training_history = []
+            epoch_times = []
+            t_train_start = time.perf_counter()
+
+            def _emit_progress(payload: Dict[str, Any]) -> None:
+                if progress_callback is None:
+                    return
+                try:
+                    progress_callback(payload)
+                except Exception:
+                    # Progress reporting should never interrupt training.
+                    pass
+
+            _emit_progress(
+                {
+                    "event": "start",
+                    "model_id": model_id,
+                    "epochs": int(epochs),
+                    "device": str(device),
+                    "optimizer": str(optimizer_type),
+                }
+            )
             
             for epoch in range(epochs):
+                epoch_start = time.perf_counter()
                 # Generate random batch
                 X_batch = rasptorch.Tensor(
                     np.random.randn(*input_shape).astype(np.float32),
@@ -1435,9 +1564,33 @@ class ModelCommands:
                 else:
                     loss_value = float(loss_np)
                 training_history.append(loss_value)
+                elapsed_epoch = float(time.perf_counter() - epoch_start)
+                epoch_times.append(elapsed_epoch)
+
+                _emit_progress(
+                    {
+                        "event": "epoch",
+                        "model_id": model_id,
+                        "epoch": int(epoch + 1),
+                        "epochs": int(epochs),
+                        "loss": float(loss_value),
+                        "seconds": elapsed_epoch,
+                    }
+                )
             
             # Save updated model
             self._save_session_model(model_id, model_data)
+            total_seconds = float(time.perf_counter() - t_train_start)
+
+            _emit_progress(
+                {
+                    "event": "done",
+                    "model_id": model_id,
+                    "epochs": int(epochs),
+                    "final_loss": float(training_history[-1]) if training_history else 0.0,
+                    "seconds": total_seconds,
+                }
+            )
             
             return {
                 "status": "success",
@@ -1448,6 +1601,8 @@ class ModelCommands:
                 "optimizer": optimizer_type,
                 "final_loss": float(training_history[-1]) if training_history else 0.0,
                 "training_history": training_history,
+                "epoch_times": epoch_times,
+                "elapsed_seconds": total_seconds,
             }
         except Exception as e:
             import traceback
@@ -1455,6 +1610,9 @@ class ModelCommands:
             msg = str(e) if e is not None else ""
             if not msg.strip():
                 msg = f"{type(e).__name__}: {repr(e)}"
+            lo = msg.lower()
+            if "out of memory" in lo or "memoryerror" in lo:
+                msg = "Training failed due to memory pressure (possible OOM). Try smaller batch size or CPU device."
             tb = traceback.format_exc(limit=8)
             return {
                 "error": msg,

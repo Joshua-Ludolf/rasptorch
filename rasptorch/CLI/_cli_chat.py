@@ -390,6 +390,7 @@ MODEL BUILDERS:
     model cnn [args]             Create CNN (args or interactive)
     model gru [args]             Create GRU (args or interactive)
     model transformer [args]     Create Transformer (args or interactive)
+    model transfer [args]        Create a transfer-learning classifier head
     model lora [args]            Create LoRA adapter (args or interactive)
 
 MODEL MANAGEMENT:
@@ -497,7 +498,7 @@ Type 'help <command>' for more details.
         """Print help for specific command."""
         helps = {
             "tensor": "tensor create|zeros|ones <shape> - Create tensors",
-            "model": "model mlp|linear|cnn|gru|transformer|lora <args> - Create/manage models (interactive if args omitted)",
+            "model": "model mlp|linear|cnn|gru|transformer|transfer|lora|combine|list|info|use|select|deselect|remove|remove-all <args> - Create/manage models (interactive if args omitted)",
             "train": "train epochs|batch-size|start - Configure and start training",
             "optimizer": "optimizer create|set-lr - Configure optimizer",
             "device": "device cpu|gpu|status - Set compute device (GPU requires Vulkan)",
@@ -563,7 +564,7 @@ Type 'help <command>' for more details.
     def _handle_model_command(self, args: List[str]):
         """Handle model operations."""
         if not args:
-            print("✗ Usage: model mlp|linear|cnn|gru|transformer|lora|combine|list|info|use|select|deselect|remove|remove-all <args>")
+            print("✗ Usage: model mlp|linear|cnn|gru|transformer|transfer|lora|combine|list|info|use|select|deselect|remove|remove-all <args>")
             return
         
         subcmd = args[0].lower()
