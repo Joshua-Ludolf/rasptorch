@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple, List, Optional, Callable
 from pathlib import PurePosixPath
 import re
+import hashlib
 import numpy as np
 import rasptorch
 import os
@@ -1227,13 +1228,17 @@ class ModelCommands:
                 "schema_version": 2,
             }
 
-            ext = os.path.splitext(str(safe_path))[1].lower()
-            if ext in {".pth", ".pt"}:
+            # Determine save format from the user-supplied path extension.
+            # This is used only to select the serialisation method; all file
+            # operations below use ``safe_path`` which is entirely hash-derived
+            # and does not contain any user-controlled data.
+            user_basename = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+            user_ext = os.path.splitext(user_basename)[1].lower()
+            if user_ext in {".pth", ".pt"}:
                 save_checkpoint(safe_path, save_data)
                 fmt = "rasptorch-npz"
             else:
                 import pickle
-                os.makedirs(os.path.dirname(safe_path), exist_ok=True)
                 with open(safe_path, "wb") as f:
                     pickle.dump(save_data, f)
                 fmt = "pickle"
@@ -1250,12 +1255,12 @@ class ModelCommands:
             return {"error": str(e)}
 
     def _resolve_model_save_path(self, path: str) -> str:
-        """Resolve a user-supplied model save path to a safe absolute path.
+        """Resolve a user-supplied model save path to a safe, hash-derived storage path.
 
         All user-provided paths (including those coming from the UI/CLI) are
-        confined to the shared ``rasptorch_models`` directory under the system
-        temporary directory.  Absolute paths are rejected outright; relative
-        paths are normalized and symlink-resolved via ``_resolve_model_path``.
+        validated and then hashed so that the returned path contains no
+        user-controlled data.  Absolute paths are rejected outright; relative
+        paths are validated and hashed via ``_resolve_model_path``.
         """
         raw = (path or "").strip()
         if not raw:
@@ -1269,11 +1274,14 @@ class ModelCommands:
         return self._resolve_model_path(raw)
 
     def _resolve_model_path(self, path: str) -> str:
-        """Resolve a user-provided model path into a confined, normalized path.
+        """Resolve a user-provided model path into a safe, hash-derived storage path.
 
-        The resulting path is guaranteed to reside within a dedicated models
-        directory under the system temporary directory. Absolute paths and
-        paths that escape this directory are rejected.
+        The user-supplied path is validated against an allowlist of safe characters
+        and then hashed with SHA-256.  The returned path is constructed entirely
+        from the trusted base directory and the hash digest, so it does *not*
+        contain any user-controlled data.  This prevents path-injection
+        vulnerabilities while keeping the mapping deterministic (save and load
+        of the same name resolve to the same on-disk location).
         """
         raw = (path or "").strip()
         if not raw:
@@ -1300,19 +1308,12 @@ class ModelCommands:
         # Use realpath to resolve any symlinks in the base directory itself.
         base_dir_real = os.path.realpath(base_dir)
 
-        # Resolve symlinks in the candidate path to guard against symlink escapes.
-        candidate = os.path.realpath(os.path.join(base_dir_real, str(p)))
-
-        # Ensure the candidate path is within base_dir.
-        try:
-            common = os.path.commonpath([base_dir_real, candidate])
-        except ValueError:
-            # Different drives on Windows, etc.
-            raise ValueError("Invalid model path")
-        if common != base_dir_real:
-            raise ValueError("Model path escapes allowed directory")
-
-        return candidate
+        # Hash the validated path to obtain a storage key that is entirely
+        # independent of the user-supplied value.  SHA-256 output is a fixed
+        # 64-character hex string that cannot contain path-traversal sequences,
+        # so it is safe to use directly as a filename component.
+        name_hash = hashlib.sha256(raw_posix.encode("utf-8", errors="replace")).hexdigest()
+        return os.path.join(base_dir_real, name_hash)
 
     def _safe_torch_load(self, path: str) -> Dict[str, Any]:
         """Safely load a torch checkpoint, using weights_only=True to avoid
@@ -1364,34 +1365,39 @@ class ModelCommands:
             safe_path = self._resolve_model_path(path)
             if not os.path.exists(safe_path):
                 return {"error": f"Model file not found: {path}"}
-            ext = os.path.splitext(str(safe_path))[1].lower()
-            if ext in {".pth", ".pt"}:
-                try:
-                    save_data = load_checkpoint(safe_path)
-                    fmt = "rasptorch-npz"
-                except Exception:
-                    # Backward compatibility: allow safe torch checkpoint loads when torch is available.
-                    try:
-                        save_data = self._safe_torch_load(safe_path)
-                        fmt = "torch"
-                    except Exception as e:
-                        return {"error": str(e)}
-            else:
-                # Prefer JSON for non-torch model files, but support legacy pickle files.
+
+            # Try loading formats in order: rasptorch checkpoint (NPZ), JSON,
+            # then pickle.  We do not rely on the file extension of ``safe_path``
+            # because the on-disk filename is now a SHA-256 hash and therefore
+            # carries no format information.
+            save_data: Any = None
+            fmt: str = "unknown"
+
+            try:
+                save_data = load_checkpoint(safe_path)
+                fmt = "rasptorch-npz"
+            except Exception:
+                pass
+
+            if save_data is None:
                 try:
                     with open(safe_path, "r", encoding="utf-8") as f:
                         save_data = json.load(f)
                     fmt = "json"
+                except Exception:
+                    pass
+
+            if save_data is None:
+                try:
+                    import pickle
+                    with open(safe_path, "rb") as f:
+                        save_data = pickle.load(f)
+                    fmt = "pickle"
                 except Exception as e:
-                    try:
-                        import pickle
-                        with open(safe_path, "rb") as f:
-                            save_data = pickle.load(f)
-                        fmt = "pickle"
-                    except Exception as e2:
-                        return {"error": f"Failed to load model file as JSON ({e}) or pickle ({e2})"}
-                if not isinstance(save_data, dict):
-                    return {"error": "Unexpected model file format: expected object payload"}
+                    return {"error": f"Failed to load model file: {e}"}
+
+            if not isinstance(save_data, dict):
+                return {"error": "Unexpected model file format: expected object payload"}
 
             model_type = save_data.get("model_type", "Unknown")
             config = save_data.get("config", {})
