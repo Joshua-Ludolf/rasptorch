@@ -2411,7 +2411,18 @@ def _handle_repl_command(command_str: str) -> None:
                 if len(parts) < 3:
                     out("✗ Usage: model load <path>")
                     return
-                res = cmds.load_model(parts[2])
+                raw_path = (parts[2] or "").strip()
+                if not raw_path:
+                    out("✗ Error: Model path must not be empty")
+                    return
+                if os.path.isabs(raw_path):
+                    out("✗ Error: Absolute model paths are not allowed")
+                    return
+                normalized_rel = os.path.normpath(raw_path)
+                if normalized_rel in ("", ".") or ".." in normalized_rel.split(os.sep):
+                    out("✗ Error: Invalid model path")
+                    return
+                res = cmds.load_model(normalized_rel)
                 if "error" in res:
                     out(f"✗ Error: {res['error']}")
                     return
