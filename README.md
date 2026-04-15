@@ -1,4 +1,4 @@
-# 🦀 rasptorch 🦀
+# 🍓🎇 rasptorch
 
 rasptorch is an experimental deep learning library inspired by PyTorch, built with a singular focus: **making complex neural networks practical and efficient to run on resource-constrained hardware like the Raspberry Pi 5, by leveraging its GPU capabilities via Vulkan.**
 
