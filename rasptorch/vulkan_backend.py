@@ -1756,7 +1756,8 @@ def force_cpu(reason: str = "Forced CPU mode by user") -> None:
             ctx.shutdown()
         finally:
             _CTX = None
-    _VULKAN_DISABLED_REASON = reason
+    if _HAS_VULKAN:
+        _VULKAN_DISABLED_REASON = reason
 
 
 def _ctx() -> _VulkanContext:
