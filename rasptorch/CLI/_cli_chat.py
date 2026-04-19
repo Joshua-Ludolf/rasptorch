@@ -39,17 +39,21 @@ class ChatREPL:
         self.history_file = os.path.expanduser("~/.rasptorch_history")
         self.session: Optional[PromptSession] = None
         resolved_device = "cpu"
+        active_backend = "cpu"
         if _HAS_RASPTORCH:
             try:
-                from .utils import resolve_device
+                from .utils import resolve_backend, backend_device
 
-                resolved_device = resolve_device(device)
+                active_backend = resolve_backend("auto")
+                resolved_device = backend_device(active_backend)
             except Exception:
                 resolved_device = "cpu"
+                active_backend = "cpu"
         self.context: Dict[str, Any] = {
             "train_epochs": 5,
             "batch_size": 32,
             "device": resolved_device,
+            "backend": ("numpy" if active_backend == "cpu" else active_backend),
             "optimizer": "Adam",
             "learning_rate": 0.001,
         }
@@ -418,10 +422,11 @@ TRAINING:
     train lr <value>             Set learning rate
   train start                  Start training
 
-DEVICE:
-  device cpu                   Use CPU for operations
-  device gpu                   Use Vulkan GPU for operations
-  device status                Show current device
+BACKEND:
+  backend list                 List supported backends + availability
+  backend <name>               Alias of: backend use <name>
+  backend use <name>           Connect backend (numpy|vulkan|opencl|cuda|auto)
+  backend status               Show active backend
 
 UTILITY:
   info                         Show version & environment
@@ -488,7 +493,11 @@ Type 'help <command>' for more details.
             self._handle_optimizer_command(parts[1:])
         
         elif cmd == "device":
-            self._handle_device_command(parts[1:])
+            print("ℹ️ Device selection is deprecated. Use: backend use <name> or backend status")
+            self._handle_backend_command(["status"])
+
+        elif cmd == "backend":
+            self._handle_backend_command(parts[1:])
         
         else:
             print(f"✗ Command not recognized: {cmd}")
@@ -501,27 +510,45 @@ Type 'help <command>' for more details.
             "model": "model mlp|linear|cnn|gru|transformer|transfer|lora|combine|list|info|use|select|deselect|remove|remove-all <args> - Create/manage models (interactive if args omitted)",
             "train": "train epochs|batch-size|start - Configure and start training",
             "optimizer": "optimizer create|set-lr - Configure optimizer",
-            "device": "device cpu|gpu|status - Set compute device (GPU requires Vulkan)",
+            "backend": "backend list|use|status - Manage active backend adapter",
             "info": "info - Show system information",
         }
         print(helps.get(subcommand, f"No help available for {subcommand}"))
+
+    def _backend_api(self):
+        from ..backend import available_backends, connect_backend, get_backend
+
+        return available_backends, connect_backend, get_backend
+
+    @staticmethod
+    def _backend_label(name: str) -> str:
+        return "numpy" if str(name) == "cpu" else str(name)
 
     def _cmd_info(self):
         """Show system info."""
         try:
             import rasptorch
             from .. import vulkan_backend as vk
+            from ..utils import backend_device, backend_device_label
 
-            active_device = "gpu (Vulkan)" if vk.using_vulkan() else "cpu"
+            _available_backends, _connect_backend, _get_backend = self._backend_api()
+            active_backend_raw = _get_backend().name
+            active_backend = self._backend_label(active_backend_raw)
+            active_device = backend_device_label(active_backend_raw)
+            self.context["backend"] = active_backend
+            self.context["device"] = backend_device(active_backend_raw)
 
             print(f"rasptorch version: {rasptorch.__version__}")
             print(f"numpy version: {np.__version__}")
-            if vk.using_vulkan():
+            if active_backend == "vulkan" and vk.using_vulkan():
                 print("vulkan: ✓ Using GPU")
+            elif vk.is_available():
+                print("vulkan: ✓ Available (not selected)")
             else:
                 print("vulkan: ✗ Not using GPU")
 
             print(f"device: {active_device}")
+            print(f"backend: {active_backend}")
 
         except Exception as e:
             print(f"✗ Error: {e}")
@@ -1040,9 +1067,12 @@ Type 'help <command>' for more details.
         
         if subcmd == "cpu":
             self.context["device"] = "cpu"
+            self.context["backend"] = "cpu"
             try:
+                from .. import connect_backend
                 from .. import vulkan_backend as vk
 
+                connect_backend("cpu", strict=False)
                 vk.force_cpu()
                 print("✓ Device set to CPU")
             except Exception:
@@ -1050,8 +1080,10 @@ Type 'help <command>' for more details.
         
         elif subcmd == "gpu":
             try:
+                from .. import connect_backend
                 from .. import vulkan_backend as vk
 
+                connect_backend("vulkan", strict=False)
                 vk.init(strict=True)
             except Exception as e:
                 print("✗ Vulkan GPU init failed; staying on CPU")
@@ -1068,21 +1100,95 @@ Type 'help <command>' for more details.
                 return
 
             self.context["device"] = "gpu"
+            self.context["backend"] = "vulkan"
             print("✓ Device set to: GPU (Vulkan)")
         
         elif subcmd == "status":
             try:
-                from .. import vulkan_backend as vk
+                from ..utils import backend_device, backend_device_label
 
-                if vk.using_vulkan():
-                    print("device: gpu (Vulkan)")
-                else:
-                    print("device: cpu")
-            except Exception as e:
+                _available_backends, _connect_backend, _get_backend = self._backend_api()
+                backend_name_raw = _get_backend().name
+                backend_name = self._backend_label(backend_name_raw)
+                device_name = backend_device_label(backend_name_raw)
+                self.context["backend"] = backend_name
+                self.context["device"] = backend_device(backend_name_raw)
+                print(f"device: {device_name}")
+                print(f"backend: {backend_name}")
+            except Exception:
                 print("device: cpu")
+                print("backend: cpu")
         
         else:
             print(f"✗ Unknown device command: {subcmd}")
+
+    def _handle_backend_command(self, args: List[str]):
+        """Handle backend selection and status."""
+        if not args:
+            print("✗ Usage: backend list|use <name>|status")
+            return
+
+        subcmd = str(args[0]).lower()
+        try:
+            _available_backends, connect_backend, get_backend = self._backend_api()
+        except Exception as e:
+            print(f"✗ Backend system unavailable: {e}")
+            return
+
+        if subcmd == "list":
+            avail = _available_backends()
+            active = self._backend_label(get_backend().name)
+            print(f"active backend: {active}")
+            for name in sorted(avail.keys()):
+                mark = "✓" if avail[name] else "✗"
+                print(f"  {mark} {self._backend_label(name)}")
+            return
+
+        if subcmd == "status":
+            try:
+                from ..utils import backend_device
+
+                active_raw = get_backend().name
+                active = self._backend_label(active_raw)
+                self.context["backend"] = active
+                self.context["device"] = backend_device(active_raw)
+                print(f"backend: {active}")
+            except Exception as e:
+                print(f"✗ {e}")
+            return
+
+        if subcmd == "use" or subcmd in {"cpu", "numpy", "vulkan", "opencl", "cuda", "auto"}:
+            requested = subcmd if subcmd != "use" else (str(args[1]).lower() if len(args) >= 2 else "")
+            if not requested:
+                print("✗ Usage: backend use <numpy|vulkan|opencl|cuda|auto>")
+                return
+            requested = str(requested).lower()
+            if requested not in {"cpu", "numpy", "vulkan", "opencl", "cuda", "auto"}:
+                print(f"✗ Unknown backend: {requested}")
+                return
+            try:
+                from ..utils import backend_device
+
+                target = "cpu" if requested == "numpy" else requested
+                if target == "auto":
+                    active = connect_backend("vulkan", strict=False).name
+                else:
+                    # Explicit selections should not silently fall back.
+                    active = connect_backend(target, strict=True).name
+                self.context["backend"] = self._backend_label(active)
+                self.context["device"] = backend_device(active)
+                print(f"✓ Active backend: {self._backend_label(active)}")
+            except Exception as e:
+                print(f"✗ {e}")
+            return
+
+        if subcmd == "use":
+            if len(args) < 2:
+                print("✗ Usage: backend use <numpy|vulkan|opencl|cuda|auto>")
+                return
+            return
+
+        print(f"✗ Unknown backend command: {subcmd}")
 
     def display_table(self, headers: List[str], rows: List[List[str]]):
         """Display formatted table."""

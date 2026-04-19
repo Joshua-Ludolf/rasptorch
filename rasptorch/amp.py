@@ -9,11 +9,13 @@ _compute_dtype: str = "float32"
 
 
 def get_compute_dtype() -> str:
+    """Get the current compute dtype for operations, which may be affected by autocast context."""
     return _compute_dtype
 
 
 @contextmanager
 def autocast(dtype: str = "float16"):
+    """A context manager to temporarily set the compute dtype for operations, allowing for automatic mixed precision."""
     global _compute_dtype
     prev = _compute_dtype
     _compute_dtype = str(dtype)
@@ -24,6 +26,7 @@ def autocast(dtype: str = "float16"):
 
 
 class GradScaler:
+    """A simple gradient scaler for automatic mixed precision training, which scales the loss to prevent underflow in float16 and unscales gradients before the optimizer step. It also implements dynamic scaling based on whether inf/nan values are found in the gradients."""
     def __init__(
         self,
         init_scale: float = 65536.0,

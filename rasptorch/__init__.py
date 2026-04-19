@@ -5,6 +5,7 @@ from .optim import SGD, Adam, AdamW, RMSProp
 from .optim_sched import StepLR, MultiStepLR, ExponentialLR, CosineAnnealingLR, ReduceLROnPlateau, WarmupScheduler
 from .amp import autocast, GradScaler
 from .gpu_training import GpuMLP
+from .backend import backend_manager, connect_backend, get_backend, available_backends
 from . import nn, functional, data, train, optim, optim_sched, init, utils, amp, data_validation
 from . import torch_bridge
 
@@ -36,6 +37,10 @@ __all__ = [
 	"autocast",
 	"GradScaler",
 	"GpuMLP",
+	"backend_manager",
+	"connect_backend",
+	"get_backend",
+	"available_backends",
 	"__version__",
 	"nn",
 	"functional",

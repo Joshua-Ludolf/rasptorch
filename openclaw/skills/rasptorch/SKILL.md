@@ -15,10 +15,12 @@ Use this skill when you need to operate **rasptorch** from an OpenClaw agent by 
 ## Command rule
 
 - Prefer JSON output: always pass `--json` when returning results to the user/agent.
-- Prefer explicit device selection:
-  - `--device auto` (default): use GPU when Vulkan is working, else CPU
-  - `--device gpu`: force GPU (will error / fall back depending on Vulkan availability)
-  - `--device cpu`: force CPU
+- Prefer explicit backend selection:
+  - `--backend auto` (default): choose best available backend
+  - `--backend vulkan`: prefer Vulkan backend
+  - `--backend opencl`: use OpenCL backend
+  - `--backend cuda`: use CUDA backend (CuPy or PyTorch CUDA provider)
+  - `--backend numpy`: CPU backend (internal key: `cpu`)
 
 ## How to run the CLI
 
@@ -52,14 +54,14 @@ Key fields:
 ### Create tensors
 
 ```bash
-rasptorch --json tensor random --shape 2,3,4 --device cpu --dtype float32
+rasptorch --json --backend numpy tensor random --shape 2,3,4 --device cpu --dtype float32
 rasptorch --json tensor zeros  --shape 3,4   --device auto
-rasptorch --json tensor ones   --shape 5,10  --device gpu
+rasptorch --json --backend vulkan tensor ones --shape 5,10 --device gpu
 ```
 
 Notes:
 - Keep shapes small unless the user explicitly requests large workloads.
-- Prefer `--device auto` unless the user asks to force CPU/GPU.
+- Prefer `--backend auto` unless the user asks to pin a specific backend.
 
 ## Model workflows (stateful)
 

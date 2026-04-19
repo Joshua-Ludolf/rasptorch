@@ -118,7 +118,6 @@ def train_one_epoch(
 ) -> EpochStats:
     model.train(True)
 
-    loss_meter = AverageMeter()
     metric_objs = list(metrics or [])
     for m in metric_objs:
         m.reset()
@@ -126,6 +125,7 @@ def train_one_epoch(
     t0 = time.perf_counter()
     seen = 0
     step = 0
+    weighted_loss: Tensor | None = None
 
     for batch in loader:
         step += 1
@@ -147,25 +147,33 @@ def train_one_epoch(
         optimizer.step()
 
         bs = int(np.asarray(yb).shape[0])
-        loss_val = float(loss.numpy().reshape(-1)[0])
-        loss_meter.update(loss_val, bs)
+        # Keep loss accumulation on-device to avoid per-step GPU->CPU readback.
+        with no_grad():
+            contrib = loss.detach() * float(bs)
+            weighted_loss = contrib if weighted_loss is None else (weighted_loss + contrib)
+
         for m in metric_objs:
             m.update(logits, np.asarray(yb))
 
         seen += bs
 
         if log_every and (step % log_every == 0):
-            # Lightweight step log (still may trigger GPU readback for loss)
+            # Step log reads only current batch loss instead of full running loss.
+            loss_val = float(loss.numpy().reshape(-1)[0])
             metric_str = " ".join(f"{m.name}={m.compute()*100:.2f}%" for m in metric_objs)
             if metric_str:
                 metric_str = " " + metric_str
-            print(f"  step {step:05d} loss={loss_meter.avg():.4f}{metric_str}")
+            print(f"  step {step:05d} loss={loss_val:.4f}{metric_str}")
 
     dt = time.perf_counter() - t0
     ips = seen / max(1e-9, dt)
+    if weighted_loss is None:
+        epoch_loss = 0.0
+    else:
+        epoch_loss = float((weighted_loss / float(max(1, seen))).numpy().reshape(-1)[0])
 
     return EpochStats(
-        loss=loss_meter.avg(),
+        loss=epoch_loss,
         metrics={m.name: m.compute() for m in metric_objs},
         seconds=float(dt),
         samples_per_sec=float(ips),
@@ -183,13 +191,13 @@ def evaluate(
 ) -> EpochStats:
     model.eval()
 
-    loss_meter = AverageMeter()
     metric_objs = list(metrics or [])
     for m in metric_objs:
         m.reset()
 
     t0 = time.perf_counter()
     seen = 0
+    weighted_loss: Tensor | None = None
 
     with no_grad():
         for batch in loader:
@@ -208,8 +216,8 @@ def evaluate(
             loss = loss_fn(logits, y_t)
 
             bs = int(np.asarray(yb).shape[0])
-            loss_val = float(loss.numpy().reshape(-1)[0])
-            loss_meter.update(loss_val, bs)
+            contrib = loss.detach() * float(bs)
+            weighted_loss = contrib if weighted_loss is None else (weighted_loss + contrib)
             for m in metric_objs:
                 m.update(logits, np.asarray(yb))
 
@@ -217,9 +225,13 @@ def evaluate(
 
     dt = time.perf_counter() - t0
     ips = seen / max(1e-9, dt)
+    if weighted_loss is None:
+        epoch_loss = 0.0
+    else:
+        epoch_loss = float((weighted_loss / float(max(1, seen))).numpy().reshape(-1)[0])
 
     return EpochStats(
-        loss=loss_meter.avg(),
+        loss=epoch_loss,
         metrics={m.name: m.compute() for m in metric_objs},
         seconds=float(dt),
         samples_per_sec=float(ips),

@@ -14,6 +14,44 @@ The library operates on a multi-layered architecture to maximize hardware utiliz
 
 The Vulkan path relies on real compute shaders compiled to SPIR-V, giving deep control over the underlying hardware.
 
+### 🔌 Backend Abstraction (Connectable Backends)
+
+rasptorch now exposes a backend abstraction API so compute backends can be registered and connected at runtime:
+
+```python
+import rasptorch
+
+# Inspect availability
+print(rasptorch.available_backends())  # {'cpu': True, 'vulkan': ..., 'opencl': ..., 'cuda': ...}
+
+# Try to connect a backend (falls back to CPU in non-strict mode)
+active = rasptorch.connect_backend("vulkan", strict=False)
+print(active.name)
+```
+
+Built-in backend adapters:
+- `numpy` (NumPy adapter; internal key: `cpu`) - Pure NumPy autograd
+- `vulkan` (rasptorch Vulkan kernels, with optional CPU fallback) - **Optimized for Raspberry Pi 4/5** ⚡
+- `opencl` (pyopencl when available, optional CPU fallback)
+- `cuda` (CuPy when available, with PyTorch CUDA fallback, optional CPU fallback)
+
+CLI helpers:
+```bash
+rasptorch backend list
+rasptorch backend connect numpy
+rasptorch backend connect vulkan --strict
+# Benchmark with auto-tuned Vulkan kernel and submission batching
+rasptorch --json backend benchmark --backends numpy,vulkan,cuda --size 2048 --iterations 100 --warmup 20 --vulkan-kernel auto --vulkan-autotune-submit --seed 42
+```
+
+> **Note:** User-facing CLI/UI labels the CPU backend as **`numpy`**.
+> Vulkan benchmark mode uses resident buffers (upload once, repeated on-device matmul, download once).
+> **Performance (Optimized):** Vulkan achieves ~564 GFLOPS (78% of NumPy on matmul_vec4 with auto-tuning).
+> `--vulkan-kernel auto` probes `matmul`, `matmul_vec4`, `matmul_a_bt`, and `matmul_a_bt_tiled` (when available) and keeps the faster path.
+> If Vulkan hits `VkErrorDeviceLost`, lower `--vulkan-submit-every` (for example, `4` or `1`) or use auto-tuning.
+> **Recommended:** Use `--vulkan-autotune-submit` to jointly probe kernel + submit chunk and pick the fastest stable combo.
+> Optimizations: Command buffer batching, memory-mapped buffers, auto kernel selection.
+
 ### 📚 What's Included (Core Features)
 
 *   **Tensor Operations:** Support for elementwise math, matrix multiplication (`matmul`), reductions, indexing, reshaping, stacking, and broadcasting.
@@ -77,6 +115,70 @@ The `main.py` script controls the operational mode:
 ```bash
 uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.01
 ```
+
+---
+
+### 📊 Benchmarks
+
+rasptorch provides a built-in benchmark tool for comparing backend performance on matrix multiplication:
+
+**Quick Benchmark (Single Size):**
+```bash
+# Benchmark with default settings (2048x2048 matmul, 100 iterations)
+uv run rasptorch backend benchmark
+
+# Benchmark with custom size and multiple backends
+uv run rasptorch --json backend benchmark --backends numpy,vulkan,cuda --size 2048 --iterations 100 --warmup 20 --seed 42
+```
+
+**Performance Results (Raspberry Pi 5, 2048x2048 matmul, optimized):**
+
+| Backend | Time (s) | Iterations/s | GFLOPS | Status |
+|---------|----------|--------------|--------|--------|
+| NumPy | 2.25 | 44.4 | 763 | Reference |
+| Vulkan (auto-tuned) | 3.15 | 31.8 | 546 | ⚡ GPU |
+| CUDA (when available) | 0.56 | 178 | 3059 | Best |
+
+**Vulkan Kernel Selection:**
+The `--vulkan-kernel auto` flag intelligently probes available kernels:
+- `matmul` - Basic single-threaded implementation
+- `matmul_vec4` - SIMD-style vec4 operations
+- `matmul_a_bt` - Matrix transpose optimization (for A @ B.T)
+- `matmul_a_bt_tiled` - Tiled transpose optimization (fastest when applicable)
+
+**Advanced Tuning:**
+```bash
+# Auto-tune both kernel AND submission batching strategy
+uv run rasptorch --json backend benchmark --backends vulkan --size 2048 \
+  --iterations 100 --warmup 20 \
+  --vulkan-kernel auto \
+  --vulkan-autotune-submit \
+  --seed 42
+
+# Manual kernel selection with custom batch submission
+uv run rasptorch --json backend benchmark --backends vulkan \
+  --vulkan-kernel matmul_a_bt_tiled \
+  --vulkan-submit-every 4 \
+  --size 2048 --iterations 100
+```
+
+**Output Format:**
+Results are provided in JSON format (with `--json` flag) including:
+- `status`: "ok" or "unavailable"
+- `elapsed_seconds`: Total benchmark time
+- `iterations_per_second`: Throughput metric
+- `estimated_gflops`: Floating-point performance
+- `checksum`: Verification result
+- `kernel`: Selected kernel name (for auto mode)
+- `submit_every`: Submission batch size (for Vulkan)
+
+**Optimization Tips:**
+- Use `--vulkan-autotune-submit` for best results (probes kernel + batch combinations)
+- If you see `VkErrorDeviceLost`, reduce `--vulkan-submit-every` (try `4` or `1`)
+- Larger problem sizes better amortize GPU setup overhead
+- Command buffer batching (`--vulkan-submit-every`) balances latency and throughput
+
+For detailed optimization guide, see [VULKAN_OPTIMIZATION.md](VULKAN_OPTIMIZATION.md).
 
 ---
 

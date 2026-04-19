@@ -7,6 +7,7 @@ Transform tensor operations, model creation, and training workflows into structu
 ## Features
 
 - **Tensor Operations**: Create, manipulate, and query tensors with full device support (CPU/GPU)
+- **Backend-First Runtime**: Select backends with `--backend` or `backend use`; CPU is labeled as `numpy`
 - **Model Management**: Build, configure, and manage neural networks
 - **Optimizer Support**: Train models with Adam, SGD, and other optimizers
 - **Dual Interface**:
@@ -24,6 +25,9 @@ python -m rasptorch.cli --help
 
 # Get version and environment info
 python -m rasptorch.cli info
+
+# Select backend globally (numpy|vulkan|opencl|cuda|auto)
+python -m rasptorch.cli --backend numpy info
 
 # Create a random tensor
 python -m rasptorch.cli tensor random --shape 2,3,4

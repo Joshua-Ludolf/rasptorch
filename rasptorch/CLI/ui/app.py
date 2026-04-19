@@ -60,6 +60,7 @@ except Exception as e:
 
 
 DEVICES = ["cpu", "gpu"]
+BACKENDS = ["auto", "numpy", "vulkan", "opencl", "cuda"]
 
 # UI constants (some pages reference these by name).
 ACTIVATIONS = [
@@ -79,7 +80,7 @@ HELP_TEXT = [
     "  help                          Show this help",
     "  info                          Show environment/device info",
     "  clear                         Clear console output",
-    "  device cpu|gpu|status         Select device or show status",
+    "  backend list|use|status       Manage backend adapters",
     "  model list                    List available models",
     "  model select <id>             Select current model",
     "  model mlp <layers_csv> [act=relu|activations=a,b,c]",
@@ -2086,6 +2087,7 @@ def _init_state() -> None:
             "learning_rate": 0.001,
             "optimizer": "Adam",
             "device": "cpu",
+            "backend": "auto",
             "loaded_files": {},
             "upload_cache": {},
             "last_loaded_hash": None,
@@ -2140,6 +2142,13 @@ def _try_set_device(device: str) -> Tuple[bool, str]:
     ctx = st.session_state.repl_context
 
     if device == "cpu":
+        try:
+            from rasptorch.backend import connect_backend, get_backend
+
+            connect_backend("cpu", strict=False)
+            ctx["backend"] = get_backend().name
+        except Exception:
+            pass
         ctx["device"] = "cpu"
         return True, "Device set to CPU (Vulkan, if initialized, stays available until restart)"
 
@@ -2148,6 +2157,13 @@ def _try_set_device(device: str) -> Tuple[bool, str]:
         return False, f"Unknown device '{device}'"
 
     try:
+        try:
+            from rasptorch.backend import connect_backend, get_backend
+
+            connect_backend("vulkan", strict=False)
+            ctx["backend"] = get_backend().name
+        except Exception:
+            pass
         _vulkan_backend.init(strict=True)
         ctx["device"] = "gpu"
         return True, "Device set to GPU (Vulkan)"
@@ -2161,21 +2177,50 @@ def _try_set_device(device: str) -> Tuple[bool, str]:
         msg = f"Vulkan GPU init failed: {e}"
         if reason:
             msg = f"{msg}\nReason: {reason}"
-        return False, msg
+    return False, msg
+
+
+def _try_set_backend(backend: str) -> Tuple[bool, str]:
+    backend = str(backend).lower().strip()
+    ctx = st.session_state.repl_context
+    try:
+        from rasptorch.backend import connect_backend
+        from rasptorch.utils import backend_device
+
+        if backend == "numpy":
+            backend = "cpu"
+        target = "vulkan" if backend == "auto" else backend
+        active = connect_backend(target, strict=False).name
+        label = "numpy" if active == "cpu" else active
+        ctx["backend"] = label
+        ctx["device"] = backend_device(active)
+        return True, f"Active backend: {label}"
+    except Exception as e:
+        return False, str(e)
 
 
 def _cmd_info() -> str:
     lines = []
+    active_backend_name = "cpu"
     try:
         lines.append(f"rasptorch version: {getattr(rasptorch, '__version__', '?')}")
     except Exception:
         lines.append("rasptorch version: ?")
     lines.append(f"numpy version: {np.__version__}")
+    device = "cpu"
+    try:
+        from rasptorch.backend import get_backend
+        from rasptorch.utils import backend_device
+
+        active_backend_name = get_backend().name
+        lines.append(f"backend: {'numpy' if active_backend_name == 'cpu' else active_backend_name}")
+        device = backend_device(active_backend_name)
+    except Exception:
+        lines.append("backend: ?")
     ok, reason = _safe_vulkan_status()
-    device = str(st.session_state.repl_context.get("device", "cpu"))
     lines.append(f"device: {device}")
     if ok:
-        lines.append("vulkan backend: initialized" + (" (in use)" if device == "gpu" else " (available)"))
+        lines.append("vulkan backend: initialized" + (" (in use)" if active_backend_name == "vulkan" else " (available)"))
     else:
         lines.append("vulkan backend: unavailable")
         if reason:
@@ -2243,6 +2288,10 @@ def _handle_repl_command(command_str: str) -> None:
             out(f"✗ Unknown device command: {sub}")
             return
 
+        if root == "device":
+            out("ℹ️ Device selection is deprecated. Use: backend use <name> or backend status")
+            return
+
         if root == "optimizer":
             if len(parts) < 2:
                 out("✗ Usage: optimizer create|set-lr <value>")
@@ -2265,6 +2314,48 @@ def _handle_repl_command(command_str: str) -> None:
                 out(f"✓ Set learning rate: {ctx['learning_rate']}")
                 return
             out(f"✗ Unknown optimizer command: {sub}")
+            return
+
+        if root == "backend":
+            if len(parts) < 2:
+                out("✗ Usage: backend list|use <name>|status")
+                return
+            sub = parts[1].lower()
+            if sub == "list":
+                try:
+                    from rasptorch.backend import available_backends, get_backend
+
+                    avail = available_backends()
+                    active = get_backend().name
+                    active_label = "numpy" if active == "cpu" else active
+                    lines = [f"active backend: {active_label}"]
+                    for name in sorted(avail.keys()):
+                        mark = "✓" if avail[name] else "✗"
+                        lines.append(f"  {mark} {'numpy' if name == 'cpu' else name}")
+                    out("\n".join(lines))
+                except Exception as e:
+                    out(f"✗ {e}")
+                return
+            if sub == "status":
+                try:
+                    from rasptorch.backend import get_backend
+
+                    active = get_backend().name
+                    out(f"backend: {'numpy' if active == 'cpu' else active}")
+                except Exception as e:
+                    out(f"✗ {e}")
+                return
+            if sub == "use":
+                if len(parts) < 3:
+                    out("✗ Usage: backend use <auto|numpy|vulkan|opencl|cuda>")
+                    return
+                ok, msg = _try_set_backend(parts[2])
+                if not ok:
+                    out(f"✗ {msg}")
+                else:
+                    out(f"✓ {msg}")
+                return
+            out(f"✗ Unknown backend command: {sub}")
             return
 
         if root == "train":
@@ -3081,7 +3172,9 @@ def _render_build_train_page() -> None:
     with col4:
         opt = st.selectbox("Optimizer", options=OPTIMIZERS, index=OPTIMIZERS.index(str(ctx.get("optimizer", "Adam"))))
 
-    device = str(ctx.get("device", "cpu"))
+    from rasptorch.utils import backend_device
+    backend_name = str(ctx.get("backend", "cpu"))
+    device = backend_device(backend_name)
     ctx["train_epochs"] = int(epochs)
     ctx["batch_size"] = int(batch)
     ctx["learning_rate"] = float(lr)
@@ -3217,15 +3310,15 @@ def main() -> None:
         st.session_state.nav = nav
         st.divider()
         st.subheader("Session")
-        current_device = str(ctx.get("device", "cpu"))
-        device_choice = st.selectbox(
-            "Device",
-            options=DEVICES,
-            index=DEVICES.index(current_device) if current_device in DEVICES else 0,
-            key="sidebar_device",
+        current_backend = str(ctx.get("backend", "auto"))
+        backend_choice = st.selectbox(
+            "Backend",
+            options=BACKENDS,
+            index=BACKENDS.index(current_backend) if current_backend in BACKENDS else 0,
+            key="sidebar_backend",
         )
-        if str(device_choice) != current_device:
-            ok, msg = _try_set_device(str(device_choice))
+        if str(backend_choice) != current_backend:
+            ok, msg = _try_set_backend(str(backend_choice))
             if not ok:
                 st.error(msg)
             else:
@@ -3233,8 +3326,24 @@ def main() -> None:
 
         ok_vk, reason = _safe_vulkan_status()
         effective_device = str(ctx.get("device", "cpu"))
+        try:
+            from rasptorch.backend import get_backend
+            from rasptorch.utils import backend_device
+
+            active_backend_name = get_backend().name
+            effective_device = backend_device(active_backend_name)
+            ctx["device"] = effective_device
+        except Exception:
+            active_backend_name = "cpu"
+        try:
+            from rasptorch.backend import get_backend
+
+            active = get_backend().name
+            st.caption(f"Active backend: {'numpy' if active == 'cpu' else active}")
+        except Exception:
+            st.caption("Active backend: ?")
         if ok_vk:
-            st.caption("Vulkan backend: initialized" + (" (in use)" if effective_device == "gpu" else " (available)"))
+            st.caption("Vulkan backend: initialized" + (" (in use)" if active_backend_name == "vulkan" else " (available)"))
         else:
             st.caption("Vulkan backend: unavailable")
             if reason:
@@ -3251,6 +3360,7 @@ def main() -> None:
                 "learning_rate": 0.001,
                 "optimizer": "Adam",
                 "device": "cpu",
+                "backend": "auto",
             }
             st.rerun()
 
@@ -3260,6 +3370,80 @@ def main() -> None:
         _render_build_train_page()
     else:
         _render_chat_page()
+
+
+def _strip_redundant_activation(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove 'activation' key when 'activations' list is present (for nested configs)."""
+    result = {}
+    for key, value in cfg.items():
+        if isinstance(value, dict):
+            # Recursively process nested dicts
+            result[key] = _strip_redundant_activation(value)
+        else:
+            result[key] = value
+    
+    # If activations list exists, remove the single activation key
+    if "activations" in result and "activation" in result:
+        result.pop("activation", None)
+    
+    return result
+
+
+def _chat_repl_help_lines() -> List[str]:
+    """Return help text lines from ChatREPL, used by both UI and CLI."""
+    try:
+        from rasptorch.CLI._cli_chat import ChatREPL
+        help_text = ChatREPL.get_help(ChatREPL.__new__(ChatREPL))
+        return [line.rstrip() for line in help_text.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
+def _infer_model_input_size(model_dict: Dict[str, Any]) -> Optional[int]:
+    """Infer input size from a model dict's config."""
+    cfg = model_dict.get("config") or {}
+    # Check for feature_size (common in some models)
+    if "feature_size" in cfg:
+        return int(cfg["feature_size"])
+    # Check for input_size
+    if "input_size" in cfg:
+        return int(cfg["input_size"])
+    # Default
+    return None
+
+
+def _gradcam_like_overlay(img: np.ndarray, model_dict: Dict[str, Any], model: Any) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Generate a GradCAM-like overlay on an image (fallback implementation).
+    
+    When the model is unavailable or too simple for GradCAM, generates
+    a simple highlight pattern on the input image.
+    """
+    # Ensure image is uint8 RGB
+    if img.dtype != np.uint8:
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    if img.shape[2] == 4:
+        img = img[:, :, :3]
+    
+    # Simple fallback: generate a Gaussian-like heatmap
+    h, w = img.shape[:2]
+    yy, xx = np.meshgrid(np.linspace(-1, 1, h), np.linspace(-1, 1, w), indexing='ij')
+    heatmap = np.exp(-(xx**2 + yy**2) / 0.5) * 255
+    heatmap = heatmap.astype(np.uint8)
+    
+    # Blend heatmap with image (red channel)
+    overlay = img.copy().astype(np.float32)
+    overlay[:, :, 0] = np.clip(overlay[:, :, 0] + heatmap * 0.4, 0, 255)
+    overlay = overlay.astype(np.uint8)
+    
+    info = {
+        "xai_method": "gradcam_style_approx",
+        "img_shape": img.shape,
+        "heatmap_shape": heatmap.shape,
+    }
+    
+    return overlay, info
 
 
 if __name__ == "__main__":

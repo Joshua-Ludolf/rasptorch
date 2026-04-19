@@ -11,7 +11,7 @@ def _import_ui_app():
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    app_path = repo_root / "rasptorch" / "ui" / "app.py"
+    app_path = repo_root / "rasptorch" / "CLI" / "ui" / "app.py"
     spec = importlib.util.spec_from_file_location("rasptorch_ui_app", app_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

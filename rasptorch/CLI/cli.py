@@ -4,13 +4,16 @@ import click
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List, Tuple
+
+import numpy as np
 from .. import __version__
 from ._cli_utils import parse_shape, format_error, format_json_output
 from ._cli_commands import TensorCommands, get_model_commands
 from ._cli_chat import ChatREPL
-from ..utils import resolve_device
+from ..utils import resolve_backend, resolve_device, backend_device_label
 
 
 @click.group(invoke_without_command=True)
@@ -22,12 +25,21 @@ from ..utils import resolve_device
     show_default=True,
     help="Device selection: cpu, gpu, or auto (gpu when Vulkan is working)",
 )
+@click.option(
+    "--backend",
+    "backend_name",
+    default="auto",
+    type=click.Choice(["auto", "numpy", "vulkan", "opencl", "cuda"], case_sensitive=False),
+    show_default=True,
+    help="Backend selection: auto prefers Vulkan, otherwise NumPy",
+)
 @click.version_option(__version__)
 @click.pass_context
-def cli(ctx: click.Context, json_output: bool, device: str):
+def cli(ctx: click.Context, json_output: bool, device: str, backend_name: str):
     """rasptorch - Deep learning on Raspberry Pi 5."""
     ctx.ensure_object(dict)
     ctx.obj["json_output"] = json_output
+    ctx.obj["backend"] = resolve_backend(backend_name)
     ctx.obj["device"] = resolve_device(device)
 
 
@@ -105,6 +117,329 @@ def ones(ctx, shape, device):
 def model():
     """Model operations."""
     pass
+
+
+@cli.group()
+def backend():
+    """Backend registry and connection commands."""
+    pass
+
+
+@backend.command("list")
+@click.pass_context
+def list_backends(ctx):
+    """List registered backends and availability."""
+    try:
+        from ..backend import available_backends, get_backend, backend_manager
+
+        registered = backend_manager.list_registered()
+        availability = available_backends()
+        active = get_backend().name
+        active_label = "numpy" if active == "cpu" else active
+        result = {
+            "status": "success",
+            "active": active_label,
+            "backends": [
+                {"name": ("numpy" if name == "cpu" else name), "available": bool(availability.get(name, False))}
+                for name in registered
+            ],
+        }
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(result))
+        else:
+            click.echo(f"Active backend: {active_label}")
+            for item in result["backends"]:
+                mark = "✓" if item["available"] else "✗"
+                click.echo(f"  {mark} {item['name']}")
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
+
+
+@backend.command("connect")
+@click.argument("name", type=click.Choice(["numpy", "vulkan", "opencl", "cuda"], case_sensitive=False))
+@click.option("--strict", is_flag=True, help="Fail instead of falling back to CPU when backend is unavailable")
+@click.pass_context
+def connect_backend_cmd(ctx, name, strict):
+    """Connect active compute backend."""
+    try:
+        from ..backend import connect_backend
+
+        target = "cpu" if str(name).lower() == "numpy" else str(name).lower()
+        backend_obj = connect_backend(target, strict=bool(strict))
+        active_label = "numpy" if backend_obj.name == "cpu" else backend_obj.name
+        result = {"status": "success", "active": active_label}
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(result))
+        else:
+            click.echo(f"✓ Active backend: {active_label}")
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
+
+
+@backend.command("benchmark")
+@click.option(
+    "--backends",
+    default="numpy,vulkan,opencl,cuda",
+    show_default=True,
+    help="Comma-separated backends to benchmark",
+)
+@click.option("--size", type=int, default=256, show_default=True, help="Square matrix size (N for NxN)")
+@click.option("--iterations", type=int, default=20, show_default=True, help="Timed iterations per backend")
+@click.option("--warmup", type=int, default=3, show_default=True, help="Warmup iterations per backend")
+@click.option("--seed", type=int, default=42, show_default=True, help="Random seed for reproducible inputs")
+@click.option(
+    "--vulkan-kernel",
+    type=click.Choice(["auto", "matmul", "matmul_vec4", "matmul_a_bt", "matmul_a_bt_tiled"], case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Resident Vulkan kernel strategy",
+)
+@click.option(
+    "--vulkan-submit-every",
+    type=int,
+    default=8,
+    show_default=True,
+    help="Resident Vulkan mode: submit command buffer every N dispatches",
+)
+@click.option(
+    "--vulkan-autotune-submit",
+    is_flag=True,
+    default=False,
+    help="Probe multiple Vulkan submit chunk sizes and select the fastest stable one",
+)
+@click.pass_context
+def benchmark_backends(
+    ctx, backends, size, iterations, warmup, seed, vulkan_kernel, vulkan_submit_every, vulkan_autotune_submit
+):
+    """Benchmark backend matmul throughput with a reproducible workload."""
+    if int(size) <= 0:
+        raise click.ClickException("--size must be > 0")
+    if int(iterations) <= 0:
+        raise click.ClickException("--iterations must be > 0")
+    if int(warmup) < 0:
+        raise click.ClickException("--warmup must be >= 0")
+    if int(vulkan_submit_every) <= 0:
+        raise click.ClickException("--vulkan-submit-every must be > 0")
+
+    requested = [b.strip().lower() for b in str(backends).split(",") if b.strip()]
+    if not requested:
+        raise click.ClickException("No backends specified")
+    valid = {"numpy", "vulkan", "opencl", "cuda"}
+    for name in requested:
+        if name not in valid:
+            raise click.ClickException(f"Unknown backend in --backends: {name}")
+
+    try:
+        from ..backend import connect_backend
+        from .. import vulkan_backend as vk
+
+        rng = np.random.default_rng(int(seed))
+        a = rng.standard_normal((int(size), int(size)), dtype=np.float32)
+        b = rng.standard_normal((int(size), int(size)), dtype=np.float32)
+
+        results = []
+        for label in requested:
+            target = "cpu" if label == "numpy" else label
+            try:
+                backend_obj = connect_backend(target, strict=True)
+
+                if label == "vulkan":
+                    # Resident-buffer path: upload once, repeated on-device matmul, download once.
+                    a_buf = vk.to_gpu(a)
+                    b_buf = vk.to_gpu(b)
+                    out_buf = vk.empty((int(size), int(size)))
+                    b_t_buf = None
+                    try:
+                        def _run_vulkan_dispatches(count: int, dispatch_fn) -> None:
+                            _run_vulkan_dispatches_chunked(count, dispatch_fn, int(vulkan_submit_every))
+
+                        def _run_vulkan_dispatches_chunked(count: int, dispatch_fn, submit_every: int) -> None:
+                            remaining = int(count)
+                            chunk = int(submit_every)
+                            while remaining > 0:
+                                step = min(chunk, remaining)
+                                vk.begin_batch()
+                                try:
+                                    for _ in range(step):
+                                        dispatch_fn()
+                                finally:
+                                    vk.end_batch()
+                                remaining -= step
+
+                        requested_kernel = str(vulkan_kernel).lower()
+                        dispatch_variants = {
+                            "matmul": (lambda: vk.matmul_into(a_buf, b_buf, out_buf)),
+                            "matmul_vec4": (lambda: vk.matmul_vec4_into(a_buf, b_buf, out_buf)),
+                        }
+                        if requested_kernel in {"auto", "matmul_a_bt", "matmul_a_bt_tiled"}:
+                            b_t_buf = vk.transpose2d(b_buf)
+                            dispatch_variants["matmul_a_bt"] = (lambda: vk.matmul_a_bt_out(a_buf, b_t_buf, out_buf))
+                            dispatch_variants["matmul_a_bt_tiled"] = (
+                                lambda: vk.matmul_a_bt_tiled_out(a_buf, b_t_buf, out_buf)
+                            )
+
+                        selected_kernel = requested_kernel
+                        selected_submit_every = int(vulkan_submit_every)
+                        if requested_kernel == "auto":
+                            best_kernel = None
+                            best_chunk = selected_submit_every
+                            best_time = float("inf")
+                            probe_dispatches = max(2, min(12, int(iterations)))
+                            if bool(vulkan_autotune_submit):
+                                candidates = [1, 2, 4, 8, 16]
+                                for kernel_name, fn in dispatch_variants.items():
+                                    for candidate in candidates:
+                                        try:
+                                            t_start = time.perf_counter()
+                                            _run_vulkan_dispatches_chunked(probe_dispatches, fn, candidate)
+                                            t_elapsed = float(time.perf_counter() - t_start)
+                                            if t_elapsed < best_time:
+                                                best_time = t_elapsed
+                                                best_kernel = kernel_name
+                                                best_chunk = candidate
+                                        except Exception:
+                                            continue
+                            else:
+                                for kernel_name, fn in dispatch_variants.items():
+                                    try:
+                                        t_start = time.perf_counter()
+                                        _run_vulkan_dispatches_chunked(probe_dispatches, fn, selected_submit_every)
+                                        t_elapsed = float(time.perf_counter() - t_start)
+                                        if t_elapsed < best_time:
+                                            best_time = t_elapsed
+                                            best_kernel = kernel_name
+                                    except Exception:
+                                        continue
+                            if best_kernel is None:
+                                raise RuntimeError("No Vulkan kernel variant succeeded during auto probe")
+                            selected_kernel = str(best_kernel)
+                            selected_submit_every = int(best_chunk)
+                            dispatch_fn = dispatch_variants[selected_kernel]
+                        else:
+                            dispatch_fn = dispatch_variants[selected_kernel]
+
+                        if bool(vulkan_autotune_submit) and requested_kernel != "auto":
+                            candidates = [1, 2, 4, 8, 16]
+                            best_chunk = selected_submit_every
+                            best_time = float("inf")
+                            probe_dispatches = max(2, min(8, int(iterations)))
+                            for candidate in candidates:
+                                try:
+                                    t_start = time.perf_counter()
+                                    _run_vulkan_dispatches_chunked(probe_dispatches, dispatch_fn, candidate)
+                                    t_elapsed = float(time.perf_counter() - t_start)
+                                    if t_elapsed < best_time:
+                                        best_time = t_elapsed
+                                        best_chunk = candidate
+                                except Exception:
+                                    continue
+                            selected_submit_every = int(best_chunk)
+
+                        if int(warmup) > 0:
+                            _run_vulkan_dispatches_chunked(int(warmup), dispatch_fn, selected_submit_every)
+                        start = time.perf_counter()
+                        _run_vulkan_dispatches_chunked(int(iterations), dispatch_fn, selected_submit_every)
+                        elapsed = float(time.perf_counter() - start)
+
+                        out = vk.to_cpu(out_buf)
+                        checksum = float(np.asarray(out, dtype=np.float32).reshape(-1)[0]) * float(int(iterations))
+                    finally:
+                        vk.free(a_buf)
+                        vk.free(b_buf)
+                        if b_t_buf is not None:
+                            vk.free(b_t_buf)
+                        vk.free(out_buf)
+                else:
+                    # Warmup includes setup/JIT/driver overhead and is excluded from timing.
+                    for _ in range(int(warmup)):
+                        backend_obj.matmul(a, b)
+
+                    checksum = 0.0
+                    start = time.perf_counter()
+                    for _ in range(int(iterations)):
+                        out = backend_obj.matmul(a, b)
+                        checksum += float(np.asarray(out, dtype=np.float32).reshape(-1)[0])
+                    elapsed = float(time.perf_counter() - start)
+
+                iters_per_sec = float(int(iterations) / elapsed) if elapsed > 0 else 0.0
+                gflops = float((2.0 * (int(size) ** 3) * int(iterations)) / elapsed / 1e9) if elapsed > 0 else 0.0
+                result_item = {
+                    "backend": label,
+                    "status": "ok",
+                    "elapsed_seconds": elapsed,
+                    "iterations": int(iterations),
+                    "iterations_per_second": iters_per_sec,
+                    "estimated_gflops": gflops,
+                    "checksum": checksum,
+                }
+                if label == "vulkan":
+                    result_item["mode"] = "resident"
+                    result_item["submit_every"] = int(selected_submit_every)
+                    result_item["kernel"] = selected_kernel
+                results.append(result_item)
+            except Exception as e:
+                error_msg = str(e).strip()
+                if not error_msg:
+                    error_msg = f"{type(e).__name__}: {repr(e)}".strip()
+                if label == "vulkan":
+                    try:
+                        reason = vk.disabled_reason()
+                    except Exception:
+                        reason = None
+                    if reason:
+                        reason_text = str(reason).strip()
+                        if reason_text and reason_text not in error_msg:
+                            error_msg = f"{error_msg} | {reason_text}" if error_msg else reason_text
+                results.append(
+                    {
+                        "backend": label,
+                        "status": "unavailable",
+                        "error": error_msg,
+                    }
+                )
+                continue
+
+        payload = {
+            "status": "success",
+            "workload": {
+                "op": "matmul",
+                "size": int(size),
+                "iterations": int(iterations),
+                "warmup": int(warmup),
+                "seed": int(seed),
+            },
+            "results": results,
+        }
+
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(payload))
+            return
+
+        click.echo(
+            f"Backend benchmark (matmul {size}x{size}, iterations={iterations}, warmup={warmup}, seed={seed})"
+        )
+        for item in results:
+            if item["status"] != "ok":
+                click.echo(f"  ✗ {item['backend']}: unavailable ({item['error']})")
+                continue
+            click.echo(
+                f"  ✓ {item['backend']}: {item['elapsed_seconds']:.4f}s, "
+                f"{item['iterations_per_second']:.2f} iter/s, {item['estimated_gflops']:.2f} GFLOP/s"
+            )
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
 
 
 @model.command("linear")
@@ -531,13 +866,16 @@ def info(ctx):
     try:
         import numpy
         from .. import vulkan_backend as vk
+        from ..backend import get_backend
 
-        active_device = "gpu (Vulkan)" if vk.using_vulkan() else "cpu"
+        active_backend = get_backend().name
+        active_device = backend_device_label(active_backend)
         
         info_data = {
             "rasptorch_version": __version__,
             "numpy_version": numpy.__version__,
             "active_device": active_device,
+            "active_backend": ("numpy" if active_backend == "cpu" else active_backend),
             "vulkan_available": vk.is_available(),
             "vulkan_using_real_gpu": vk.using_vulkan(),
         }
@@ -550,6 +888,7 @@ def info(ctx):
             click.echo(f"rasptorch: {info_data['rasptorch_version']}")
             click.echo(f"numpy: {info_data['numpy_version']}")
             click.echo(f"device: {active_device}")
+            click.echo(f"backend: {info_data['active_backend']}")
             if info_data["vulkan_using_real_gpu"]:
                 click.echo(f"vulkan: ✓ Using GPU")
             else:
@@ -570,7 +909,7 @@ def info(ctx):
 def ui(ctx: click.Context, port: int | None, server_headless: bool, streamlit_args: Tuple[str, ...]):
     """Launch the Streamlit UI."""
     # Resolve app path to the isometric SVG UI version in rasptorch/ui/app.py
-    app_path = Path(__file__).resolve().parents[1] / "ui" / "app.py"
+    app_path = Path(__file__).resolve().parent / "ui" / "app.py"
     if not app_path.exists():
         raise click.ClickException(f"UI entry not found at: {app_path}")
 

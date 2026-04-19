@@ -8,7 +8,21 @@ from rasptorch import Tensor
 from rasptorch import functional as F
 from rasptorch import init as rt_init
 from rasptorch import utils
-from rasptorch.nn import AvgPool2d, BatchNorm1d, BatchNorm2d, ELU, Embedding, GELU, GRU, LayerNorm, LeakyReLU, MaxPool2d, MultiheadAttention, SiLU
+from rasptorch.nn import (
+    AvgPool2d,
+    BatchNorm1d,
+    BatchNorm2d,
+    ELU,
+    Embedding,
+    GELU,
+    GRU,
+    LayerNorm,
+    LeakyReLU,
+    MaxPool2d,
+    MultiheadAttention,
+    SiLU,
+    TransformerEncoder,
+)
 from rasptorch.optim import Adam, AdamW, RMSProp, SGD
 from rasptorch.optim_sched import CosineAnnealingLR, ExponentialLR, MultiStepLR, ReduceLROnPlateau, StepLR, WarmupScheduler
 from rasptorch import vulkan_backend as vk
@@ -232,6 +246,31 @@ def test_multihead_attention_backward_populates_grads() -> None:
     assert v.grad is not None and v.grad.shape == v.shape
     assert mha.q_weight.grad is not None
     assert mha.out_weight.grad is not None
+
+
+def test_transformer_encoder_forward_shapes() -> None:
+    rng = np.random.default_rng(10)
+    enc = TransformerEncoder(embed_dim=8, num_heads=2, ff_hidden_dim=16, dropout=0.0)
+    x = Tensor(rng.standard_normal((2, 5, 8), dtype=np.float32), requires_grad=True)
+
+    out, weights = enc(x, need_weights=True)
+    assert out.shape == (2, 5, 8)
+    assert weights.shape == (2, 5, 5)
+
+
+def test_transformer_encoder_backward_populates_grads() -> None:
+    rng = np.random.default_rng(11)
+    enc = TransformerEncoder(embed_dim=8, num_heads=2, ff_hidden_dim=16, dropout=0.0)
+    x = Tensor(rng.standard_normal((2, 4, 8), dtype=np.float32), requires_grad=True)
+
+    out = enc(x)
+    out.sum().backward()
+
+    assert x.grad is not None and x.grad.shape == x.shape
+    assert enc.self_attn.q_weight.grad is not None
+    assert enc.self_attn.out_weight.grad is not None
+    assert enc.ffn.layers[0].weight.grad is not None
+    assert enc.ffn.layers[-1].weight.grad is not None
 
 
 def test_gru_forward_and_autograd_limit() -> None:

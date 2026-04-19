@@ -8,11 +8,13 @@ from rasptorch.optim import SGD
 from rasptorch.tensor import Tensor
 from rasptorch.functional import mse_loss
 from rasptorch.checkpoint import save_checkpoint
+from rasptorch import connect_backend
 
 
 def main() -> None:
+    '''A simple demo showing how to train a small MLP on synthetic regression data, using either CPU or Vulkan GPU backends.'''
     parser = argparse.ArgumentParser(description="rasptorch demo")
-    parser.add_argument("--device", choices=["cpu", "gpu", "gpu-autograd"], default="cpu")
+    parser.add_argument("--device", choices=["cpu", "gpu", "gpu-autograd", "auto"], default="cpu")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=0.1)
@@ -24,7 +26,15 @@ def main() -> None:
     x = np.linspace(-1, 1, 200, dtype="float32").reshape(-1, 1)
     y = 2 * (x ** 2) + 1
 
-    if args.device == "gpu":
+    selected_backend = connect_backend("vulkan", strict=False) if args.device in {"gpu", "auto"} else connect_backend("cpu", strict=False)
+    use_gpu_training = selected_backend.name == "vulkan" and args.device in {"gpu", "auto"}
+    if args.device == "auto":
+        if use_gpu_training:
+            print("Auto device selected: using Vulkan GPU backend.")
+        else:
+            print("Auto device selected: Vulkan unavailable, falling back to CPU.")
+
+    if use_gpu_training:
         try:
             train_mlp_regression_gpu(
                 x,

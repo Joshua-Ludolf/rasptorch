@@ -21,6 +21,20 @@ def test_chat_info_reports_active_device(capsys) -> None:
     assert "device: gpu (Vulkan)" in captured or "device: cpu" in captured
 
 
+def test_chat_info_reports_gpu_for_cuda_backend(capsys) -> None:
+    repl = ChatREPL(device="cpu")
+
+    class _Backend:
+        name = "cuda"
+
+    repl._backend_api = lambda: ({}, None, lambda: _Backend())  # type: ignore[assignment]
+    repl._cmd_info()
+
+    captured = capsys.readouterr().out
+    assert "backend: cuda" in captured
+    assert "device: gpu (CUDA)" in captured
+
+
 def test_force_cpu_is_reversible() -> None:
     code = """
 from rasptorch import vulkan_backend as vk

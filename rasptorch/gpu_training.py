@@ -167,7 +167,14 @@ class GpuMLP:
     ) -> None:
         self.close()
 
-    def train_step(self, x_np: np.ndarray, y_np: np.ndarray, *, lr: float | None = None) -> float:
+    def train_step(
+        self,
+        x_np: np.ndarray,
+        y_np: np.ndarray,
+        *,
+        lr: float | None = None,
+        return_loss: bool = False,
+    ) -> float | None:
         x_np = np.asarray(x_np, dtype=np.float32)
         y_np = np.asarray(y_np, dtype=np.float32)
         bufs = self._get_batch_buffers(x_np.shape[0])
@@ -187,9 +194,11 @@ class GpuMLP:
         vk.add_rowvec_out(bufs["z2"], self.b2, bufs["y_pred"])
         vk.end_batch()
 
-        # Loss (CPU readback for logging only)
-        pred_cpu = vk.to_cpu(bufs["y_pred"])
-        loss = float(np.mean((pred_cpu - y_np) ** 2))
+        # Optional loss readback for logging/debug only.
+        loss: float | None = None
+        if return_loss:
+            pred_cpu = vk.to_cpu(bufs["y_pred"])
+            loss = float(np.mean((pred_cpu - y_np) ** 2))
 
         vk.begin_batch()
         # Backward (explicit kernels)
@@ -304,13 +313,15 @@ def train_mlp_regression_gpu(
         for epoch in range(epochs):
             epoch_loss = 0.0
             num_batches = 0
+            should_log = (log_every > 0 and (epoch % log_every == 0)) or (epoch == epochs - 1)
             for xb_np, yb_np in loader:
-                loss = model.train_step(xb_np, yb_np, lr=lr)
-                epoch_loss += loss
-                num_batches += 1
+                loss = model.train_step(xb_np, yb_np, lr=lr, return_loss=should_log)
+                if should_log and loss is not None:
+                    epoch_loss += float(loss)
+                    num_batches += 1
 
-            avg_loss = epoch_loss / max(1, num_batches)
-            if epoch % log_every == 0:
+            if should_log:
+                avg_loss = epoch_loss / max(1, num_batches)
                 print(f"Epoch {epoch}: loss={avg_loss:.6f}")
 
         if save_path:

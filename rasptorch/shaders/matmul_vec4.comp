@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufA { float a[]; } bufa;
+layout(set = 0, binding = 1, std430) readonly buffer BufB { float b[]; } bufb;
+layout(set = 0, binding = 2, std430) writeonly buffer BufO { float o[]; } bufo;
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+// Row-major matrices:
+// A: [m,k], B: [k,n], O: [m,n]
+//
+// Vectorized variant for better memory throughput when k is large.
+// Handles tail elements when k is not divisible by 4.
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.m || col >= pc.n) return;
+
+    float sum = 0.0;
+    uint k4 = pc.k & ~3u;
+
+    for (uint i = 0u; i < k4; i += 4u) {
+        vec4 av = vec4(
+            bufa.a[row * pc.k + i + 0u],
+            bufa.a[row * pc.k + i + 1u],
+            bufa.a[row * pc.k + i + 2u],
+            bufa.a[row * pc.k + i + 3u]
+        );
+        vec4 bv = vec4(
+            bufb.b[(i + 0u) * pc.n + col],
+            bufb.b[(i + 1u) * pc.n + col],
+            bufb.b[(i + 2u) * pc.n + col],
+            bufb.b[(i + 3u) * pc.n + col]
+        );
+        sum += dot(av, bv);
+    }
+
+    for (uint i = k4; i < pc.k; i++) {
+        sum += bufa.a[row * pc.k + i] * bufb.b[i * pc.n + col];
+    }
+
+    bufo.o[row * pc.n + col] = sum;
+}

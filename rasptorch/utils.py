@@ -4,8 +4,27 @@ from collections.abc import Iterable
 
 import numpy as np
 
+from .backend import connect_backend, get_backend
 from . import vulkan_backend as vk
 from .tensor import Tensor
+
+
+def backend_device(backend_name: str | None) -> str:
+    """Map a backend name to a coarse device class."""
+    name = str(backend_name or "").strip().lower()
+    return "gpu" if name in {"vulkan", "opencl", "cuda"} else "cpu"
+
+
+def backend_device_label(backend_name: str | None) -> str:
+    """Map a backend name to user-facing device text."""
+    name = str(backend_name or "").strip().lower()
+    if name == "vulkan":
+        return "gpu (Vulkan)"
+    if name == "opencl":
+        return "gpu (OpenCL)"
+    if name == "cuda":
+        return "gpu (CUDA)"
+    return "cpu"
 
 
 def resolve_device(device: str | None) -> str:
@@ -24,14 +43,42 @@ def resolve_device(device: str | None) -> str:
 
     d = str(device).strip().lower()
     if d == "auto":
-        return "gpu" if vk.is_available() else "cpu"
+        chosen = connect_backend("vulkan", strict=False)
+        return backend_device(chosen.name)
     if d in ("cpu", "gpu"):
         # For GPU, proactively try init so callers can surface failures early.
         if d == "gpu":
-            vk.init(strict=False)
+            chosen = connect_backend("vulkan", strict=False)
+            if chosen.name != "vulkan":
+                return "cpu"
+        else:
+            connect_backend("cpu", strict=False)
         return d
 
     raise ValueError(f"Unknown device: {device!r} (expected 'cpu', 'gpu', or 'auto')")
+
+
+def resolve_backend(backend: str | None) -> str:
+    """Resolve and connect a backend selection.
+
+    Accepted values:
+    - "auto": prefer Vulkan, otherwise CPU
+    - "cpu" | "vulkan" | "opencl" | "cuda"
+
+    Returns the active backend name after connection.
+    """
+
+    if backend is None:
+        return get_backend().name
+
+    b = str(backend).strip().lower()
+    if b == "auto":
+        return connect_backend("vulkan", strict=False).name
+    if b == "numpy":
+        b = "cpu"
+    if b in {"cpu", "vulkan", "opencl", "cuda"}:
+        return connect_backend(b, strict=False).name
+    raise ValueError(f"Unknown backend: {backend!r} (expected 'auto', 'numpy', 'vulkan', 'opencl', or 'cuda')")
 
 
 def _materialize_params(parameters: Iterable[Tensor]) -> list[Tensor]:

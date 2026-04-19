@@ -277,8 +277,12 @@ class Linear(Module):
                     x.grad = x.grad + grad_x
 
             # dL/dW = grad_out^T @ x
+            # For higher-dimensional inputs, reshape to 2D: (all_but_last, last)
             if self.weight.requires_grad:
-                grad_w = grad_out.T @ x.data
+                # Reshape for batch matrix multiplication
+                grad_out_2d = grad_out.reshape(-1, grad_out.shape[-1])
+                x_data_2d = x.data.reshape(-1, x.data.shape[-1])
+                grad_w = grad_out_2d.T @ x_data_2d
                 if self.weight.grad is None:
                     self.weight.grad = grad_w
                 else:
@@ -286,7 +290,7 @@ class Linear(Module):
 
             # dL/db = sum over batch
             if self.bias is not None and self.bias.requires_grad:
-                grad_b = grad_out.sum(axis=0)
+                grad_b = grad_out.sum(axis=tuple(range(grad_out.ndim - 1)))
                 if self.bias.grad is None:
                     self.bias.grad = grad_b
                 else:
@@ -1111,6 +1115,68 @@ class MultiheadAttention(Module):
             return out
         weights = _make_tensor_from_np(attn.mean(axis=1), device=device, requires_grad=False, op="attention_weights")
         return out, weights
+
+
+class TransformerEncoder(Module):
+    """A single transformer encoder block.
+
+    Structure:
+    1. Self-attention + residual + layer norm
+    2. Feed-forward MLP + residual + layer norm
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *,
+        ff_hidden_dim: int | None = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if embed_dim <= 0:
+            raise ValueError("embed_dim must be > 0")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be > 0")
+        if ff_hidden_dim is None:
+            ff_hidden_dim = int(embed_dim * 4)
+        if ff_hidden_dim <= 0:
+            raise ValueError("ff_hidden_dim must be > 0")
+        p = float(dropout)
+        if p < 0.0 or p >= 1.0:
+            raise ValueError("dropout must satisfy 0.0 <= p < 1.0")
+
+        self.embed_dim = int(embed_dim)
+        self.self_attn = MultiheadAttention(self.embed_dim, int(num_heads), batch_first=True)
+        self.norm1 = LayerNorm(self.embed_dim)
+        self.norm2 = LayerNorm(self.embed_dim)
+        self.ffn = Sequential(
+            Linear(self.embed_dim, int(ff_hidden_dim)),
+            ReLU(),
+            Linear(int(ff_hidden_dim), self.embed_dim),
+        )
+        self.dropout1 = Dropout(p) if p > 0.0 else None
+        self.dropout2 = Dropout(p) if p > 0.0 else None
+
+    def forward(self, x: Tensor, *, need_weights: bool = False):
+        if len(x.shape) != 3:
+            raise ValueError(f"TransformerEncoder expects input shape [B,T,E], got {x.shape}")
+        if x.shape[2] != self.embed_dim:
+            raise ValueError(f"TransformerEncoder expected embed_dim={self.embed_dim}, got {x.shape[2]}")
+
+        attn_out, weights = self.self_attn(x, x, x, need_weights=True)
+        if self.dropout1 is not None:
+            attn_out = self.dropout1(attn_out)
+        x = self.norm1(x + attn_out)
+
+        ff_out = self.ffn(x)
+        if self.dropout2 is not None:
+            ff_out = self.dropout2(ff_out)
+        out = self.norm2(x + ff_out)
+
+        if need_weights:
+            return out, weights
+        return out
 
 
 class GRU(Module):
