@@ -1119,7 +1119,6 @@ source = { editable = "." }
 dependencies = [
     { name = "build" },
     { name = "click" },
-    { name = "cupy" },
     { name = "mako" },
     { name = "numpy" },
     { name = "prompt-toolkit" },
@@ -1133,6 +1132,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+cuda = [
+    { name = "cupy" },
+]
 dev = [
     { name = "build" },
     { name = "pytest" },
@@ -1144,10 +1146,10 @@ gpu = [
 
 [package.metadata]
 requires-dist = [
-    { name = "build", specifier = ">=1.4.0" },
+    { name = "build", specifier = ">=1.4.3" },
     { name = "build", marker = "extra == 'dev'" },
     { name = "click", specifier = ">=8.0" },
-    { name = "cupy", specifier = ">=14.0.1" },
+    { name = "cupy", marker = "extra == 'cuda'", specifier = ">=14.0.1" },
     { name = "mako", specifier = ">=1.3.11" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
@@ -1162,7 +1164,7 @@ requires-dist = [
     { name = "vulkan", specifier = ">=1.3.275.1" },
     { name = "vulkan", marker = "extra == 'gpu'", specifier = ">=1.3.275.1" },
 ]
-provides-extras = ["gpu", "torch", "dev"]
+provides-extras = ["cuda", "gpu", "torch", "dev"]
 
 [[package]]
 name = "readme-renderer"
