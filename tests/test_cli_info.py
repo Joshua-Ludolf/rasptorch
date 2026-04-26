@@ -68,7 +68,7 @@ def test_force_cpu_is_reversible() -> None:
     assert lines["after_force"] == "False"
     assert lines["after_init"] == lines["before"]
     # On systems without Vulkan bindings/devices, a non-empty reason is expected.
-    assert lines["reason"] in {"None", ""} or "Vulkan" in lines["reason"]
+    assert lines["reason"] in {"None", ""} or "vulkan" in lines["reason"].lower()
 
 
 def test_chat_device_can_switch_back_and_forth() -> None:
