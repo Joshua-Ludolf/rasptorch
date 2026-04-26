@@ -12,7 +12,6 @@ dependencies = [
 	"prompt-toolkit>=3.0",
 	"streamlit>=1.56.0",
 	"pytest>=9.0.3",
-	"build>=1.4.0",
 	"twine>=6.2.0",
 ]
 
