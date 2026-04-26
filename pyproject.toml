@@ -9,6 +9,8 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "click",
+    "prompt_toolkit",
+    "streamlit",
 ]
 
 [project.optional-dependencies]
