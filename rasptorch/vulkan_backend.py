@@ -107,8 +107,10 @@ class _VulkanContext:
         self._fence: Optional[VkFence] = None
         self._ds_cache: dict[object, VkDescriptorSet] = {}
         self._matmul_bind_key: Optional[tuple[object, object, object]] = None
+        self._matmul_tiled_bind_key: Optional[tuple[object, object, object]] = None
         self._matmul_vec4_bind_key: Optional[tuple[object, object, object]] = None
         self._matmul_vec4_tiled_bind_key: Optional[tuple[object, object, object]] = None
+        self._matmul_vec4_wide_tiled_bind_key: Optional[tuple[object, object, object]] = None
         self._matmul_a_bt_bind_key: Optional[tuple[object, object, object]] = None
         self._matmul_a_bt_tiled_bind_key: Optional[tuple[object, object, object]] = None
 
@@ -123,8 +125,10 @@ class _VulkanContext:
         self.p_relu: Optional[_Pipeline] = None
         self.p_mul_add_relu: Optional[_Pipeline] = None
         self.p_matmul: Optional[_Pipeline] = None
+        self.p_matmul_tiled: Optional[_Pipeline] = None
         self.p_matmul_vec4: Optional[_Pipeline] = None
         self.p_matmul_vec4_tiled: Optional[_Pipeline] = None
+        self.p_matmul_vec4_wide_tiled: Optional[_Pipeline] = None
 
         self.p_neg: Optional[_Pipeline] = None
 
@@ -1652,8 +1656,10 @@ class _VulkanContext:
             self.p_relu = None
             self.p_mul_add_relu = None
             self.p_matmul = None
+            self.p_matmul_tiled = None
             self.p_matmul_vec4 = None
             self.p_matmul_vec4_tiled = None
+            self.p_matmul_vec4_wide_tiled = None
             self.p_neg = None
             self.p_add_scalar = None
             self.p_mul_scalar = None
@@ -1709,8 +1715,10 @@ class _VulkanContext:
             self._cmd_recording = False
             self._batch_depth = 0
             self._matmul_bind_key = None
+            self._matmul_tiled_bind_key = None
             self._matmul_vec4_bind_key = None
             self._matmul_vec4_tiled_bind_key = None
+            self._matmul_vec4_wide_tiled_bind_key = None
             self._matmul_a_bt_bind_key = None
             self._matmul_a_bt_tiled_bind_key = None
 
@@ -7153,6 +7161,208 @@ def matmul(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
     return out
 
 
+def matmul_fast(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
+    """Fast matmul helper for A @ B.
+
+    This prefers the wide tiled vec4 kernel for larger square-ish workloads,
+    then falls back to the tiled vec4, vec4, or naive resident kernels.
+    """
+
+    if len(a.shape) != 2 or len(b.shape) != 2:
+        raise ValueError("matmul_fast expects 2D matrices")
+
+    m, k = a.shape
+    k2, n = b.shape
+    if k != k2:
+        raise ValueError(f"matmul_fast shape mismatch: {a.shape} @ {b.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        if a.host is None or b.host is None:
+            aa = np.zeros(a.shape, dtype=np.float32)
+            bb = np.zeros(b.shape, dtype=np.float32)
+            return _fallback_buf(aa @ bb)
+        return _fallback_buf(a.host @ b.host)
+
+    out = empty((m, n))
+    if min(int(m), int(n), int(k)) >= 128:
+        try:
+            return matmul_vec4_wide_tiled_into(a, b, out)
+        except Exception:
+            pass
+    if min(int(m), int(n), int(k)) >= 64:
+        try:
+            return matmul_tiled_into(a, b, out)
+        except Exception:
+            pass
+
+    if min(int(m), int(n), int(k)) >= 64:
+        try:
+            return matmul_vec4_tiled_into(a, b, out)
+        except Exception:
+            pass
+
+    if (int(k) % 4) == 0:
+        try:
+            return matmul_vec4_into(a, b, out)
+        except Exception:
+            pass
+
+    return matmul_into(a, b, out)
+
+
+def matmul_vec4_wide_tiled_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Wider tiled+vectorized matmul into a preallocated output buffer.
+
+    Each invocation computes two adjacent output columns so the shared B tile
+    has a 16x32 footprint while keeping the same 16x16 workgroup geometry.
+    """
+
+    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+        raise ValueError("matmul_vec4_wide_tiled_into expects 2D matrices")
+
+    m, k = a.shape
+    k2, n = b.shape
+    if k != k2:
+        raise ValueError(f"matmul_vec4_wide_tiled_into shape mismatch: {a.shape} @ {b.shape}")
+    if out.shape != (m, n):
+        raise ValueError(f"matmul_vec4_wide_tiled_into output shape mismatch: out={out.shape} expected={(m, n)}")
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        if a.host is None or b.host is None:
+            aa = np.zeros(a.shape, dtype=np.float32)
+            bb = np.zeros(b.shape, dtype=np.float32)
+            write(out, aa @ bb)
+            return out
+        write(out, a.host @ b.host)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    if ctx.p_matmul_vec4_wide_tiled is None:
+        ctx.p_matmul_vec4_wide_tiled = ctx._create_pipeline_matmul("matmul_vec4_wide_tiled")
+    assert ctx.p_matmul_vec4_wide_tiled is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_matmul_vec4_wide_tiled)
+    bind_key = (_vk_handle_key(a.buffer), _vk_handle_key(b.buffer), _vk_handle_key(out.buffer))
+    if ctx._matmul_vec4_wide_tiled_bind_key != bind_key:
+        infos = [
+            VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+            VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+            VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+        ]
+        writes = [
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=0,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[0]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=1,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[1]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=2,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[2]],
+            ),
+        ]
+        vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+        ctx._matmul_vec4_wide_tiled_bind_key = bind_key
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_vec4_wide_tiled.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_matmul_vec4_wide_tiled.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_matmul_vec4_wide_tiled.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        12,
+        pc,
+    )
+    group_count_x = (int(n) + 31) // 32
+    group_count_y = (int(m) + 15) // 16
+    vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
+    ctx._end_commands()
+    return out
+
+
+def matmul_a_bt_fast(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
+    """Fast matmul helper for A @ B^T.
+
+    The transpose-aware tiled kernel is preferred for larger workloads; the
+    basic transpose-aware kernel remains as the fallback path.
+    """
+
+    if len(a.shape) != 2 or len(b.shape) != 2:
+        raise ValueError("matmul_a_bt_fast expects 2D matrices")
+
+    m, k = a.shape
+    n, k2 = b.shape
+    if k != k2:
+        raise ValueError(f"matmul_a_bt_fast shape mismatch: {a.shape} vs {b.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        aa = a.host if a.host is not None else np.zeros(a.shape, np.float32)
+        bb = b.host if b.host is not None else np.zeros(b.shape, np.float32)
+        return _fallback_buf(aa @ bb.T)
+
+    out = empty((m, n))
+    if min(int(m), int(n), int(k)) >= 64:
+        try:
+            return matmul_a_bt_tiled_out(a, b, out)
+        except Exception:
+            pass
+    return matmul_a_bt_out(a, b, out)
+
+
+def matmul_at_b_fast(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
+    """Fast matmul helper for A^T @ B."""
+
+    if len(a.shape) != 2 or len(b.shape) != 2:
+        raise ValueError("matmul_at_b_fast expects 2D matrices")
+
+    m, k = a.shape
+    m2, n = b.shape
+    if m != m2:
+        raise ValueError(f"matmul_at_b_fast shape mismatch: {a.shape} vs {b.shape}")
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        aa = a.host if a.host is not None else np.zeros(a.shape, np.float32)
+        bb = b.host if b.host is not None else np.zeros(b.shape, np.float32)
+        return _fallback_buf(aa.T @ bb)
+
+    out = empty((k, n))
+    return matmul_at_b_out(a, b, out)
+
+
 def matmul_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
     """Matmul into a preallocated output buffer.
 
@@ -7239,6 +7449,106 @@ def matmul_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBu
     vkCmdPushConstants(
         ctx.command_buffer,
         ctx.p_matmul.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        12,
+        pc,
+    )
+    group_count_x = (int(n) + 15) // 16
+    group_count_y = (int(m) + 15) // 16
+    vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
+    ctx._end_commands()
+    return out
+
+
+def matmul_tiled_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Shared-memory tiled matmul into a preallocated output buffer."""
+
+    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+        raise ValueError("matmul_tiled_into expects 2D matrices")
+
+    m, k = a.shape
+    k2, n = b.shape
+    if k != k2:
+        raise ValueError(f"matmul_tiled_into shape mismatch: {a.shape} @ {b.shape}")
+    if out.shape != (m, n):
+        raise ValueError(f"matmul_tiled_into output shape mismatch: out={out.shape} expected={(m, n)}")
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        if a.host is None or b.host is None:
+            aa = np.zeros(a.shape, dtype=np.float32)
+            bb = np.zeros(b.shape, dtype=np.float32)
+            write(out, aa @ bb)
+            return out
+        write(out, a.host @ b.host)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    if ctx.p_matmul_tiled is None:
+        ctx.p_matmul_tiled = ctx._create_pipeline_matmul("matmul_tiled")
+    assert ctx.p_matmul_tiled is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_matmul_tiled)
+    bind_key = (_vk_handle_key(a.buffer), _vk_handle_key(b.buffer), _vk_handle_key(out.buffer))
+    if ctx._matmul_tiled_bind_key != bind_key:
+        infos = [
+            VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+            VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+            VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+        ]
+        writes = [
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=0,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[0]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=1,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[1]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=2,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[2]],
+            ),
+        ]
+        vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+        ctx._matmul_tiled_bind_key = bind_key
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+
+    vkCmdBindPipeline(ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_tiled.pipeline)
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_matmul_tiled.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_matmul_tiled.pipeline_layout,
         VK_SHADER_STAGE_COMPUTE_BIT,
         0,
         12,

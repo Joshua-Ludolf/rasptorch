@@ -157,8 +157,6 @@ def list_backends(ctx):
         else:
             click.echo(f"✗ Error: {e}")
         sys.exit(1)
-
-
 @backend.command("connect")
 @click.argument("name", type=click.Choice(["numpy", "vulkan", "opencl", "cuda"], case_sensitive=False))
 @click.option("--strict", is_flag=True, help="Fail instead of falling back to CPU when backend is unavailable")
@@ -197,10 +195,13 @@ def connect_backend_cmd(ctx, name, strict):
 @click.option("--seed", type=int, default=42, show_default=True, help="Random seed for reproducible inputs")
 @click.option(
     "--vulkan-kernel",
-    type=click.Choice(["auto", "matmul", "matmul_vec4", "matmul_a_bt", "matmul_a_bt_tiled"], case_sensitive=False),
+    type=click.Choice(
+        ["auto", "matmul", "matmul_tiled", "matmul_vec4", "matmul_vec4_tiled", "matmul_vec4_wide_tiled", "matmul_a_bt", "matmul_a_bt_tiled"],
+        case_sensitive=False,
+    ),
     default="auto",
     show_default=True,
-    help="Resident Vulkan kernel strategy",
+    help="Resident Vulkan kernel strategy, including new kernel options",
 )
 @click.option(
     "--vulkan-submit-every",
@@ -275,11 +276,17 @@ def benchmark_backends(
                                 remaining -= step
 
                         requested_kernel = str(vulkan_kernel).lower()
+                        if requested_kernel == "auto" and int(size) >= 4096:
+                            requested_kernel = "matmul_vec4_wide_tiled"
                         dispatch_variants = {
+                            "matmul_tiled": (lambda: vk.matmul_tiled_into(a_buf, b_buf, out_buf)),
+                            "matmul_vec4_wide_tiled": (lambda: vk.matmul_vec4_wide_tiled_into(a_buf, b_buf, out_buf)),
+                            "matmul_vec4_tiled": (lambda: vk.matmul_vec4_tiled_into(a_buf, b_buf, out_buf)),
                             "matmul": (lambda: vk.matmul_into(a_buf, b_buf, out_buf)),
                             "matmul_vec4": (lambda: vk.matmul_vec4_into(a_buf, b_buf, out_buf)),
                         }
-                        if requested_kernel in {"auto", "matmul_a_bt", "matmul_a_bt_tiled"}:
+                        allow_transpose_aware_auto = requested_kernel != "auto" or int(size) < 4096
+                        if requested_kernel in {"auto", "matmul_a_bt", "matmul_a_bt_tiled"} and allow_transpose_aware_auto:
                             b_t_buf = vk.transpose2d(b_buf)
                             dispatch_variants["matmul_a_bt"] = (lambda: vk.matmul_a_bt_out(a_buf, b_t_buf, out_buf))
                             dispatch_variants["matmul_a_bt_tiled"] = (
@@ -292,30 +299,18 @@ def benchmark_backends(
                             best_kernel = None
                             best_chunk = selected_submit_every
                             best_time = float("inf")
-                            probe_dispatches = max(2, min(12, int(iterations)))
-                            if bool(vulkan_autotune_submit):
-                                candidates = [1, 2, 4, 8, 16]
-                                for kernel_name, fn in dispatch_variants.items():
-                                    for candidate in candidates:
-                                        try:
-                                            t_start = time.perf_counter()
-                                            _run_vulkan_dispatches_chunked(probe_dispatches, fn, candidate)
-                                            t_elapsed = float(time.perf_counter() - t_start)
-                                            if t_elapsed < best_time:
-                                                best_time = t_elapsed
-                                                best_kernel = kernel_name
-                                                best_chunk = candidate
-                                        except Exception:
-                                            continue
-                            else:
-                                for kernel_name, fn in dispatch_variants.items():
+                            probe_dispatches = max(4, min(24, int(iterations) // 2 or 4))
+                            candidates = [1, 2, 4, 8, 16] if bool(vulkan_autotune_submit) else [1, 2, 4, 8]
+                            for kernel_name, fn in dispatch_variants.items():
+                                for candidate in candidates:
                                     try:
                                         t_start = time.perf_counter()
-                                        _run_vulkan_dispatches_chunked(probe_dispatches, fn, selected_submit_every)
+                                        _run_vulkan_dispatches_chunked(probe_dispatches, fn, candidate)
                                         t_elapsed = float(time.perf_counter() - t_start)
                                         if t_elapsed < best_time:
                                             best_time = t_elapsed
                                             best_kernel = kernel_name
+                                            best_chunk = candidate
                                     except Exception:
                                         continue
                             if best_kernel is None:

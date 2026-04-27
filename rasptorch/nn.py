@@ -221,8 +221,10 @@ class Linear(Module):
         # GPU path: explicit Vulkan kernels (keeps grads on GPU).
         if x.device == "gpu" or self.weight.device == "gpu" or (self.bias is not None and self.bias.device == "gpu"):
             # weight stored as [out,in] so forward uses x @ weight.T
-            w_t = self.weight.T
-            out = x @ w_t
+            out = Tensor._from_vkbuf(
+                vk.matmul_a_bt_fast(x._as_vkbuf(), self.weight._as_vkbuf()),
+                requires_grad=track,
+            )
             if self.bias is not None:
                 out = out.add_rowvec(self.bias)
 
@@ -239,13 +241,11 @@ class Linear(Module):
 
                     # dX = dY @ W   where W is [out,in]
                     if x.requires_grad:
-                        x._accum_grad_vk(vk.matmul(grad_out, self.weight._as_vkbuf()))
+                        x._accum_grad_vk(vk.matmul_fast(grad_out, self.weight._as_vkbuf()))
 
                     # dW = dY^T @ X
                     if self.weight.requires_grad:
-                        go_t = vk.transpose2d(grad_out)
-                        self.weight._accum_grad_vk(vk.matmul(go_t, x._as_vkbuf()))
-                        vk.free(go_t)
+                        self.weight._accum_grad_vk(vk.matmul_at_b_fast(grad_out, x._as_vkbuf()))
 
                     # dB = sum_rows(dY)
                     if self.bias is not None and self.bias.requires_grad:
@@ -375,11 +375,8 @@ class Conv2d(Module):
             # weight as [out, K] where K=C*kh*kw
             K = int(self.in_channels * kh * kw)
             w2d = vk.view(self.weight._as_vkbuf(), (self.out_channels, K))
-            w2d_t = vk.transpose2d(w2d)  # [K,out]
+            y2d = vk.matmul_a_bt_fast(xcol, w2d)  # [N*OH*OW, out]
             vk.free(w2d)
-
-            y2d = vk.matmul(xcol, w2d_t)  # [N*OH*OW, out]
-            vk.free(w2d_t)
             if self.bias is not None:
                 y2d2 = vk.add_rowvec(y2d, self.bias._as_vkbuf())
                 vk.free(y2d)
@@ -407,9 +404,7 @@ class Conv2d(Module):
 
                     # Weight grad: dW(out,K) = dY^T(out,R) @ Xcol(R,K)
                     if self.weight.requires_grad:
-                        dY2d_t = vk.transpose2d(dY2d)  # [out, R]
-                        dW2d = vk.matmul(dY2d_t, xcol)  # [out, K]
-                        vk.free(dY2d_t)
+                        dW2d = vk.matmul_at_b_fast(dY2d, xcol)  # [out, K]
                         dW4 = vk.view(dW2d, self.weight.shape)
                         self.weight._accum_grad_vk(dW4)
                         vk.free(dW2d)
@@ -417,7 +412,7 @@ class Conv2d(Module):
                     # Input grad: dXcol(R,K) = dY(R,out) @ W(out,K)
                     if x.requires_grad:
                         w2d_local = vk.view(self.weight._as_vkbuf(), (self.out_channels, K))
-                        dXcol = vk.matmul(dY2d, w2d_local)  # [R,K]
+                        dXcol = vk.matmul_fast(dY2d, w2d_local)  # [R,K]
                         vk.free(w2d_local)
                         dX = vk.col2im_nchw(
                             dXcol,

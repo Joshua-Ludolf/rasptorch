@@ -21,6 +21,34 @@ Vulkan Kernel: matmul_vec4 (auto-selected)
 Submission Batching: submit_every=16 (auto-tuned)
 ```
 
+## Roadmap: Shared-Memory Tiled GEMM
+
+The current Vulkan matmul path already has tiled and vec4 variants, but a true shared-memory GEMM remains the next major step for large workloads.
+
+### Phase 1: Stabilize the Large-Square Path
+
+- Keep `matmul_vec4_wide_tiled` as the default auto-selected kernel for large square workloads.
+- Retain `matmul`, `matmul_vec4`, and `matmul_vec4_tiled` as fallbacks.
+- Avoid transpose-aware probing in the 4096x4096 auto path when it is not needed.
+
+### Phase 2: Implement Blocked Shared-Memory GEMM
+
+- Use 16x16 or 32x32 tiles with cooperative loading into `shared` memory.
+- Minimize redundant global-memory loads by reusing each tile across multiple MAC steps.
+- Keep the output resident so benchmarking remains compute-bound rather than transfer-bound.
+
+### Phase 3: Add a Cooperative-Matrix Backend Path
+
+- Evaluate `VK_KHR_cooperative_matrix` as an accelerator path where the driver supports it.
+- Prefer it for desktop NVIDIA hardware first, then gate it behind runtime feature checks.
+- Keep the tiled shared-memory kernel as the portable fallback for Raspberry Pi and other devices.
+
+### Phase 4: Benchmark and Auto-Tune
+
+- Extend `--vulkan-kernel auto` to probe the tiled shared-memory kernels first on large workloads.
+- Keep submission chunk auto-tuning separate so kernel quality and dispatch strategy can be measured independently.
+- Add regression coverage for large square workloads to prevent device-lost regressions.
+
 ### What Changed
 
 - **Before Optimization**: ~545 GFLOPS
@@ -71,6 +99,8 @@ rasptorch --json backend benchmark \
 **Kernels Probed:**
 - `matmul` - Reference implementation
 - `matmul_vec4` - Vec4 optimized (fastest on most hardware)
+- `matmul_vec4_tiled` - Shared-memory tiled vec4 path
+- `matmul_vec4_wide_tiled` - Wider tiled vec4 path for better reuse
 - `matmul_a_bt` - Transpose-optimized
 - `matmul_a_bt_tiled` - Aggressive tiling (may cause device loss on some hardware)
 

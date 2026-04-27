@@ -47,7 +47,9 @@ rasptorch --json backend benchmark --backends numpy,vulkan,cuda --size 2048 --it
 > **Note:** User-facing CLI/UI labels the CPU backend as **`numpy`**.
 > Vulkan benchmark mode uses resident buffers (upload once, repeated on-device matmul, download once).
 > **Performance (Optimized):** Vulkan achieves ~564 GFLOPS (78% of NumPy on matmul_vec4 with auto-tuning).
-> `--vulkan-kernel auto` probes `matmul`, `matmul_vec4`, `matmul_a_bt`, and `matmul_a_bt_tiled` (when available) and keeps the faster path.
+> For very large square workloads (for example, 4096x4096), the benchmark now prefers the stable `matmul_vec4_wide_tiled` path by default.
+> If you want to pin that path manually, use `--vulkan-kernel matmul_vec4_wide_tiled --vulkan-submit-every 8`.
+> `--vulkan-kernel auto` probes `matmul_vec4_wide_tiled`, `matmul`, `matmul_vec4`, `matmul_vec4_tiled`, `matmul_a_bt`, and `matmul_a_bt_tiled` (when available) and keeps the faster path.
 > If Vulkan hits `VkErrorDeviceLost`, lower `--vulkan-submit-every` (for example, `4` or `1`) or use auto-tuning.
 > **Recommended:** Use `--vulkan-autotune-submit` to jointly probe kernel + submit chunk and pick the fastest stable combo.
 > Optimizations: Command buffer batching, memory-mapped buffers, auto kernel selection.
@@ -142,18 +144,44 @@ uv run rasptorch backend benchmark
 uv run rasptorch --json backend benchmark --backends numpy,vulkan,cuda --size 2048 --iterations 100 --warmup 20 --seed 42
 ```
 
-**Performance Results (Raspberry Pi 5, 2048x2048 matmul, optimized):**
+**Performance Results (Windows 11, NVIDIA GeForce RTX 3070 Ti):**
 
-| Backend | Time (s) | Iterations/s | GFLOPS | Status |
-|---------|----------|--------------|--------|--------|
-| NumPy | 2.25 | 44.4 | 763 | Reference |
-| Vulkan (auto-tuned) | 3.15 | 31.8 | 546 | ⚡ GPU |
-| CUDA (when available) | 0.56 | 178 | 3059 | Best |
+Measured backend scaling with:
+```bash
+uv run rasptorch --json backend benchmark --backends numpy,opencl,vulkan,cuda --vulkan-kernel matmul_vec4_wide_tiled --vulkan-submit-every 8 --iterations 5 --warmup 1 --seed 42
+```
+
+#### 256×256 → 4096×4096 Scaling
+| Backend  | 256×256 (GFLOPS) | 512×512 (GFLOPS) | 1024×1024 (GFLOPS) | 2048×2048 (GFLOPS) | 4096×4096 (GFLOPS) |
+|----------|------------------|------------------|-------------------|-------------------|-------------------|
+| NumPy | 101.01 | 368.14 | 720.12 | 816.57 | 883.75 |
+| OpenCL | 44.24 | 68.20 | 107.01 | 97.75 | 46.87 |
+| Vulkan (`matmul_vec4_wide_tiled`) | 259.43 | 654.88 | 1043.37 | 809.62 | 534.92 |
+| CUDA | 116.48 | 380.50 | 1063.82 | 2136.75 | 3990.81 |
+
+#### Vulkan Kernel Comparison (2048×2048)
+Measured with:
+```bash
+uv run rasptorch --json backend benchmark --backends vulkan --vulkan-submit-every 8 --size 2048 --iterations 5 --warmup 1 --seed 42 --vulkan-kernel <kernel>
+```
+
+| Vulkan Kernel | GFLOPS | Status |
+|---------------|--------|--------|
+| `matmul` | 492.73 | ok |
+| `matmul_tiled` | 497.81 | ok |
+| `matmul_vec4` | 493.15 | ok |
+| `matmul_vec4_tiled` | 484.03 | ok |
+| `matmul_vec4_wide_tiled` | 778.27 | ok |
+| `matmul_a_bt` | 150.90 | ok |
+| `matmul_a_bt_tiled` | 173.23 | ok |
+
 
 **Vulkan Kernel Selection:**
 The `--vulkan-kernel auto` flag intelligently probes available kernels:
 - `matmul` - Basic single-threaded implementation
 - `matmul_vec4` - SIMD-style vec4 operations
+- `matmul_vec4_tiled` - vec4 plus shared-memory tiling
+- `matmul_vec4_wide_tiled` - vec4 plus wider output tiling for better reuse
 - `matmul_a_bt` - Matrix transpose optimization (for A @ B.T)
 - `matmul_a_bt_tiled` - Tiled transpose optimization (fastest when applicable)
 
@@ -172,6 +200,11 @@ uv run rasptorch --json backend benchmark --backends vulkan \
   --vulkan-submit-every 4 \
   --size 2048 --iterations 100
 ```
+
+**Large Workload Guidance:**
+- For 4096x4096 matmul, use the default auto mode or pin `matmul_vec4_wide_tiled` directly.
+- If a custom Vulkan kernel triggers `VkErrorDeviceLost`, reduce `--vulkan-submit-every` first.
+- The benchmark path uses resident buffers, so the large-size slowdown is kernel quality rather than repeated host-device transfers.
 
 **Output Format:**
 Results are provided in JSON format (with `--json` flag) including:

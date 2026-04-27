@@ -65,7 +65,7 @@ class VulkanComputeBackend(Backend):
         abuf = self._to_gpu(a)
         bbuf = self._to_gpu(b)
         try:
-            out = vk.matmul(abuf, bbuf)
+            out = vk.matmul_fast(abuf, bbuf)
             try:
                 return np.asarray(vk.to_cpu(out), dtype=np.float32)
             finally:

@@ -747,7 +747,7 @@ class Tensor:
         other_t = self._ensure_tensor(other)
         track = is_grad_enabled() and (self.requires_grad or other_t.requires_grad)
         if self.device == "gpu" or other_t.device == "gpu":
-            vk_out = vk.matmul(self._as_vkbuf(), other_t._as_vkbuf())
+            vk_out = vk.matmul_fast(self._as_vkbuf(), other_t._as_vkbuf())
             out = Tensor._from_vkbuf(vk_out, requires_grad=track)
             out._op = "matmul"
         else:
@@ -764,13 +764,9 @@ class Tensor:
                     # dA = dC @ B^T
                     # dB = A^T @ dC
                     if self.requires_grad:
-                        b_t = vk.transpose2d(other_t._as_vkbuf())
-                        self._accum_grad_vk(vk.matmul(out.grad_vkbuf, b_t))
-                        vk.free(b_t)
+                        self._accum_grad_vk(vk.matmul_a_bt_fast(out.grad_vkbuf, other_t._as_vkbuf()))
                     if other_t.requires_grad:
-                        a_t = vk.transpose2d(self._as_vkbuf())
-                        other_t._accum_grad_vk(vk.matmul(a_t, out.grad_vkbuf))
-                        vk.free(a_t)
+                        other_t._accum_grad_vk(vk.matmul_at_b_fast(self._as_vkbuf(), out.grad_vkbuf))
                 else:
                     if out.grad is None:
                         return

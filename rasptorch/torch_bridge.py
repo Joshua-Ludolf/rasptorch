@@ -222,14 +222,9 @@ class RaspConv2d:
 
                 w2d = vk.view(self.weight_buf, (out_ch, K))
                 try:
-                    w2d_t = vk.transpose2d(w2d)
+                    y2d = vk.matmul_a_bt_fast(xcol, w2d)
                 finally:
                     vk.free(w2d)
-
-                try:
-                    y2d = vk.matmul(xcol, w2d_t)
-                finally:
-                    vk.free(w2d_t)
 
                 if self.bias_buf is not None:
                     y2d2 = vk.add_rowvec(y2d, self.bias_buf)

@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufA {
+    float a[];
+} bufa;
+
+layout(set = 0, binding = 1, std430) readonly buffer BufB {
+    float b[];
+} bufb;
+
+layout(set = 0, binding = 2, std430) writeonly buffer BufO {
+    float o[];
+} bufo;
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+shared float Asub[16][16];
+shared float Bsub[16][16];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint lx = gl_LocalInvocationID.x;
+
+    float sum = 0.0;
+    uint tiles = (pc.k + 15u) / 16u;
+
+    for (uint t = 0u; t < tiles; ++t) {
+        uint a_col = t * 16u + lx;
+        uint b_row = t * 16u + ly;
+
+        Asub[ly][lx] = (row < pc.m && a_col < pc.k) ? bufa.a[row * pc.k + a_col] : 0.0;
+        Bsub[ly][lx] = (b_row < pc.k && col < pc.n) ? bufb.b[b_row * pc.n + col] : 0.0;
+
+        barrier();
+
+        for (uint i = 0u; i < 16u; ++i) {
+            sum += Asub[ly][i] * Bsub[i][lx];
+        }
+
+        barrier();
+    }
+
+    if (row < pc.m && col < pc.n) {
+        bufo.o[row * pc.n + col] = sum;
+    }
+}

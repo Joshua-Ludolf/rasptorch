@@ -1,0 +1,78 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer ABuffer {
+    float a[];
+} buf_a;
+
+layout(set = 0, binding = 1, std430) readonly buffer BBuffer {
+    float b[];
+} buf_b;
+
+layout(set = 0, binding = 2, std430) writeonly buffer OBuffer {
+    float o[];
+} buf_o;
+
+layout(push_constant) uniform PushConstants {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+shared float Asub[16][16];
+shared float Bsub[16][32];
+
+void main() {
+    uint ly = gl_LocalInvocationID.y;
+    uint lx = gl_LocalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    uint col0 = gl_GlobalInvocationID.x * 2u;
+    uint col1 = col0 + 1u;
+    float sum0 = 0.0;
+    float sum1 = 0.0;
+    uint tile_count = (pc.k + 15u) / 16u;
+
+    for (uint t = 0u; t < tile_count; ++t) {
+        uint k_col = t * 16u + lx;
+        uint k_row = t * 16u + ly;
+
+        Asub[ly][lx] = (row < pc.m && k_col < pc.k) ? buf_a.a[row * pc.k + k_col] : 0.0;
+        Bsub[ly][lx * 2u] = (k_row < pc.k && col0 < pc.n) ? buf_b.b[k_row * pc.n + col0] : 0.0;
+        Bsub[ly][lx * 2u + 1u] = (k_row < pc.k && col1 < pc.n) ? buf_b.b[k_row * pc.n + col1] : 0.0;
+
+        barrier();
+
+        for (uint i = 0u; i < 16u; i += 4u) {
+            vec4 a_vec = vec4(
+                Asub[ly][i + 0u],
+                Asub[ly][i + 1u],
+                Asub[ly][i + 2u],
+                Asub[ly][i + 3u]
+            );
+            vec4 b0_vec = vec4(
+                Bsub[i + 0u][lx * 2u],
+                Bsub[i + 1u][lx * 2u],
+                Bsub[i + 2u][lx * 2u],
+                Bsub[i + 3u][lx * 2u]
+            );
+            vec4 b1_vec = vec4(
+                Bsub[i + 0u][lx * 2u + 1u],
+                Bsub[i + 1u][lx * 2u + 1u],
+                Bsub[i + 2u][lx * 2u + 1u],
+                Bsub[i + 3u][lx * 2u + 1u]
+            );
+            sum0 += dot(a_vec, b0_vec);
+            sum1 += dot(a_vec, b1_vec);
+        }
+
+        barrier();
+    }
+
+    if (row < pc.m && col0 < pc.n) {
+        buf_o.o[row * pc.n + col0] = sum0;
+    }
+    if (row < pc.m && col1 < pc.n) {
+        buf_o.o[row * pc.n + col1] = sum1;
+    }
+}
