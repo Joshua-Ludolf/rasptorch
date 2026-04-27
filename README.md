@@ -78,9 +78,11 @@ pip install -e ".[dev]"
 
 **C. GPU Mode Prerequisites:**
 To utilize the GPU backend, you must meet these prerequisites:
-*   Raspberry Pi 5 with working Vulkan drivers.
-*   The `glslc` shader compiler must be available in your system `PATH`.
-*   When running, you must specify the device: `--device gpu` or `--device auto`.
+**D. GPU Backend Dependencies:**
+For systems with a proper GPU setup (e.g., Raspberry Pi 5), install the GPU backend dependencies using:
+```bash
+uv pip install rasptorch[gpu]
+```
 
 #### 2. Quick Run Examples
 
