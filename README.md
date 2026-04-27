@@ -81,6 +81,15 @@ To utilize the GPU backend, you must meet these prerequisites:
 **D. GPU Backend Dependencies:**
 For systems with a proper GPU setup (e.g., Raspberry Pi 5), install the GPU backend dependencies using:
 ```bash
+
+# Prerequisites for Vulkan backend (Raspberry Pi 4/5 & Linux)
+sudo apt update
+sudo apt install -y glslc (for raspberry pi 4/5 & linux operating systems)
+
+# For Windows, install the Vulkan SDK from LunarG:
+./VulkanSDK-Installer.exe --accept-licenses --default-answer --confirm-command install
+
+# Then install rasptorch with GPU support after installing prerequisites (for either platform):
 uv pip install rasptorch[gpu]
 ```
 
