@@ -15,6 +15,9 @@ dependencies = [
 	"twine>=6.2.0",
 ]
 
+[project.scripts]
+rasptorch = "rasptorch.CLI.cli:cli"
+
 [project.optional-dependencies]
 optional = [
     "requests>=2.33.1",
