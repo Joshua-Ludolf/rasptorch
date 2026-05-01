@@ -92,7 +92,24 @@ sudo apt install -y glslc (for raspberry pi 4/5 & linux operating systems)
 ./VulkanSDK-Installer.exe --accept-licenses --default-answer --confirm-command install
 
 # Then install rasptorch with GPU support after installing prerequisites (for either platform):
-uv pip install rasptorch[gpu]
+pip install rasptorch[gpu]
+```
+
+You can also install only the backend(s) you need instead of the entire `gpu` extra. Examples:
+
+```bash
+# Vulkan-only (recommended for Raspberry Pi 4/5)
+pip install rasptorch[vulkan]
+
+# OpenCL-only
+pip install rasptorch[opencl]
+
+# CUDA-only (for NVIDIA systems with CUDA installed)
+pip install rasptorch[cuda]
+
+# Vulkan + OpenCL
+pip install "rasptorch[vulkan,opencl]"
+```
 ```
 
 #### 2. Quick Run Examples
