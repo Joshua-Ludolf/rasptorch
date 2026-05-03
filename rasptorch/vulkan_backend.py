@@ -1810,7 +1810,7 @@ def flush() -> None:
 
 
 def set_job_timeout(timeout: int) -> None:
-    """Set Vulkan command timeout in milliseconds (default: 10s)."""
+    """Set Vulkan command timeout in nanoseconds (default: 10s)."""
 
     if not _HAS_VULKAN:
         return
