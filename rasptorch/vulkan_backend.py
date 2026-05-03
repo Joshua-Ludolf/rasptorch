@@ -99,6 +99,7 @@ class _VulkanContext:
         self.queue: Optional[VkQueue] = None
         self.queue_family_index: Optional[int] = None
 
+        self._job_timeout = 10_000_000_000
         self.command_pool: Optional[VkCommandPool] = None
         # Use a dedicated list/queue for command buffers to record work for a batch.
         self._command_buffers: list[VkCommandBuffer] = []
@@ -309,6 +310,9 @@ class _VulkanContext:
         self.p_log_softmax2d_backward = self._create_pipeline_vec3_u32u32("log_softmax2d_backward")
         self.p_layernorm2d = self._create_pipeline_vec2_u32u32("layernorm2d")
         self.p_layernorm2d_backward = self._create_pipeline_vec3_u32u32("layernorm2d_backward")
+
+    def set_job_timeout(self, timeout: int) -> None:
+        self._job_timeout = timeout
 
     def _create_pipeline_vec3_pc16(self, name: str) -> _Pipeline:
         """Compute pipeline with 3 storage buffers and a 16-byte push constant range."""
@@ -1561,7 +1565,7 @@ class _VulkanContext:
         )
         vkResetFences(self.device, 1, [self._fence])
         vkQueueSubmit(self.queue, 1, [submit], self._fence)
-        vkWaitForFences(self.device, 1, [self._fence], VK_TRUE, 10_000_000_000)  # 10s
+        vkWaitForFences(self.device, 1, [self._fence], VK_TRUE, self._job_timeout)
 
     def shutdown(self) -> None:
         """Destroy Vulkan resources and clear the live context."""
@@ -1803,6 +1807,15 @@ def flush() -> None:
         return
     ctx = _ctx()
     ctx.flush()
+
+
+def set_job_timeout(timeout: int) -> None:
+    """Set Vulkan command timeout in nanoseconds (default: 10s)."""
+
+    if not _HAS_VULKAN:
+        return
+    ctx = _ctx()
+    ctx._job_timeout = timeout
 
 
 def init(*, strict: bool = False) -> None:
