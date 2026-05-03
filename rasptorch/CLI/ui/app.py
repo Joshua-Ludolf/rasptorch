@@ -2078,6 +2078,7 @@ def _init_state() -> None:
     ss = st.session_state
     ss.setdefault("nav", "Models")
     ss.setdefault("repl_log", [])
+    ss.setdefault("_backend_initialized", False)
     ss.setdefault(
         "repl_context",
         {
@@ -2095,6 +2096,66 @@ def _init_state() -> None:
             "trained_models": [],
         },
     )
+    
+    # Initialize backend on first startup: try Vulkan first, fallback to NumPy
+    if not ss.get("_backend_initialized", False):
+        _try_set_backend("auto")
+        ss["_backend_initialized"] = True
+
+
+def _query_param_text(name: str) -> Optional[str]:
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return None
+    if isinstance(value, list):
+        if not value:
+            return None
+        value = value[0]
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _ui_summarize_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if "type" in value and "config" in value and ("state_dict" in value or "model_id" in value):
+            summary: Dict[str, Any] = {"type": value.get("type", "Unknown")}
+            config = value.get("config")
+            if config is not None:
+                summary["config"] = _ui_summarize_value(config)
+            state_dict = value.get("state_dict")
+            if isinstance(state_dict, dict):
+                summary["state_dict"] = f"<state_dict: {len(state_dict)} tensors>"
+            elif state_dict is not None:
+                summary["state_dict"] = f"<{type(state_dict).__name__}>"
+            return summary
+
+        summarized: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "state_dict" and isinstance(item, dict):
+                summarized[key] = f"<state_dict: {len(item)} tensors>"
+                continue
+            if key.endswith("_snapshot") and isinstance(item, dict):
+                snapshot: Dict[str, Any] = {"type": item.get("type", "Unknown")}
+                snapshot_config = item.get("config")
+                if snapshot_config is not None:
+                    snapshot["config"] = _ui_summarize_value(snapshot_config)
+                snapshot_state = item.get("state_dict")
+                if isinstance(snapshot_state, dict):
+                    snapshot["state_dict"] = f"<state_dict: {len(snapshot_state)} tensors>"
+                elif snapshot_state is not None:
+                    snapshot["state_dict"] = f"<{type(snapshot_state).__name__}>"
+                summarized[key] = snapshot
+                continue
+            summarized[key] = _ui_summarize_value(item)
+        return summarized
+    if isinstance(value, list):
+        return [_ui_summarize_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_ui_summarize_value(item) for item in value)
+    return value
 
 
 def _append_log(lines: List[str] | str) -> None:
@@ -2652,8 +2713,7 @@ def _render_models_page() -> None:
 
     # URL-based selection persistence.
     try:
-        qp = st.query_params
-        qmid = qp.get("model_id")
+        qmid = _query_param_text("model_id")
         if qmid and isinstance(qmid, str) and qmid in cmds.models:
             ctx["current_model"] = qmid
     except Exception:
@@ -2706,15 +2766,6 @@ def _render_models_page() -> None:
     )
     ctx["current_model"] = selected
 
-    # Keep URL in sync.
-    try:
-        if selected is None:
-            st.query_params.pop("model_id", None)
-        else:
-            st.query_params["model_id"] = str(selected)
-    except Exception:
-        pass
-
     col_a, col_b, col_c = st.columns(3)
     with col_a:
         if st.button("Refresh"):
@@ -2737,7 +2788,7 @@ def _render_models_page() -> None:
     if selected is not None and selected in cmds.models:
         st.subheader("Info")
         md = cmds.models[selected]
-        cfg = dict(md.get("config", {}) or {})
+        cfg = _ui_summarize_value(dict(md.get("config", {}) or {}))
         # Avoid showing both `activation` and per-layer `activations` in the UI.
         if "activations" in cfg and "activation" in cfg:
             cfg.pop("activation", None)
@@ -2754,70 +2805,76 @@ def _render_models_page() -> None:
             language="json",
         )
 
-        diagram = _model_mermaid_diagram(cmds.models, selected)
-        if diagram:
-            st.subheader("Structure")
-            st.markdown(f"```mermaid\n{diagram}\n```")
+        show_structure = st.button(
+            "Show structure preview",
+            key=f"show_structure_btn_{selected}",
+            help="Render the model diagram only on demand. This avoids automatic heavy work on page load.",
+        )
+        if show_structure:
+            diagram = _model_mermaid_diagram(cmds.models, selected)
+            if diagram:
+                st.subheader("Structure")
+                st.markdown(f"```mermaid\n{diagram}\n```")
 
-        st.subheader("Structure (3D)")
+            st.subheader("Structure (3D)")
 
-        mode = _ui_3d_render_mode()
-        rendered = False
+            mode = _ui_3d_render_mode()
+            rendered = False
 
-        # ── canvas3d — Canvas 2D + manual projection (Pi 4/5, integrated GPU, all) ──
-        if mode == "canvas3d":
-            if components is not None:
-                html3d = _model_canvas3d_html(cmds.models, selected)
-                if html3d is not None:
-                    components.html(html3d, height=560, scrolling=False)
+            # ── canvas3d — Canvas 2D + manual projection (Pi 4/5, integrated GPU, all) ──
+            if mode == "canvas3d":
+                if components is not None:
+                    html3d = _model_canvas3d_html(cmds.models, selected)
+                    if html3d is not None:
+                        components.html(html3d, height=560, scrolling=False)
+                        rendered = True
+                    else:
+                        st.caption("Canvas 3D renderer unavailable for this model; falling back.")
+                else:
+                    st.caption("Canvas 3D requires `streamlit.components.v1`.")
+
+            # ── pyvista_png — server-side offscreen render ────────────────────────────
+            if not rendered and mode == "pyvista_png":
+                png = _model_pyvista_png(cmds.models, selected)
+                if png is not None:
+                    st.image(png, use_container_width=True)
                     rendered = True
                 else:
-                    st.caption("Canvas 3D renderer unavailable for this model; falling back.")
-            else:
-                st.caption("Canvas 3D requires `streamlit.components.v1`.")
+                    st.caption("PyVista PNG render failed; falling back to Plotly.")
 
-        # ── pyvista_png — server-side offscreen render ────────────────────────────
-        if not rendered and mode == "pyvista_png":
-            png = _model_pyvista_png(cmds.models, selected)
-            if png is not None:
-                st.image(png, use_container_width=True)
-                rendered = True
-            else:
-                st.caption("PyVista PNG render failed; falling back to Plotly.")
-
-        # ── pyvista interactive ───────────────────────────────────────────────────
-        if not rendered and mode == "pyvista":
-            if pv is None:
-                st.caption("PyVista renderer requires `pyvista`.")
-            else:
-                try:
-                    from stpyvista import stpyvista as _stpyvista  # type: ignore
-                except Exception as e:
-                    st.caption(
-                        "PyVista interactive renderer requires a Streamlit-compatible "
-                        "`stpyvista`. Import failed; try upgrading `stpyvista`."
-                    )
-                    st.caption(f"stpyvista import error: {e}")
+            # ── pyvista interactive ───────────────────────────────────────────────────
+            if not rendered and mode == "pyvista":
+                if pv is None:
+                    st.caption("PyVista renderer requires `pyvista`.")
                 else:
-                    plotter = _model_pyvista_plotter(cmds.models, selected, off_screen=False)
-                    if plotter is None:
-                        st.caption("PyVista renderer unavailable for this model.")
+                    try:
+                        from stpyvista import stpyvista as _stpyvista  # type: ignore
+                    except Exception as e:
+                        st.caption(
+                            "PyVista interactive renderer requires a Streamlit-compatible "
+                            "`stpyvista`. Import failed; try upgrading `stpyvista`."
+                        )
+                        st.caption(f"stpyvista import error: {e}")
                     else:
-                        _stpyvista(plotter, key=f"pyvista_{selected}")
-                        rendered = True
+                        plotter = _model_pyvista_plotter(cmds.models, selected, off_screen=False)
+                        if plotter is None:
+                            st.caption("PyVista renderer unavailable for this model.")
+                        else:
+                            _stpyvista(plotter, key=f"pyvista_{selected}")
+                            rendered = True
 
-        # ── Plotly WebGL — default for x86 with integrated/discrete GPU ──────────
-        if not rendered:
-            fig3d = _model_plotly_3d_figure(cmds.models, selected)
-            if fig3d is not None:
-                st.plotly_chart(fig3d, use_container_width=True)
-                rendered = True
-            else:
-                st.caption("3D structure requires Plotly (install `plotly`).")
+            # ── Plotly WebGL — default for x86 with integrated/discrete GPU ──────────
+            if not rendered:
+                fig3d = _model_plotly_3d_figure(cmds.models, selected)
+                if fig3d is not None:
+                    st.plotly_chart(fig3d, use_container_width=True)
+                    rendered = True
+                else:
+                    st.caption("3D structure requires Plotly (install `plotly`).")
 
-        if rendered and mode != "canvas3d":
-            st.markdown(
-            """**Legend (3D)**
+            if rendered and mode != "canvas3d":
+                st.markdown(
+                    """**Legend (3D)**
 
 | Item | Meaning |
 |---|---|
@@ -2832,7 +2889,7 @@ def _render_models_page() -> None:
 Note: this is an **approximate schematic**, not exact tensor shapes.  
 Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any platform.
 """
-            )
+                )
 
 
         st.subheader("Save")
@@ -2851,20 +2908,22 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
             if Path(save_name).suffix.lower() != str(save_type).lower():
                 save_name = str(Path(save_name).with_suffix(str(save_type)))
 
-            dl_ext = Path(save_name).suffix.lower() if save_name else str(save_type)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=dl_ext) as f:
-                tmp_out = f.name
-            res = cmds.save_model(selected, tmp_out)
+            # Pass just the filename to save_model (not an absolute path)
+            res = cmds.save_model(selected, save_name)
             if "error" in res:
                 st.error(res["error"])
             else:
-                data = Path(tmp_out).read_bytes()
-                st.download_button(
-                    "Download",
-                    data=data,
-                    file_name=save_name or f"model_{selected}{dl_ext}",
-                    mime="application/octet-stream",
-                )
+                # Read the saved file from the resolved path
+                resolved_path = res.get("resolved_path")
+                if resolved_path and Path(resolved_path).exists():
+                    data = Path(resolved_path).read_bytes()
+                    dl_ext = Path(save_name).suffix.lower() if save_name else str(save_type)
+                    st.download_button(
+                        "Download",
+                        data=data,
+                        file_name=save_name or f"model_{selected}{dl_ext}",
+                        mime="application/octet-stream",
+                    )
 
     st.subheader("Load")
     up = st.file_uploader("Load a saved model (.pkl/.pth/.pt)", type=["pkl", "pth", "pt"], accept_multiple_files=False)
@@ -2888,11 +2947,29 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
 
         if not st.button("Load model", key="load_model_btn"):
             return
-        suffix = Path(up.name).suffix or ".pkl"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(raw)
-            tmp_path = f.name
-        res = cmds.load_model(tmp_path)
+        
+        # Use the original filename (relative path) - validate it's safe
+        import re as re_module
+        safe_name = Path(up.name).name or "model.pkl"
+        # Validate filename contains only allowed characters
+        allowed_pattern = re_module.compile(r"^[A-Za-z0-9._ -]+$")
+        if not allowed_pattern.match(safe_name):
+            st.error(f"Filename contains unsupported characters. Allowed: letters, numbers, dots, underscores, spaces, hyphens")
+            return
+        
+        # Write the file to the resolved path before loading
+        try:
+            import os as os_module
+            from pathlib import Path as PathlibPath
+            base_dir = os_module.path.join(tempfile.gettempdir(), "rasptorch_models")
+            os_module.makedirs(base_dir, exist_ok=True)
+            safe_path = os_module.path.join(os_module.path.realpath(base_dir), hashlib.sha256(safe_name.encode()).hexdigest())
+            PathlibPath(safe_path).write_bytes(raw)
+        except Exception as e:
+            st.error(f"Failed to prepare file for loading: {e}")
+            return
+        
+        res = cmds.load_model(safe_name)
         if "error" in res:
             st.error(res["error"])
             # If load failed, don't keep cached bytes around.
@@ -2936,7 +3013,7 @@ def _render_save_page() -> None:
 
     # URL-based selection persistence.
     try:
-        qmid = st.query_params.get("model_id")
+        qmid = _query_param_text("model_id")
         if qmid and isinstance(qmid, str) and qmid in model_ids:
             ctx["current_model"] = qmid
     except Exception:
@@ -2954,10 +3031,6 @@ def _render_save_page() -> None:
         format_func=_display_name,
     )
     ctx["current_model"] = selected
-    try:
-        st.query_params["model_id"] = str(selected)
-    except Exception:
-        pass
 
     col_name, col_type = st.columns([4, 1])
     with col_type:
@@ -3139,7 +3212,7 @@ def _render_build_train_page() -> None:
 
     # URL-based selection persistence (Train section).
     try:
-        qmid = st.query_params.get("model_id")
+        qmid = _query_param_text("model_id")
         if qmid and isinstance(qmid, str) and qmid in model_ids:
             ctx["current_model"] = qmid
     except Exception:
@@ -3157,10 +3230,6 @@ def _render_build_train_page() -> None:
         format_func=_display_name,
     )
     ctx["current_model"] = sel
-    try:
-        st.query_params["model_id"] = str(sel)
-    except Exception:
-        pass
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:

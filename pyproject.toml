@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rasptorch"
-version = "1.0.2"
+version = "1.0.3"
 description = "Deep learning library with NumPy and GPU backends (Vulkan, OpenCL, CUDA)."
 readme = "README.md"
 license = "MIT"
