@@ -3042,7 +3042,10 @@ def _render_save_page() -> None:
     if Path(save_name).suffix.lower() != str(save_type).lower():
         save_name = str(Path(save_name).with_suffix(str(save_type)))
 
-    dl_ext = Path(save_name).suffix.lower() if save_name else str(save_type)
+    allowed_exts = {".pkl", ".pth", ".pt"}
+    dl_ext = str(save_type).lower()
+    if dl_ext not in allowed_exts:
+        dl_ext = ".pkl"
     with tempfile.NamedTemporaryFile(delete=False, suffix=dl_ext) as f:
         tmp_out = f.name
     res = cmds.save_model(selected, tmp_out)
