@@ -1,1 +1,0 @@
-import{f as e}from"./emotion-styled.browser.esm.j1V2KkYw.js";function t(e){return e instanceof Error?e:Error(`${e}`)}var n=()=>e();export{t as n,n as t};

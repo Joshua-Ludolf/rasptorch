@@ -1163,8 +1163,11 @@ Type 'help <command>' for more details.
                 print("✗ Usage: backend use <numpy|vulkan|opencl|cuda|auto>")
                 return
             requested = str(requested).lower()
+            # Friendly aliases for common user inputs.
+            if requested in {"pyopencl", "cl"}:
+                requested = "opencl"
             if requested not in {"cpu", "numpy", "vulkan", "opencl", "cuda", "auto"}:
-                print(f"✗ Unknown backend: {requested}")
+                print(f"✗ Unknown backend: {requested} (expected numpy|vulkan|opencl|cuda|auto)")
                 return
             try:
                 from ..utils import backend_device

@@ -9,6 +9,7 @@ wheels/
 *.egg-info
 
 # Virtual environments
+.env
 .venv
 
 # text files

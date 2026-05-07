@@ -2,7 +2,7 @@ import argparse
 import numpy as np
 
 from rasptorch.data import DataLoader, TensorDataset
-from rasptorch.gpu_training import train_mlp_regression_gpu
+from rasptorch.gpu_training import BackendMLP, train_mlp_regression_gpu
 from rasptorch.nn import Linear, ReLU, Sequential
 from rasptorch.optim import SGD
 from rasptorch.tensor import Tensor
@@ -26,15 +26,27 @@ def main() -> None:
     x = np.linspace(-1, 1, 200, dtype="float32").reshape(-1, 1)
     y = 2 * (x ** 2) + 1
 
-    selected_backend = connect_backend("vulkan", strict=False) if args.device in {"gpu", "auto"} else connect_backend("cpu", strict=False)
-    use_gpu_training = selected_backend.name == "vulkan" and args.device in {"gpu", "auto"}
-    if args.device == "auto":
-        if use_gpu_training:
-            print("Auto device selected: using Vulkan GPU backend.")
-        else:
-            print("Auto device selected: Vulkan unavailable, falling back to CPU.")
+    if args.device in {"gpu", "auto"}:
+        # Prefer Vulkan, but fall back to OpenCL/CUDA if Vulkan isn't available.
+        selected_backend = connect_backend("vulkan", strict=False)
+        if selected_backend.name != "vulkan":
+            selected_backend = connect_backend("opencl", strict=False)
+        if selected_backend.name not in {"vulkan", "opencl"}:
+            selected_backend = connect_backend("cuda", strict=False)
+    else:
+        selected_backend = connect_backend("cpu", strict=False)
 
-    if use_gpu_training:
+    use_vulkan_training = selected_backend.name == "vulkan" and args.device in {"gpu", "auto"}
+    use_backend_training = selected_backend.name in {"opencl", "cuda"} and args.device in {"gpu", "auto"}
+    if args.device == "auto":
+        if use_vulkan_training:
+            print("Auto device selected: using Vulkan backend.")
+        elif use_backend_training:
+            print(f"Auto device selected: Vulkan unavailable, using {selected_backend.name} backend.")
+        else:
+            print("Auto device selected: no GPU backend available, falling back to CPU.")
+
+    if use_vulkan_training:
         try:
             train_mlp_regression_gpu(
                 x,
@@ -53,6 +65,42 @@ def main() -> None:
                 "and 'glslc' (shader compiler) is installed on the system."
             )
             raise SystemExit(1) from e
+
+        print("Training done.")
+        return
+
+    if use_backend_training:
+        dataset = TensorDataset(np.asarray(x, dtype=np.float32), np.asarray(y, dtype=np.float32))
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+
+        model = BackendMLP(
+            in_features=x.shape[1],
+            hidden=16,
+            out_features=y.shape[1],
+            backend=selected_backend.name,
+            seed=0,
+            optimizer="sgd",
+            lr=args.lr,
+            strict=False,
+        )
+
+        for epoch in range(args.epochs):
+            epoch_loss = 0.0
+            num_batches = 0
+            should_log = (args.log_every > 0 and (epoch % args.log_every == 0)) or (epoch == args.epochs - 1)
+            for xb_np, yb_np in loader:
+                loss = model.train_step(xb_np, yb_np, lr=args.lr, return_loss=should_log)
+                if should_log and loss is not None:
+                    epoch_loss += float(loss)
+                    num_batches += 1
+
+            if should_log:
+                avg_loss = epoch_loss / max(1, num_batches)
+                print(f"Epoch {epoch}: loss={avg_loss:.6f}")
+
+        if args.save:
+            model.save(args.save)
+            print(f"Saved model to: {args.save}")
 
         print("Training done.")
         return
