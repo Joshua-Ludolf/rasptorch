@@ -2917,15 +2917,16 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
                 # convention as the command layer, instead of trusting a returned path.
                 try:
                     safe_root = (Path(tempfile.gettempdir()) / "rasptorch" / "models").resolve()
-                    input_path = (save_name or "").strip()
-                    normalized_input = str(Path(input_path))
-                    ext = Path(normalized_input).suffix or ".pkl"
-                    key = hashlib.sha256(normalized_input.encode("utf-8")).hexdigest() + ext
+                    allowed_exts = {".pkl", ".pth", ".pt"}
+                    trusted_ext = str(save_type).lower() if str(save_type).lower() in allowed_exts else ".pkl"
+                    base_name = Path((save_name or f"model_{selected}")).stem
+                    key_source = f"{base_name}{trusted_ext}"
+                    key = hashlib.sha256(key_source.encode("utf-8")).hexdigest() + trusted_ext
                     rp = (safe_root / key).resolve()
                     rp.relative_to(safe_root)
                     if rp.exists():
                         data = rp.read_bytes()
-                        dl_ext = Path(save_name).suffix.lower() if save_name else str(save_type)
+                        dl_ext = trusted_ext
                         st.download_button(
                             "Download",
                             data=data,
