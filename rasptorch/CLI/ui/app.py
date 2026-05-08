@@ -2914,26 +2914,13 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
                 st.error(res["error"])
             else:
                 try:
-                    import re as re_module
-
                     resolved_raw = str(res.get("resolved_path") or "").strip()
-                    if not resolved_raw:
-                        raise ValueError("Missing resolved save path")
-
-                    resolved_path = Path(resolved_raw).resolve()
-                    safe_root = (Path(tempfile.gettempdir()) / "rasptorch_models").resolve()
-                    try:
-                        rel_path = resolved_path.relative_to(safe_root)
-                    except ValueError:
-                        raise ValueError("Resolved save path is outside the allowed models directory")
-
-                    if len(rel_path.parts) != 1 or not re_module.fullmatch(r"[a-f0-9]{64}", rel_path.name):
-                        raise ValueError("Resolved save path does not match expected storage layout")
-                    if not resolved_path.exists():
-                        st.error("Saved model file was not found in the expected models directory.")
+                    bytes_result = cmds.read_saved_model_bytes(resolved_raw)
+                    if "error" in bytes_result:
+                        st.error(bytes_result["error"])
                         return
 
-                    data = resolved_path.read_bytes()
+                    data = bytes_result.get("data", b"")
                     st.download_button(
                         "Download",
                         data=data,

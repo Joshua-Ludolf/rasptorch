@@ -7,7 +7,7 @@ from __future__ import annotations
 
 
 from typing import Any, Dict, Tuple, List, Optional, Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import hashlib
 import numpy as np
@@ -1313,6 +1313,38 @@ class ModelCommands:
         # so it is safe to use directly as a filename component.
         name_hash = hashlib.sha256(raw_posix.encode("utf-8", errors="replace")).hexdigest()
         return os.path.join(base_dir_real, name_hash)
+
+    def read_saved_model_bytes(self, resolved_path: str) -> Dict[str, Any]:
+        """Read bytes from a command-resolved model path after strict confinement validation."""
+        try:
+            raw = str(resolved_path or "").strip()
+            if not raw:
+                return {"error": "Missing resolved model path"}
+
+            safe_root = (Path(tempfile.gettempdir()) / "rasptorch_models").resolve()
+            candidate = Path(raw).resolve()
+
+            try:
+                rel = candidate.relative_to(safe_root)
+            except ValueError:
+                return {"error": "Resolved save path is outside the allowed models directory"}
+
+            if len(rel.parts) != 1 or not re.fullmatch(r"[a-f0-9]{64}", rel.name):
+                return {"error": "Resolved save path does not match expected storage layout"}
+
+            safe_candidate = (safe_root / rel.name).resolve()
+            try:
+                safe_candidate.relative_to(safe_root)
+            except ValueError:
+                return {"error": "Resolved save path is outside the allowed models directory"}
+            if safe_candidate != candidate:
+                return {"error": "Resolved save path does not match expected storage layout"}
+            if not safe_candidate.exists():
+                return {"error": "Saved model file was not found in the expected models directory."}
+
+            return {"status": "success", "data": safe_candidate.read_bytes()}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _safe_torch_load(self, path: str) -> Dict[str, Any]:
         """Safely load a torch checkpoint, using weights_only=True to avoid
