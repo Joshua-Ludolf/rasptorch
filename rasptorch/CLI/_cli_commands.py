@@ -1322,23 +1322,21 @@ class ModelCommands:
                 return {"error": "Missing resolved model path"}
 
             safe_root = (Path(tempfile.gettempdir()) / "rasptorch_models").resolve()
-            candidate = Path(raw).resolve()
-
-            try:
-                rel = candidate.relative_to(safe_root)
-            except ValueError:
+            safe_root_posix = safe_root.as_posix()
+            raw_posix = raw.replace("\\", "/")
+            prefix = safe_root_posix + "/"
+            if not raw_posix.startswith(prefix):
                 return {"error": "Resolved save path is outside the allowed models directory"}
+            rel_name = raw_posix[len(prefix):]
 
-            if len(rel.parts) != 1 or not re.fullmatch(r"[a-f0-9]{64}", rel.name):
+            if "/" in rel_name or not re.fullmatch(r"[a-f0-9]{64}", rel_name):
                 return {"error": "Resolved save path does not match expected storage layout"}
 
-            safe_candidate = (safe_root / rel.name).resolve()
+            safe_candidate = (safe_root / rel_name).resolve()
             try:
                 safe_candidate.relative_to(safe_root)
             except ValueError:
                 return {"error": "Resolved save path is outside the allowed models directory"}
-            if safe_candidate != candidate:
-                return {"error": "Resolved save path does not match expected storage layout"}
             if not safe_candidate.exists():
                 return {"error": "Saved model file was not found in the expected models directory."}
 
