@@ -255,17 +255,7 @@ class OpenCLBackend(Backend):
         except Exception as e:
             self._available = False
             if strict:
-                msg = str(e)
-                # Common case: pyopencl is installed but no OpenCL ICD/platform is present.
-                if "PLATFORM_NOT_FOUND_KHR" in msg or "No OpenCL platforms" in msg:
-                    msg = (
-                        f"{msg}\n"
-                        "Hint: No OpenCL platform is visible. On Debian, install an OpenCL ICD (runtime), e.g.:\n"
-                        "  sudo apt install -y pocl-opencl-icd   # CPU OpenCL (always works)\n"
-                        "  sudo apt install -y mesa-opencl-icd   # Mesa OpenCL (may expose GPU if supported)\n"
-                        "Then verify with: clinfo (Number of platforms should be > 0)."
-                    )
-                raise RuntimeError(f"OpenCL initialization failed: {msg}") from e
+                raise RuntimeError(f"OpenCL initialization failed: {e}") from e
 
     def shutdown(self) -> None:
         self._queue = None

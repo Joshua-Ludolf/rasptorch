@@ -39,10 +39,6 @@ Built-in backend adapters:
 
 Raspberry Pi 5’s GPU stack is Vulkan-first. If you want the `opencl` backend to run on the **Vulkan GPU**, you typically need an OpenCL ICD that targets Vulkan (commonly `clvk`). Once installed, rasptorch’s OpenCL backend will prefer GPU-like devices automatically.
 
-- ` sudo apt install clvk `
-- ` sudo apt install -y pocl-opencl-icd `
-- ` sudo apt install -y mesa-opencl-icd `
-
 Useful environment variables for selecting the right OpenCL runtime/device:
 - `RASPTORCH_OPENCL_PREFER`: `gpu` (default) or `clvk`/`vulkan` to strongly prefer a Vulkan-backed OpenCL platform
 - `RASPTORCH_OPENCL_PLATFORM`: substring match against platform name/vendor
@@ -94,12 +90,7 @@ pip install rasptorch
 **B. Development Install (Full Capability):**
 For local development and access to all potential backends:
 ```bash
-# Recommended (uv-managed project environment)
-uv sync --group dev
-
-# Alternative (pip)
-pip install -e .
-pip install build pytest twine
+pip install -e ".[dev]"
 ```
 
 **C. GPU Mode Prerequisites:**
@@ -110,15 +101,13 @@ For systems with a proper GPU setup (e.g., Raspberry Pi 5), install the GPU back
 
 # Prerequisites for Vulkan backend (Raspberry Pi 4/5 & Linux)
 sudo apt update
-sudo apt install -y glslc  # Raspberry Pi 4/5 & Linux
+sudo apt install -y glslc (for raspberry pi 4/5 & linux operating systems)
 
 # For Windows, install the Vulkan SDK from LunarG:
 ./VulkanSDK-Installer.exe --accept-licenses --default-answer --confirm-command install
 
 # Then install rasptorch with GPU support after installing prerequisites (for either platform):
 pip install rasptorch[gpu]
-
-# Note: `gpu` installs Vulkan + OpenCL support (Pi-friendly). For CUDA, use `rasptorch[cuda]`.
 ```
 
 You can also install only the backend(s) you need instead of the entire `gpu` extra. Examples:
