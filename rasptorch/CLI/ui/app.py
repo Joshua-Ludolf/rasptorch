@@ -2913,17 +2913,22 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
             if "error" in res:
                 st.error(res["error"])
             else:
-                # Read the saved file from the resolved path
-                resolved_path = res.get("resolved_path")
-                if resolved_path and Path(resolved_path).exists():
-                    data = Path(resolved_path).read_bytes()
-                    dl_ext = Path(save_name).suffix.lower() if save_name else str(save_type)
+                try:
+                    resolved_raw = str(res.get("resolved_path") or "").strip()
+                    bytes_result = cmds.read_saved_model_bytes(save_name, resolved_raw)
+                    if "error" in bytes_result:
+                        st.error(bytes_result["error"])
+                        return
+
+                    data = bytes_result.get("data", b"")
                     st.download_button(
                         "Download",
                         data=data,
-                        file_name=save_name or f"model_{selected}{dl_ext}",
+                        file_name=save_name or f"model_{selected}{save_type}",
                         mime="application/octet-stream",
                     )
+                except Exception:
+                    st.error("Resolved save path is invalid or outside the allowed models directory.")
 
     st.subheader("Load")
     up = st.file_uploader("Load a saved model (.pkl/.pth/.pt)", type=["pkl", "pth", "pt"], accept_multiple_files=False)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 
 from typing import Any, Dict, Tuple, List, Optional, Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
 import hashlib
 import numpy as np
@@ -1313,6 +1313,35 @@ class ModelCommands:
         # so it is safe to use directly as a filename component.
         name_hash = hashlib.sha256(raw_posix.encode("utf-8", errors="replace")).hexdigest()
         return os.path.join(base_dir_real, name_hash)
+
+    def read_saved_model_bytes(self, save_path: str, resolved_path: str) -> Dict[str, Any]:
+        """Read bytes from a saved model after validating resolved-path agreement and confinement."""
+        try:
+            resolved_raw = str(resolved_path or "").strip()
+            if not resolved_raw:
+                return {"error": "Missing resolved model path"}
+
+            expected = Path(self._resolve_model_save_path(save_path)).resolve()
+            safe_root = (Path(tempfile.gettempdir()) / "rasptorch_models").resolve()
+            try:
+                expected.relative_to(safe_root)
+            except ValueError:
+                return {"error": "Resolved save path is outside the allowed models directory"}
+
+            expected_name = expected.name
+            if not re.fullmatch(r"[a-f0-9]{64}", expected_name):
+                return {"error": "Resolved save path does not match expected storage layout"}
+
+            resolved_norm = resolved_raw.replace("\\", "/")
+            if resolved_norm != expected.as_posix():
+                return {"error": "Resolved save path does not match expected storage layout"}
+
+            if not expected.exists():
+                return {"error": "Saved model file was not found in the expected models directory."}
+
+            return {"status": "success", "data": expected.read_bytes()}
+        except Exception as e:
+            return {"error": str(e)}
 
     def _safe_torch_load(self, path: str) -> Dict[str, Any]:
         """Safely load a torch checkpoint, using weights_only=True to avoid
