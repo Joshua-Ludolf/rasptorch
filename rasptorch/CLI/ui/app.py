@@ -2913,28 +2913,21 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
             if "error" in res:
                 st.error(res["error"])
             else:
-                # Derive the saved file path locally using the same safe storage
-                # convention as the command layer, instead of trusting a returned path.
                 try:
-                    safe_root = (Path(tempfile.gettempdir()) / "rasptorch" / "models").resolve()
-                    allowed_exts = {".pkl", ".pth", ".pt"}
-                    trusted_ext = str(save_type).lower() if str(save_type).lower() in allowed_exts else ".pkl"
-                    base_name = Path((save_name or f"model_{selected}")).stem
-                    key_source = f"{base_name}{trusted_ext}"
-                    key = hashlib.sha256(key_source.encode("utf-8")).hexdigest() + trusted_ext
-                    rp = (safe_root / key).resolve()
-                    rp.relative_to(safe_root)
-                    if rp.exists():
-                        data = rp.read_bytes()
-                        dl_ext = trusted_ext
-                        st.download_button(
-                            "Download",
-                            data=data,
-                            file_name=save_name or f"model_{selected}{dl_ext}",
-                            mime="application/octet-stream",
-                        )
-                    else:
-                        st.error("Saved model file was not found in the expected models directory.")
+                    resolved_path = Path(res.get("resolved_path", "")).resolve()
+                    safe_root = (Path(tempfile.gettempdir()) / "rasptorch_models").resolve()
+                    try:
+                        resolved_path.relative_to(safe_root)
+                    except ValueError:
+                        raise ValueError("Resolved save path is outside the allowed models directory")
+
+                    data = resolved_path.read_bytes()
+                    st.download_button(
+                        "Download",
+                        data=data,
+                        file_name=save_name or f"model_{selected}{save_type}",
+                        mime="application/octet-stream",
+                    )
                 except Exception:
                     st.error("Resolved save path is invalid or outside the allowed models directory.")
 
