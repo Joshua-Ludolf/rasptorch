@@ -2915,7 +2915,7 @@ Tip: set `RASPTORCH_UI_3D_RENDER=canvas3d` to use the WebGL-free renderer on any
             else:
                 try:
                     resolved_raw = str(res.get("resolved_path") or "").strip()
-                    bytes_result = cmds.read_saved_model_bytes(resolved_raw)
+                    bytes_result = cmds.read_saved_model_bytes(save_name, resolved_raw)
                     if "error" in bytes_result:
                         st.error(bytes_result["error"])
                         return

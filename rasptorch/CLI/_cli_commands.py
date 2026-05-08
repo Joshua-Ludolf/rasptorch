@@ -1314,33 +1314,32 @@ class ModelCommands:
         name_hash = hashlib.sha256(raw_posix.encode("utf-8", errors="replace")).hexdigest()
         return os.path.join(base_dir_real, name_hash)
 
-    def read_saved_model_bytes(self, resolved_path: str) -> Dict[str, Any]:
-        """Read bytes from a command-resolved model path after strict confinement validation."""
+    def read_saved_model_bytes(self, save_path: str, resolved_path: str) -> Dict[str, Any]:
+        """Read bytes from a saved model after validating resolved-path agreement and confinement."""
         try:
-            raw = str(resolved_path or "").strip()
-            if not raw:
+            resolved_raw = str(resolved_path or "").strip()
+            if not resolved_raw:
                 return {"error": "Missing resolved model path"}
 
+            expected = Path(self._resolve_model_save_path(save_path)).resolve()
             safe_root = (Path(tempfile.gettempdir()) / "rasptorch_models").resolve()
-            safe_root_posix = safe_root.as_posix()
-            raw_posix = raw.replace("\\", "/")
-            prefix = safe_root_posix + "/"
-            if not raw_posix.startswith(prefix):
-                return {"error": "Resolved save path is outside the allowed models directory"}
-            rel_name = raw_posix[len(prefix):]
-
-            if "/" in rel_name or not re.fullmatch(r"[a-f0-9]{64}", rel_name):
-                return {"error": "Resolved save path does not match expected storage layout"}
-
-            safe_candidate = (safe_root / rel_name).resolve()
             try:
-                safe_candidate.relative_to(safe_root)
+                expected.relative_to(safe_root)
             except ValueError:
                 return {"error": "Resolved save path is outside the allowed models directory"}
-            if not safe_candidate.exists():
+
+            expected_name = expected.name
+            if not re.fullmatch(r"[a-f0-9]{64}", expected_name):
+                return {"error": "Resolved save path does not match expected storage layout"}
+
+            resolved_norm = resolved_raw.replace("\\", "/")
+            if resolved_norm != expected.as_posix():
+                return {"error": "Resolved save path does not match expected storage layout"}
+
+            if not expected.exists():
                 return {"error": "Saved model file was not found in the expected models directory."}
 
-            return {"status": "success", "data": safe_candidate.read_bytes()}
+            return {"status": "success", "data": expected.read_bytes()}
         except Exception as e:
             return {"error": str(e)}
 
