@@ -202,6 +202,12 @@ class Tensor:
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return f"Tensor(data={self.data!r}, requires_grad={self.requires_grad})"
 
+    def __del__(self) -> None:  # pragma: no cover - temporary tensors cleanup
+        try:
+            self.free()
+        except Exception:
+            pass
+
     def detach(self) -> "Tensor":
         """Return a Tensor that shares storage but is detached from autograd."""
 
