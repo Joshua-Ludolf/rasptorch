@@ -63,7 +63,7 @@ secretstorage==3.5.0
 siphash24==1.8
 six==1.17.0
 smmap==5.0.3
-starlette==1.0.0
+starlette==1.1.0
 streamlit==1.57.0
 tenacity==9.1.4
 toml==0.10.2
