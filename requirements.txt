@@ -50,7 +50,7 @@ pyopencl==2026.1.2
 pyproject-hooks==1.2.0
 pytest==9.0.3
 python-dateutil==2.9.0.post0
-python-multipart==0.0.28
+python-multipart==0.0.29
 pytools==2026.1
 readme-renderer==44.0
 referencing==0.37.0
