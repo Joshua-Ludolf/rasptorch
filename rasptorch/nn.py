@@ -203,10 +203,10 @@ class Module:
 
 
 class Linear(Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, rng: np.random.Generator | None = None) -> None:
         super().__init__()
         self.weight = Parameter(np.empty((out_features, in_features), dtype=np.float32))
-        init_ops.kaiming_normal_(self.weight, nonlinearity="relu")
+        init_ops.kaiming_normal_(self.weight, nonlinearity="relu", rng=rng)
         if bias:
             self.bias = Parameter(np.zeros(out_features, dtype="float32"))
         else:

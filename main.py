@@ -22,7 +22,9 @@ def main() -> None:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save", type=str, default="", help="Save trained weights to a .pth file")
     args = parser.parse_args()
-    np.random.seed(args.seed)
+
+    # Create a single RNG for consistent CPU/GPU initialization
+    rng = np.random.default_rng(args.seed)
 
     # Generate synthetic data: y = 2x^2 + 1 (nonlinear)
     x = np.linspace(-1, 1, 200, dtype="float32").reshape(-1, 1)
@@ -74,7 +76,7 @@ def main() -> None:
 
     if use_backend_training:
         dataset = TensorDataset(np.asarray(x, dtype=np.float32), np.asarray(y, dtype=np.float32))
-        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, rng=rng)
 
         model = BackendMLP(
             in_features=x.shape[1],
@@ -112,13 +114,14 @@ def main() -> None:
     y_t = Tensor(y, requires_grad=False)
 
     dataset = TensorDataset(x_t.data, y_t.data)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, rng=rng)
 
     # A slightly deeper model using Sequential + ReLU
+    # Use the same rng for consistent CPU/GPU initialization
     model = Sequential(
-        Linear(1, 16),
+        Linear(1, 16, rng=rng),
         ReLU(),
-        Linear(16, 1),
+        Linear(16, 1, rng=rng),
     )
     if args.device == "gpu-autograd":
         model.to("gpu")

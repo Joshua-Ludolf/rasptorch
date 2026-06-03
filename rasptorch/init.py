@@ -55,13 +55,17 @@ def _calculate_gain(nonlinearity: str, a: float = 0.0) -> float:
     return table.get(nonlinearity, 1.0)
 
 
-def uniform_(tensor: Tensor, a: float = 0.0, b: float = 1.0) -> Tensor:
-    values = np.random.uniform(float(a), float(b), size=_shape_of(tensor)).astype(np.float32)
+def uniform_(tensor: Tensor, a: float = 0.0, b: float = 1.0, rng: np.random.Generator | None = None) -> Tensor:
+    if rng is None:
+        rng = np.random.default_rng()
+    values = rng.uniform(float(a), float(b), size=_shape_of(tensor)).astype(np.float32)
     return _assign(tensor, values)
 
 
-def normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0) -> Tensor:
-    values = np.random.normal(float(mean), float(std), size=_shape_of(tensor)).astype(np.float32)
+def normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0, rng: np.random.Generator | None = None) -> Tensor:
+    if rng is None:
+        rng = np.random.default_rng()
+    values = rng.normal(float(mean), float(std), size=_shape_of(tensor)).astype(np.float32)
     return _assign(tensor, values)
 
 
@@ -78,16 +82,16 @@ def ones_(tensor: Tensor) -> Tensor:
     return constant_(tensor, 1.0)
 
 
-def xavier_uniform_(tensor: Tensor, gain: float = 1.0) -> Tensor:
+def xavier_uniform_(tensor: Tensor, gain: float = 1.0, rng: np.random.Generator | None = None) -> Tensor:
     fan_in, fan_out = _calculate_fan_in_and_fan_out(_shape_of(tensor))
     bound = float(gain) * math.sqrt(6.0 / max(1, fan_in + fan_out))
-    return uniform_(tensor, -bound, bound)
+    return uniform_(tensor, -bound, bound, rng=rng)
 
 
-def xavier_normal_(tensor: Tensor, gain: float = 1.0) -> Tensor:
+def xavier_normal_(tensor: Tensor, gain: float = 1.0, rng: np.random.Generator | None = None) -> Tensor:
     fan_in, fan_out = _calculate_fan_in_and_fan_out(_shape_of(tensor))
     std = float(gain) * math.sqrt(2.0 / max(1, fan_in + fan_out))
-    return normal_(tensor, 0.0, std)
+    return normal_(tensor, 0.0, std, rng=rng)
 
 
 def kaiming_uniform_(
@@ -95,12 +99,13 @@ def kaiming_uniform_(
     a: float = 0.0,
     mode: str = "fan_in",
     nonlinearity: str = "leaky_relu",
+    rng: np.random.Generator | None = None,
 ) -> Tensor:
     fan_in, fan_out = _calculate_fan_in_and_fan_out(_shape_of(tensor))
     fan = fan_in if mode == "fan_in" else fan_out
     gain = _calculate_gain(nonlinearity, a)
     bound = math.sqrt(3.0) * gain / math.sqrt(max(1, fan))
-    return uniform_(tensor, -bound, bound)
+    return uniform_(tensor, -bound, bound, rng=rng)
 
 
 def kaiming_normal_(
@@ -108,22 +113,26 @@ def kaiming_normal_(
     a: float = 0.0,
     mode: str = "fan_in",
     nonlinearity: str = "leaky_relu",
+    rng: np.random.Generator | None = None,
 ) -> Tensor:
     fan_in, fan_out = _calculate_fan_in_and_fan_out(_shape_of(tensor))
     fan = fan_in if mode == "fan_in" else fan_out
     gain = _calculate_gain(nonlinearity, a)
     std = gain / math.sqrt(max(1, fan))
-    return normal_(tensor, 0.0, std)
+    return normal_(tensor, 0.0, std, rng=rng)
 
 
-def orthogonal_(tensor: Tensor, gain: float = 1.0) -> Tensor:
+def orthogonal_(tensor: Tensor, gain: float = 1.0, rng: np.random.Generator | None = None) -> Tensor:
     shape = _shape_of(tensor)
     if len(shape) < 2:
         raise ValueError("orthogonal_ requires a tensor with at least 2 dimensions")
 
+    if rng is None:
+        rng = np.random.default_rng()
+
     rows = shape[0]
     cols = int(np.prod(shape[1:]))
-    flat = np.random.normal(0.0, 1.0, size=(rows, cols)).astype(np.float32)
+    flat = rng.normal(0.0, 1.0, size=(rows, cols)).astype(np.float32)
     if rows < cols:
         flat = flat.T
     q, r = np.linalg.qr(flat)

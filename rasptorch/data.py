@@ -43,17 +43,22 @@ class DataLoader(Iterable):
         dataset: Dataset,
         batch_size: int = 32,
         shuffle: bool = True,
+        rng: np.random.Generator | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.rng = rng
 
     def __iter__(self) -> Iterator:
         indices = np.arange(len(self.dataset))
         if self.shuffle:
-            np.random.shuffle(indices)
+            if self.rng is not None:
+                self.rng.shuffle(indices)
+            else:
+                np.random.shuffle(indices)
         batch: List[int] = []
         for idx in indices:
             batch.append(int(idx))

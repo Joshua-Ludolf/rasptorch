@@ -27,9 +27,18 @@ def test_main_gpu_passes_seed_to_vulkan_trainer(monkeypatch) -> None:
     assert seen["seed"] == 123
 
 
-def test_main_sets_numpy_seed(monkeypatch) -> None:
-    seen: list[int] = []
-    monkeypatch.setattr(main_script.np.random, "seed", lambda value: seen.append(int(value)))
+def test_main_creates_rng_from_seed(monkeypatch) -> None:
+    """Test that main.py creates a np.random.Generator with the correct seed."""
+    rng_configs: list[int] = []
+
+    original_default_rng = main_script.np.random.default_rng
+
+    def _fake_default_rng(seed=None):
+        if seed is not None:
+            rng_configs.append(seed)
+        return original_default_rng(seed)
+
+    monkeypatch.setattr(main_script.np.random, "default_rng", _fake_default_rng)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -37,4 +46,5 @@ def test_main_sets_numpy_seed(monkeypatch) -> None:
     )
 
     main_script.main()
-    assert seen == [77]
+    # Verify that default_rng was called with seed=77
+    assert 77 in rng_configs

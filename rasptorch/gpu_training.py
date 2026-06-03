@@ -460,8 +460,11 @@ def train_mlp_regression_gpu(
     vk.init(strict=True)
     print("GPU training backend: Vulkan")
 
+    # Create rng for reproducible shuffling
+    rng = np.random.default_rng(seed)
+
     dataset = TensorDataset(np.asarray(x, dtype=np.float32), np.asarray(y, dtype=np.float32))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, rng=rng)
 
     model = GpuMLP(in_features=x.shape[1], hidden=hidden, out_features=y.shape[1], seed=seed)
     try:
