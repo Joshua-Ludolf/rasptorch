@@ -153,6 +153,10 @@ def run_benchmarks() -> None:
     # Keep these modest so it runs quickly on a Pi.
     warmup = 5
     iters = 50
+    print(
+        "Note: compute+readback timings include host-device transfer overhead; "
+        "on Raspberry Pi eGPU/PCIe setups this can dominate and make GPU slower than CPU."
+    )
 
     rng = np.random.default_rng(0)
 

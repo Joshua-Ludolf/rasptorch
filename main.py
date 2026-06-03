@@ -18,9 +18,11 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducible CPU/GPU comparisons")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save", type=str, default="", help="Save trained weights to a .pth file")
     args = parser.parse_args()
+    np.random.seed(args.seed)
 
     # Generate synthetic data: y = 2x^2 + 1 (nonlinear)
     x = np.linspace(-1, 1, 200, dtype="float32").reshape(-1, 1)
@@ -54,6 +56,7 @@ def main() -> None:
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 lr=args.lr,
+                seed=args.seed,
                 log_every=args.log_every,
                 save_path=(args.save or None),
             )
@@ -78,7 +81,7 @@ def main() -> None:
             hidden=16,
             out_features=y.shape[1],
             backend=selected_backend.name,
-            seed=0,
+            seed=args.seed,
             optimizer="sgd",
             lr=args.lr,
             strict=False,
