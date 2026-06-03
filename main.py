@@ -117,7 +117,6 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, rng=rng)
 
     # A slightly deeper model using Sequential + ReLU
-    # Use the same rng for consistent CPU/GPU initialization
     model = Sequential(
         Linear(1, 16, rng=rng),
         ReLU(),
