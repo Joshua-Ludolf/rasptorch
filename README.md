@@ -158,8 +158,10 @@ The `main.py` script controls the operational mode:
 
 **Example Training Command:**
 ```bash
-uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.01
+uv run main.py --device gpu --epochs 50 --batch-size 32 --lr 0.01 --seed 0
 ```
+
+> **Reproducibility tip:** use the same `--seed` value when comparing CPU and GPU runs; otherwise losses can differ due to different random initialization/shuffle order.
 
 ---
 
@@ -253,6 +255,7 @@ Results are provided in JSON format (with `--json` flag) including:
 - If you see `VkErrorDeviceLost`, reduce `--vulkan-submit-every` (try `4` or `1`)
 - Larger problem sizes better amortize GPU setup overhead
 - Command buffer batching (`--vulkan-submit-every`) balances latency and throughput
+- Compute+readback timing includes transfer overhead. On Raspberry Pi eGPU setups over PCIe, this overhead can outweigh compute gains, so CPU can be faster for smaller workloads.
 
 For detailed optimization guide, see [VULKAN_OPTIMIZATION.md](VULKAN_OPTIMIZATION.md).
 
