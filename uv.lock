@@ -390,13 +390,13 @@ nvtx = [
 
 [[package]]
 name = "cupy"
-version = "14.0.1"
+version = "14.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-pathfinder" },
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/18/3c/d3aa4aaf179567f6588dbfb18b29471949fb782fc79fddfd43480b052d71/cupy-14.0.1.tar.gz", hash = "sha256:4b673ab2d8b2329abe7ae0a7ae6159656044a8eecca56cf0b834b7c907063205", size = 3899909, upload-time = "2026-02-20T10:25:27.585Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/86/e99f52f4a50e5faaf4932cf3574d64d870bce224314be7fca91a6d02cda7/cupy-14.1.1.tar.gz", hash = "sha256:3d4d193a5b028e1823d1d44fe6268364d8fb76c3793ad4e28e1427c56ceb2f80", size = 3953009, upload-time = "2026-06-01T04:55:30.379Z" }
 
 [[package]]
 name = "docutils"
