@@ -2,12 +2,16 @@ from __future__ import annotations as annotate
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
+import csv
+import io
 import json
 import sys
 import tempfile
 import hashlib
 import platform
 import os
+import time
+import math
 import streamlit as st
 import numpy as np
 
@@ -26,7 +30,7 @@ try:
 except Exception:  # pragma: no cover
     pv = None  # type: ignore[assignment]
 
-_UI_BUILD = "2026-03-27-activation-conditional-v1"
+_UI_BUILD = "2026-08-05-dashboard-events-training-data-v1"
 
 
 # When running `streamlit run` from inside `rasptorch/ui`, Python's import
@@ -2078,6 +2082,7 @@ def _init_state() -> None:
     ss = st.session_state
     ss.setdefault("nav", "Models")
     ss.setdefault("repl_log", [])
+    ss.setdefault("dashboard_events", [])
     ss.setdefault("_backend_initialized", False)
     ss.setdefault(
         "repl_context",
@@ -2089,9 +2094,12 @@ def _init_state() -> None:
             "optimizer": "Adam",
             "device": "cpu",
             "backend": "auto",
+            "backend_choice": "auto",
             "loaded_files": {},
             "upload_cache": {},
             "last_loaded_hash": None,
+            "train_data": None,
+            "train_data_summary": "Synthetic batches",
             # Models that have successfully completed at least one training run in this UI session.
             "trained_models": [],
         },
@@ -2163,6 +2171,247 @@ def _append_log(lines: List[str] | str) -> None:
         st.session_state.repl_log.append(lines)
     else:
         st.session_state.repl_log.extend(lines)
+
+
+def _record_event(event: Dict[str, Any]) -> None:
+    payload = dict(event)
+    payload.setdefault("timestamp", time.strftime("%H:%M:%S"))
+    events = st.session_state.setdefault("dashboard_events", [])
+    events.append(payload)
+    st.session_state.dashboard_events = events[-300:]
+
+
+def _format_event_message(event: Dict[str, Any]) -> str:
+    kind = str(event.get("event", "event"))
+    model_id = str(event.get("model_id") or "")
+    prefix = f"[{event.get('timestamp', '')}] {kind}"
+    if model_id:
+        prefix += f" {model_id[:8]}"
+    if kind == "epoch":
+        return f"{prefix} loss={float(event.get('loss', 0.0)):.6f}"
+    if kind == "done":
+        return f"{prefix} final_loss={float(event.get('final_loss', 0.0)):.6f}"
+    if kind == "start":
+        return f"{prefix} epochs={event.get('epochs', '?')}"
+    if event.get("message"):
+        return f"{prefix} {event['message']}"
+    return prefix
+
+
+def _append_event(event: Dict[str, Any]) -> None:
+    _record_event(event)
+    _append_log(_format_event_message(event))
+
+
+def _encode_csv_column(values: List[Any], column_name: str) -> Tuple[np.ndarray, Dict[str, Any]]:
+    cleaned = ["" if value is None else str(value).strip() for value in values]
+    try:
+        numeric = np.asarray([float(value) for value in cleaned], dtype=np.float32)
+        return numeric.reshape(-1, 1), {"kind": "numeric", "column": column_name}
+    except (TypeError, ValueError):
+        categories: List[str] = []
+        seen: set[str] = set()
+        for value in cleaned:
+            if value not in seen:
+                seen.add(value)
+                categories.append(value)
+        encoded = np.zeros((len(cleaned), len(categories)), dtype=np.float32)
+        index_map = {category: idx for idx, category in enumerate(categories)}
+        for row_index, value in enumerate(cleaned):
+            encoded[row_index, index_map[value]] = 1.0
+        return encoded, {
+            "kind": "categorical",
+            "column": column_name,
+            "categories": categories,
+        }
+
+
+def _parse_csv_training_payload(csv_text: str, feature_columns: List[str], target_column: Optional[str]) -> Dict[str, Any]:
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows = list(reader)
+    if not rows:
+        raise ValueError("CSV file has no rows")
+
+    if feature_columns:
+        features = [col for col in feature_columns if col]
+    else:
+        features = [name for name in (reader.fieldnames or []) if name and name != target_column]
+
+    if not features:
+        raise ValueError("Choose at least one feature column")
+
+    encoded_features: List[np.ndarray] = []
+    feature_info: List[Dict[str, Any]] = []
+    for feature in features:
+        column_values = [row.get(feature) for row in rows]
+        encoded, info = _encode_csv_column(column_values, feature)
+        encoded_features.append(encoded)
+        feature_info.append(info)
+
+    x_arr = np.concatenate(encoded_features, axis=1) if encoded_features else np.empty((len(rows), 0), dtype=np.float32)
+    result: Dict[str, Any] = {
+        "x": x_arr,
+        "features": features,
+        "feature_encoding": feature_info,
+        "source": "csv",
+        "rows": int(x_arr.shape[0]),
+        "input_shape": tuple(int(s) for s in x_arr.shape[1:]),
+        "raw_rows": rows,
+    }
+    if target_column:
+        target_values = [row.get(target_column) for row in rows]
+        y_arr, target_info = _encode_csv_column(target_values, target_column)
+        result["y"] = y_arr
+        result["target_column"] = target_column
+        result["target_encoding"] = target_info
+    return result
+
+
+def _parse_npz_training_payload(raw_bytes: bytes, x_key: str = "x", y_key: str = "y") -> Dict[str, Any]:
+    with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as data:
+        keys = list(data.files)
+        if not keys:
+            raise ValueError("NPZ file has no arrays")
+
+        x_arr = data[x_key] if x_key in data.files else data[keys[0]]
+        y_arr = data[y_key] if y_key in data.files else (data[keys[1]] if len(keys) > 1 else None)
+
+    x_arr = np.asarray(x_arr, dtype=np.float32)
+    if x_arr.ndim == 1:
+        x_arr = x_arr[:, None]
+
+    result: Dict[str, Any] = {
+        "x": x_arr,
+        "source": "npz",
+        "keys": keys,
+        "rows": int(x_arr.shape[0]),
+        "input_shape": tuple(int(s) for s in x_arr.shape[1:]),
+    }
+    if y_arr is not None:
+        y_arr = np.asarray(y_arr, dtype=np.float32)
+        if y_arr.ndim == 1:
+            y_arr = y_arr[:, None]
+        result["y"] = y_arr
+        result["target_key"] = y_key if y_key in keys else (keys[1] if len(keys) > 1 else keys[0])
+    return result
+
+
+def _summarize_train_data(train_data: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(train_data, dict):
+        return "Synthetic batches"
+    source = str(train_data.get("source", "data"))
+    rows = train_data.get("rows")
+    input_shape = train_data.get("input_shape")
+    if rows is None:
+        return source
+    return f"{source.upper()}: {rows} rows, input_shape={input_shape}"
+
+
+def _summarize_training_run(run: Dict[str, Any]) -> str:
+    model_id = str(run.get("model_id", ""))
+    optimizer = str(run.get("optimizer", "?"))
+    learning_rate = run.get("learning_rate", "?")
+    batch_size = run.get("batch_size", "?")
+    epochs = run.get("epochs", "?")
+    final_loss = run.get("final_loss", 0.0)
+    data_summary = str(run.get("train_data_summary") or "Synthetic batches")
+    model_part = model_id[:8] if model_id else "unknown"
+    return (
+        f"{model_part} | opt={optimizer} | lr={learning_rate} | batch={batch_size} | epochs={epochs} | "
+        f"loss={float(final_loss):.6f} | {data_summary}"
+    )
+
+
+def _tensor_to_numpy(value: Any) -> np.ndarray:
+    if isinstance(value, tuple):
+        for item in value:
+            if hasattr(item, "shape"):
+                return _tensor_to_numpy(item)
+        return np.asarray(value, dtype=np.float32)
+    if hasattr(value, "numpy"):
+        try:
+            return np.asarray(value.numpy(), dtype=np.float32)
+        except Exception:
+            pass
+    if hasattr(value, "data"):
+        try:
+            return np.asarray(value.data, dtype=np.float32)
+        except Exception:
+            pass
+    return np.asarray(value, dtype=np.float32)
+
+
+def _prediction_summary_from_output(pred_row: np.ndarray, target_info: Optional[Dict[str, Any]] = None) -> str:
+    pred_row = np.asarray(pred_row, dtype=np.float32).reshape(-1)
+    if pred_row.size == 0:
+        return "[]"
+    if target_info and target_info.get("kind") == "categorical":
+        categories = list(target_info.get("categories") or [])
+        if pred_row.size > 1 and categories:
+            idx = int(np.argmax(pred_row))
+            label = categories[idx] if 0 <= idx < len(categories) else str(idx)
+            return f"{label} (scores={np.round(pred_row, 4).tolist()})"
+    if pred_row.size == 1:
+        return f"{float(pred_row[0]):.6f}"
+    return str(np.round(pred_row, 4).tolist())
+
+
+def _build_csv_training_comparison(model: Any, train_data: Dict[str, Any], *, device: str, limit: int = 12) -> Dict[str, Any]:
+    if not isinstance(train_data, dict) or str(train_data.get("source")) != "csv":
+        return {"rows": [], "summary": "No CSV training data available."}
+
+    raw_rows = list(train_data.get("raw_rows") or [])
+    if not raw_rows:
+        return {"rows": [], "summary": "CSV data missing original rows."}
+
+    x_arr = np.asarray(train_data.get("x"), dtype=np.float32)
+    if x_arr.ndim == 1:
+        x_arr = x_arr[:, None]
+    if x_arr.size == 0:
+        return {"rows": [], "summary": "CSV data has no encoded features."}
+
+    sample_count = min(int(limit), int(x_arr.shape[0]), len(raw_rows))
+    x_batch = rasptorch.Tensor(x_arr[:sample_count], device=device)
+    outputs = model(x_batch)
+    out_arr = _tensor_to_numpy(outputs)
+    if out_arr.ndim == 1:
+        out_arr = out_arr[:, None]
+
+    target_info = train_data.get("target_encoding") if isinstance(train_data.get("target_encoding"), dict) else None
+    target_column = str(train_data.get("target_column") or "target")
+    comparison_rows: List[Dict[str, Any]] = []
+    for idx in range(sample_count):
+        row = dict(raw_rows[idx])
+        row["__target__"] = raw_rows[idx].get(target_column)
+        row["__prediction__"] = _prediction_summary_from_output(out_arr[idx], target_info)
+        comparison_rows.append(row)
+
+    return {
+        "rows": comparison_rows,
+        "summary": f"Compared {sample_count} CSV row(s) against model output.",
+        "output_shape": tuple(int(s) for s in out_arr.shape),
+    }
+
+
+def _render_csv_comparison_block(csv_comparison: Any) -> None:
+    if not isinstance(csv_comparison, dict) or not csv_comparison.get("rows"):
+        return
+
+    st.subheader("CSV row comparison")
+    st.caption(str(csv_comparison.get("summary", "")))
+
+    rows = csv_comparison.get("rows") or []
+    display_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        display_row = {k: v for k, v in row.items() if not str(k).startswith("__")}
+        display_row["target"] = row.get("__target__")
+        display_row["prediction"] = row.get("__prediction__")
+        display_rows.append(display_row)
+
+    if display_rows:
+        st.dataframe(display_rows, width="stretch", hide_index=True)
 
 
 def _parse_csv_ints(raw: str) -> List[int]:
@@ -2442,6 +2691,9 @@ def _handle_repl_command(command_str: str) -> None:
                     out("✗ No model selected")
                     return
                 out(f"🚀 Training {mid[:8]}...")
+                def _progress_callback(payload: Dict[str, Any]) -> None:
+                    _append_event(payload)
+
                 result = cmds.train_model(
                     mid,
                     epochs=int(ctx.get("train_epochs", 5)),
@@ -2449,6 +2701,8 @@ def _handle_repl_command(command_str: str) -> None:
                     batch_size=int(ctx.get("batch_size", 32)),
                     device=str(ctx.get("device", "cpu")),
                     optimizer_type=str(ctx.get("optimizer", "Adam")),
+                    progress_callback=_progress_callback,
+                    train_data=ctx.get("train_data"),
                 )
                 if "error" in result:
                     out(f"✗ Error: {result['error']}")
@@ -2746,7 +3000,7 @@ def _render_models_page() -> None:
                     break
             disp = _display_name(full_id) if full_id else mid8
             rows.append({"name": disp, "model_id": mid8, "type": m.get("type")})
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.info("No models yet. Create one in Build & Train.")
 
@@ -2837,7 +3091,7 @@ def _render_models_page() -> None:
             if not rendered and mode == "pyvista_png":
                 png = _model_pyvista_png(cmds.models, selected)
                 if png is not None:
-                    st.image(png, use_container_width=True)
+                    st.image(png, width="stretch")
                     rendered = True
                 else:
                     st.caption("PyVista PNG render failed; falling back to Plotly.")
@@ -2867,7 +3121,7 @@ def _render_models_page() -> None:
             if not rendered:
                 fig3d = _model_plotly_3d_figure(cmds.models, selected)
                 if fig3d is not None:
-                    st.plotly_chart(fig3d, use_container_width=True)
+                    st.plotly_chart(fig3d, width="stretch")
                     rendered = True
                 else:
                     st.caption("3D structure requires Plotly (install `plotly`).")
@@ -3212,7 +3466,53 @@ def _render_build_train_page() -> None:
                 st.rerun()
 
     st.divider()
-    st.subheader("Train")
+    st.subheader("Training data")
+    data_mode = st.radio(
+        "Source",
+        options=["Synthetic", "CSV upload", "NPZ upload"],
+        index=0,
+        horizontal=True,
+        key="train_data_source",
+    )
+
+    train_data: Optional[Dict[str, Any]] = None
+    if data_mode == "Synthetic":
+        st.caption("Use model-inferred synthetic batches when you do not have a dataset handy.")
+    elif data_mode == "CSV upload":
+        csv_upload = st.file_uploader("Upload CSV training data", type=["csv"], key="train_csv_upload")
+        feature_cols_raw = st.text_input("Feature columns (CSV, comma-separated)", value="", key="train_csv_features")
+        target_col_raw = st.text_input("Target column (optional)", value="", key="train_csv_target")
+        if csv_upload is not None:
+            try:
+                csv_text = csv_upload.getvalue().decode("utf-8", errors="ignore")
+                train_data = _parse_csv_training_payload(
+                    csv_text,
+                    [col.strip() for col in feature_cols_raw.split(",") if col.strip()],
+                    target_col_raw.strip() or None,
+                )
+                st.success(_summarize_train_data(train_data))
+            except Exception as e:
+                st.error(f"Failed to parse CSV training data: {e}")
+    else:
+        npz_upload = st.file_uploader("Upload NPZ training data", type=["npz"], key="train_npz_upload")
+        npz_x_key = st.text_input("NPZ input key", value="x", key="train_npz_x_key")
+        npz_y_key = st.text_input("NPZ target key (optional)", value="y", key="train_npz_y_key")
+        if npz_upload is not None:
+            try:
+                train_data = _parse_npz_training_payload(
+                    npz_upload.getvalue(),
+                    x_key=npz_x_key.strip() or "x",
+                    y_key=npz_y_key.strip() or "y",
+                )
+                st.success(_summarize_train_data(train_data))
+            except Exception as e:
+                st.error(f"Failed to parse NPZ training data: {e}")
+
+    ctx["train_data"] = train_data
+    ctx["train_data_summary"] = _summarize_train_data(train_data)
+    st.caption(ctx.get("train_data_summary", "Synthetic batches"))
+
+    st.subheader("Training hyperparameters")
     model_ids = list(cmds.models.keys())
     if not model_ids:
         st.info("No models available to train.")
@@ -3261,6 +3561,9 @@ def _render_build_train_page() -> None:
     ctx.setdefault("train_runs", [])
 
     if st.button("Train"):
+        def _progress_callback(payload: Dict[str, Any]) -> None:
+            _append_event(payload)
+
         with st.spinner("Training..."):
             res = cmds.train_model(
                 sel,
@@ -3269,6 +3572,8 @@ def _render_build_train_page() -> None:
                 batch_size=int(batch),
                 device=str(device),
                 optimizer_type=str(opt),
+                progress_callback=_progress_callback,
+                train_data=ctx.get("train_data"),
             )
         if "error" in res:
             err = res.get("error")
@@ -3316,6 +3621,11 @@ def _render_build_train_page() -> None:
                         "learning_rate": float(lr),
                         "batch_size": int(batch),
                         "epochs": int(epochs),
+                        "train_data_used": bool(ctx.get("train_data")),
+                        "train_data_summary": str(ctx.get("train_data_summary", "Synthetic batches")),
+                        "train_input_shape": tuple(int(s) for s in res.get("train_input_shape", ()) or ()),
+                        "final_loss": float(res.get("final_loss", hist[-1] if hist else 0.0)),
+                        "elapsed_seconds": float(res.get("elapsed_seconds", 0.0)),
                         "loss": [float(x) for x in hist],
                     }
                 ])[-10:]
@@ -3330,6 +3640,16 @@ def _render_build_train_page() -> None:
             except Exception:
                 pass
 
+            try:
+                train_data = ctx.get("train_data")
+                if isinstance(train_data, dict) and str(train_data.get("source")) == "csv":
+                    model = cmds._ensure_model(sel)
+                    if model is not None:
+                        ctx["csv_comparison"] = _build_csv_training_comparison(model, train_data, device=str(device))
+                        ctx["csv_comparison_model_id"] = sel
+                        _render_csv_comparison_block(ctx["csv_comparison"])
+            except Exception:
+                ctx["csv_comparison"] = {"rows": [], "summary": "Unable to build CSV comparison preview."}
     # Plot most recent run, plus optionally overlay older runs.
     runs = ctx.get("train_runs", [])
     if runs:
@@ -3338,6 +3658,131 @@ def _render_build_train_page() -> None:
         if isinstance(loss, list) and loss:
             st.caption("Train loss (most recent run)")
             st.line_chart(loss)
+
+
+def _render_dashboard_page() -> None:
+    st.header("Dashboard")
+    ctx = st.session_state.repl_context
+    events = list(st.session_state.get("dashboard_events", []))
+    runs = list(ctx.get("train_runs", []))
+
+    cols = st.columns(4)
+    cols[0].metric("Models", len(get_model_commands().models))
+    cols[1].metric("Events", len(events))
+    cols[2].metric("Training runs", len(runs))
+    cols[3].metric("Current model", "set" if ctx.get("current_model") else "none")
+
+    st.subheader("Current training setup")
+    st.write(ctx.get("train_data_summary", "Synthetic batches"))
+    st.caption(
+        f"Epochs={ctx.get('train_epochs', 5)} | Batch size={ctx.get('batch_size', 32)} | "
+        f"Learning rate={ctx.get('learning_rate', 0.001)} | Optimizer={ctx.get('optimizer', 'Adam')}"
+    )
+
+    if runs:
+        last = runs[-1]
+        loss = last.get("loss") or []
+        if isinstance(loss, list) and loss:
+            st.subheader("Recent loss")
+            st.line_chart(loss)
+
+    st.subheader("Compare hyperparameter runs")
+    if not runs:
+        st.info("No completed runs yet.")
+    else:
+        model_ids = sorted({str(run.get("model_id")) for run in runs if run.get("model_id")})
+        selected_model = st.selectbox(
+            "Model to compare",
+            options=model_ids,
+            index=model_ids.index(str(ctx.get("current_model"))) if str(ctx.get("current_model")) in model_ids else 0,
+            format_func=lambda mid: f"{mid[:8]} ({get_model_commands().models.get(mid, {}).get('type', 'Unknown')})",
+            key="dashboard_compare_model",
+        )
+        model_runs = [run for run in runs if str(run.get("model_id")) == selected_model]
+        model_runs_sorted = sorted(
+            model_runs,
+            key=lambda run: (
+                float(run.get("final_loss", float("inf"))),
+                float(run.get("learning_rate", 0.0)),
+                int(run.get("batch_size", 0)),
+            ),
+        )
+
+        if not model_runs_sorted:
+            st.info("No runs for the selected model.")
+        else:
+            comparison_rows = []
+            for idx, run in enumerate(model_runs_sorted, start=1):
+                comparison_rows.append(
+                    {
+                        "run": idx,
+                        "epochs": run.get("epochs"),
+                        "batch_size": run.get("batch_size"),
+                        "learning_rate": run.get("learning_rate"),
+                        "optimizer": run.get("optimizer"),
+                        "device": run.get("device"),
+                        "train_data": run.get("train_data_summary", "Synthetic batches"),
+                        "final_loss": round(float(run.get("final_loss", 0.0)), 6),
+                        "elapsed_seconds": round(float(run.get("elapsed_seconds", 0.0)), 3),
+                        "loss_points": len(run.get("loss") or []),
+                    }
+                )
+            st.dataframe(comparison_rows, width="stretch", hide_index=True)
+
+            chart_cols = st.columns(2)
+            with chart_cols[0]:
+                st.caption("Final loss by run")
+                st.bar_chart(
+                    {
+                        "final_loss": [row["final_loss"] for row in comparison_rows],
+                    }
+                )
+            with chart_cols[1]:
+                st.caption("Loss curves")
+                overlay: Dict[str, List[float]] = {}
+                max_len = 0
+                for idx, run in enumerate(model_runs_sorted, start=1):
+                    loss = run.get("loss") or []
+                    if isinstance(loss, list) and loss:
+                        label = f"run_{idx}"
+                        overlay[label] = [float(x) for x in loss]
+                        max_len = max(max_len, len(loss))
+                if overlay:
+                    for label, values in overlay.items():
+                        if len(values) < max_len:
+                            values.extend([math.nan] * (max_len - len(values)))
+                    st.line_chart(overlay)
+
+            st.caption("Run details")
+            for run in model_runs_sorted:
+                st.write(_summarize_training_run(run))
+
+    csv_comparison = ctx.get("csv_comparison")
+    if isinstance(csv_comparison, dict) and csv_comparison.get("rows"):
+        _render_csv_comparison_block(csv_comparison)
+    elif isinstance(ctx.get("train_data"), dict) and str(ctx.get("train_data", {}).get("source")) == "csv":
+        st.subheader("CSV row comparison")
+        st.info("Train a model with the uploaded CSV to see original rows compared with the model output.")
+
+    st.subheader("Event log")
+    if events:
+        rows = []
+        for event in reversed(events[-150:]):
+            rows.append(
+                {
+                    "time": event.get("timestamp"),
+                    "event": event.get("event"),
+                    "model": str(event.get("model_id", ""))[:8],
+                    "epoch": event.get("epoch"),
+                    "loss": event.get("loss"),
+                    "final_loss": event.get("final_loss"),
+                    "seconds": event.get("seconds"),
+                    "message": event.get("message"),
+                }
+            )
+        st.dataframe(rows, width="stretch", hide_index=True)
+    else:
+        st.info("No events yet. Train a model or run a REPL command to populate the dashboard.")
 
 
 def _render_chat_page() -> None:
@@ -3378,16 +3823,17 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader("Navigation")
+        nav_options = ["Dashboard", "Models", "Build & Train", "Chat/REPL"]
         nav = st.radio(
             "Page",
-            options=["Models", "Build & Train", "Chat/REPL"],
-            index=["Models", "Build & Train", "Chat/REPL"].index(st.session_state.nav),
+            options=nav_options,
+            index=nav_options.index(st.session_state.nav) if st.session_state.nav in nav_options else 0,
             label_visibility="collapsed",
         )
         st.session_state.nav = nav
         st.divider()
         st.subheader("Session")
-        current_backend = str(ctx.get("backend", "auto"))
+        current_backend = str(ctx.get("backend_choice", "auto"))
         backend_choice = st.selectbox(
             "Backend",
             options=BACKENDS,
@@ -3396,6 +3842,7 @@ def main() -> None:
         )
         if str(backend_choice) != current_backend:
             ok, msg = _try_set_backend(str(backend_choice))
+            ctx["backend_choice"] = str(backend_choice)
             if not ok:
                 st.error(msg)
             else:
@@ -3430,6 +3877,8 @@ def main() -> None:
         st.write(f"Selected model: {(mid[:8] if mid else '(none)')}")
         if st.button("Reset session state"):
             st.session_state.repl_log = []
+            st.session_state.dashboard_events = []
+            st.session_state.sidebar_backend = "auto"
             st.session_state.repl_context = {
                 "current_model": None,
                 "train_epochs": 5,
@@ -3438,10 +3887,15 @@ def main() -> None:
                 "optimizer": "Adam",
                 "device": "cpu",
                 "backend": "auto",
+                "backend_choice": "auto",
+                "train_data": None,
+                "train_data_summary": "Synthetic batches",
             }
             st.rerun()
 
-    if nav == "Models":
+    if nav == "Dashboard":
+        _render_dashboard_page()
+    elif nav == "Models":
         _render_models_page()
     elif nav == "Build & Train":
         _render_build_train_page()

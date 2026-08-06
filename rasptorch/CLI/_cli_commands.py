@@ -1475,6 +1475,7 @@ class ModelCommands:
         device: str = "cpu",
         optimizer_type: str = "Adam",
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        train_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Train a model."""
         if model_id not in self.models:
@@ -1549,7 +1550,45 @@ class ModelCommands:
                 input_size = int(config.get("input_size") or config.get("vocab_size") or config.get("layer_sizes", [10])[0])
                 input_shape = (batch_size, input_size)
 
-            X_probe = rasptorch.Tensor(np.random.randn(*input_shape).astype(np.float32), device=device)
+            train_bundle: Optional[Dict[str, Any]] = None
+            expected_input_shape = tuple(int(s) for s in input_shape[1:])
+            if isinstance(train_data, dict):
+                x_data = train_data.get("x")
+                if x_data is None:
+                    x_data = train_data.get("inputs")
+                if x_data is None:
+                    x_data = train_data.get("features")
+                if x_data is not None:
+                    x_arr = np.asarray(x_data, dtype=np.float32)
+                    if x_arr.ndim == 1:
+                        x_arr = x_arr[:, None]
+                    y_data = train_data.get("y")
+                    if y_data is None:
+                        y_data = train_data.get("targets")
+                    if y_data is None:
+                        y_data = train_data.get("labels")
+                    y_arr = None if y_data is None else np.asarray(y_data, dtype=np.float32)
+                    if y_arr is not None and len(y_arr) != len(x_arr):
+                        return {"error": "train_data x and y must have the same number of samples"}
+                    data_input_shape = tuple(int(s) for s in x_arr.shape[1:]) or (1,)
+                    if data_input_shape != expected_input_shape:
+                        return {
+                            "error": (
+                                "Training data shape does not match this model's expected input shape: "
+                                f"data={data_input_shape}, model={expected_input_shape}. "
+                                "Use a model whose input size matches the encoded feature width, or rebuild the model."
+                            )
+                        }
+                    train_bundle = {
+                        "x": x_arr,
+                        "y": y_arr,
+                        "shuffle": bool(train_data.get("shuffle", True)),
+                    }
+
+            if train_bundle is not None:
+                X_probe = rasptorch.Tensor(train_bundle["x"][:1], device=device)
+            else:
+                X_probe = rasptorch.Tensor(np.random.randn(*input_shape).astype(np.float32), device=device)
             y_probe = _forward_for_loss(model, X_probe)
             if not hasattr(y_probe, "shape"):
                 return {"error": f"Model forward did not return a Tensor (got {type(y_probe)})"}
@@ -1580,15 +1619,33 @@ class ModelCommands:
             
             for epoch in range(epochs):
                 epoch_start = time.perf_counter()
-                # Generate random batch
-                X_batch = rasptorch.Tensor(
-                    np.random.randn(*input_shape).astype(np.float32),
-                    device=device
-                )
-                y_batch = rasptorch.Tensor(
-                    np.random.randn(*label_shape).astype(np.float32),
-                    device=device
-                )
+                if train_bundle is not None:
+                    x_arr = train_bundle["x"]
+                    y_arr = train_bundle["y"]
+                    sample_count = int(x_arr.shape[0])
+                    if sample_count <= 0:
+                        return {"error": "train_data has no samples"}
+                    if train_bundle["shuffle"]:
+                        replace = sample_count < int(batch_size)
+                        batch_indices = np.random.choice(sample_count, size=int(batch_size), replace=replace)
+                    else:
+                        start = (epoch * int(batch_size)) % sample_count
+                        batch_indices = np.arange(start, start + int(batch_size)) % sample_count
+                    X_batch = rasptorch.Tensor(x_arr[batch_indices].astype(np.float32), device=device)
+                    if y_arr is not None:
+                        y_batch = rasptorch.Tensor(y_arr[batch_indices].astype(np.float32), device=device)
+                    else:
+                        y_batch = rasptorch.Tensor(np.random.randn(*label_shape).astype(np.float32), device=device)
+                else:
+                    # Generate random batch
+                    X_batch = rasptorch.Tensor(
+                        np.random.randn(*input_shape).astype(np.float32),
+                        device=device
+                    )
+                    y_batch = rasptorch.Tensor(
+                        np.random.randn(*label_shape).astype(np.float32),
+                        device=device
+                    )
                 
                 # Forward pass
                 output = _forward_for_loss(model, X_batch)
@@ -1652,6 +1709,8 @@ class ModelCommands:
                 "training_history": training_history,
                 "epoch_times": epoch_times,
                 "elapsed_seconds": total_seconds,
+                "train_data_used": train_bundle is not None,
+                "train_input_shape": tuple(int(s) for s in input_shape),
             }
         except Exception as e:
             import traceback

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+import tempfile
 import numpy as np
 
 
@@ -133,6 +134,76 @@ def test_activation_mode_submit_logic_matches_mode() -> None:
 
     assert activations == ["relu", "none"]
     assert activation == "tanh"  # single activation stays independent
+
+
+def test_csv_training_payload_parser_uses_named_columns() -> None:
+    ui = _import_ui_app()
+
+    csv_text = "f1,f2,target\n1.0,2.0,0.0\n3.0,4.0,1.0\n"
+    parsed = ui._parse_csv_training_payload(csv_text, ["f1", "f2"], "target")
+
+    assert parsed["source"] == "csv"
+    assert parsed["rows"] == 2
+    assert parsed["x"].shape == (2, 2)
+    assert parsed["y"].shape == (2, 1)
+    assert parsed["features"] == ["f1", "f2"]
+    assert parsed["feature_encoding"][0]["kind"] == "numeric"
+    assert parsed["target_encoding"]["kind"] == "numeric"
+
+
+def test_csv_training_payload_parser_encodes_string_features_and_target() -> None:
+    ui = _import_ui_app()
+
+    csv_text = "name,color,label\nSheryl,red,cat\nMina,blue,dog\nSheryl,blue,cat\n"
+    parsed = ui._parse_csv_training_payload(csv_text, ["name", "color"], "label")
+
+    assert parsed["source"] == "csv"
+    assert parsed["rows"] == 3
+    assert parsed["x"].shape == (3, 4)
+    assert parsed["y"].shape == (3, 2)
+    assert parsed["feature_encoding"][0]["kind"] == "categorical"
+    assert parsed["feature_encoding"][1]["kind"] == "categorical"
+    assert parsed["target_encoding"]["kind"] == "categorical"
+
+
+def test_npz_training_payload_parser_prefers_standard_keys() -> None:
+    ui = _import_ui_app()
+
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+        path = Path(tmp.name)
+    try:
+        np.savez(path, x=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32), y=np.array([0.0, 1.0], dtype=np.float32))
+        parsed = ui._parse_npz_training_payload(path.read_bytes())
+    finally:
+        path.unlink(missing_ok=True)
+
+    assert parsed["source"] == "npz"
+    assert parsed["rows"] == 2
+    assert parsed["x"].shape == (2, 2)
+    assert parsed["y"].shape == (2, 1)
+    assert "x" in parsed["keys"]
+
+
+def test_training_run_summary_includes_hyperparameters() -> None:
+    ui = _import_ui_app()
+
+    summary = ui._summarize_training_run(
+        {
+            "model_id": "abcd1234efgh",
+            "optimizer": "Adam",
+            "learning_rate": 0.001,
+            "batch_size": 32,
+            "epochs": 5,
+            "final_loss": 0.123456,
+            "train_data_summary": "CSV: 100 rows, input_shape=(8,)",
+        }
+    )
+
+    assert "abcd1234" in summary
+    assert "opt=Adam" in summary
+    assert "lr=0.001" in summary
+    assert "batch=32" in summary
+    assert "loss=0.123456" in summary
 
 
 def test_ui_constants_exist_and_are_nonempty() -> None:
