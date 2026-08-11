@@ -19,14 +19,16 @@ void main() {
     for (uint c = 0u; c < pc.C; c++) {
         mean += bufi.x[base + c];
     }
-    mean /= max(1.0, float(pc.C));
+    // Multiply by reciprocal rather than divide for better precision/performance.
+    float invC = 1.0 / float(max(1u, pc.C));
+    mean *= invC;
 
     float var = 0.0;
     for (uint c = 0u; c < pc.C; c++) {
         float d = bufi.x[base + c] - mean;
         var += d * d;
     }
-    var /= max(1.0, float(pc.C));
+    var *= invC;
 
     float invstd = inversesqrt(var + 1e-5);
     for (uint c = 0u; c < pc.C; c++) {

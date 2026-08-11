@@ -25,13 +25,20 @@ void main() {
     uint off_b = 0;
 
     // Convert flat idx -> multi-index in row-major order.
-    for (uint d = 0; d < pc.rank; d++) {
-        uint stride_out = 1;
-        for (uint k = d + 1; k < pc.rank; k++) {
-            stride_out *= pc.out_sizes[k];
+    // Precompute output strides once to avoid an O(rank^2) inner-product.
+    uint stride_outs[8];
+    if (pc.rank > 0u) {
+        stride_outs[pc.rank - 1u] = 1u;
+        for (int k = int(pc.rank) - 2; k >= 0; k--) {
+            uint uk = uint(k);
+            stride_outs[uk] = stride_outs[uk + 1u] * pc.out_sizes[uk + 1u];
         }
+    }
+
+    for (uint d = 0; d < pc.rank; d++) {
         uint coord = 0;
-        if (stride_out > 0) {
+        uint stride_out = stride_outs[d];
+        if (stride_out > 0u) {
             coord = rem / stride_out;
             rem = rem - coord * stride_out;
         }
