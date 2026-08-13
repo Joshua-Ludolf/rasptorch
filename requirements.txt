@@ -52,7 +52,7 @@ pytest==9.0.3
 python-dateutil==2.9.0.post0
 python-multipart==0.0.32
 pytools==2026.1
-readme-renderer==44.0
+readme-renderer==45.0
 referencing==0.37.0
 requests==2.33.1
 requests-toolbelt==1.0.0
