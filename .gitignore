@@ -17,3 +17,4 @@ pypi-token.txt
 
 # VsCode settings
 .vscode/
+/rasptorch/shaders/scripts/*
