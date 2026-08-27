@@ -16,7 +16,7 @@ gitpython==3.1.58
 h11==0.16.0
 httptools==0.8.0
 id==1.6.1
-idna==3.15
+idna==3.19
 importlib-metadata==9.0.0
 iniconfig==2.3.0
 itsdangerous==2.2.0
