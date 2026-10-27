@@ -140,6 +140,25 @@ uv run rasptorch ui
 ```
 *(This will usually open at `http://localhost:8501`)*
 
+**Streamlit Community Cloud:**
+
+The repository includes [`packages.txt`](packages.txt), which installs Vulkan
+runtime libraries and Mesa's software Vulkan driver on Streamlit Community
+Cloud. This can make the Vulkan backend available through CPU-based software
+rendering (lavapipe), but it does not provide Raspberry Pi VideoCore,
+NVIDIA CUDA, or other hardware GPU access.
+
+The hosted app keeps `auto` backend selection enabled:
+
+1. Use Vulkan if a compatible software Vulkan device is available.
+2. Fall back to the NumPy backend when Vulkan is unavailable.
+
+Open the **Vulkan diagnostics** expander in the sidebar to inspect the
+deployment platform, Vulkan availability, active backend, and any
+initialization error. Software Vulkan may be slower than NumPy for small
+workloads; use a Raspberry Pi 4/5 or another machine with a supported Vulkan
+device for hardware acceleration.
+
 **Viewing Help:**
 To see all available CLI subcommands:
 ```bash

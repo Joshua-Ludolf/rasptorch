@@ -3872,6 +3872,22 @@ def main() -> None:
             st.caption("Vulkan backend: unavailable")
             if reason:
                 st.caption(f"{reason}")
+        with st.expander("Vulkan diagnostics"):
+            using_vulkan = False
+            if _vulkan_backend is not None:
+                try:
+                    using_vulkan = bool(_vulkan_backend.using_vulkan())
+                except (RuntimeError, OSError, ValueError, AttributeError):
+                    using_vulkan = False
+            st.json(
+                {
+                    "platform": platform.platform(),
+                    "vulkan_available": ok_vk,
+                    "using_vulkan": using_vulkan,
+                    "disabled_reason": reason,
+                    "VK_ICD_FILENAMES": os.environ.get("VK_ICD_FILENAMES"),
+                }
+            )
 
         mid = ctx.get("current_model")
         st.write(f"Selected model: {(mid[:8] if mid else '(none)')}")
