@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1514,8 +1514,9 @@ wheels = [
 
 [[package]]
 name = "rasptorch"
-version = "1.1.0"
+version = "1.2.0"
 source = { editable = "." }
+default-groups = ["runtime-gpu"]
 dependencies = [
     { name = "click" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1530,6 +1531,18 @@ dependencies = [
 [package.optional-dependencies]
 cuda = [
     { name = "cupy" },
+]
+dev = [
+    { name = "build" },
+    { name = "cupy" },
+    { name = "mako" },
+    { name = "pygments" },
+    { name = "pyopencl" },
+    { name = "pytest" },
+    { name = "requests" },
+    { name = "torch" },
+    { name = "twine" },
+    { name = "vulkan" },
 ]
 gpu = [
     { name = "pyopencl" },
@@ -1553,8 +1566,15 @@ vulkan = [
 [package.dev-dependencies]
 dev = [
     { name = "build" },
+    { name = "cupy" },
+    { name = "mako" },
+    { name = "pygments" },
+    { name = "pyopencl" },
     { name = "pytest" },
+    { name = "requests" },
+    { name = "torch" },
     { name = "twine" },
+    { name = "vulkan" },
 ]
 runtime-gpu = [
     { name = "pyopencl", marker = "sys_platform == 'linux'" },
@@ -1563,30 +1583,47 @@ runtime-gpu = [
 
 [package.metadata]
 requires-dist = [
+    { name = "build", marker = "extra == 'dev'", specifier = ">=1.4.4" },
     { name = "click", specifier = ">=8.0" },
     { name = "cupy", marker = "extra == 'cuda'", specifier = ">=14.0.1" },
+    { name = "cupy", marker = "extra == 'dev'", specifier = ">=14.0.1" },
+    { name = "mako", marker = "extra == 'dev'", specifier = ">=1.3.11" },
     { name = "mako", marker = "extra == 'optional'", specifier = ">=1.3.11" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "prompt-toolkit", specifier = ">=3.0" },
+    { name = "pygments", marker = "extra == 'dev'", specifier = ">=2.20.0" },
     { name = "pygments", marker = "extra == 'optional'", specifier = ">=2.20.0" },
+    { name = "pyopencl", marker = "extra == 'dev'", specifier = ">=2026.1.2" },
     { name = "pyopencl", marker = "extra == 'gpu'", specifier = ">=2026.1.2" },
     { name = "pyopencl", marker = "extra == 'opencl'", specifier = ">=2026.1.2" },
     { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
+    { name = "requests", marker = "extra == 'dev'", specifier = ">=2.33.1" },
     { name = "requests", marker = "extra == 'optional'", specifier = ">=2.33.1" },
     { name = "streamlit", specifier = ">=1.56.0" },
+    { name = "torch", marker = "extra == 'dev'", specifier = ">=2.11.0" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.11.0" },
     { name = "twine", specifier = ">=7.0.0" },
+    { name = "twine", marker = "extra == 'dev'", specifier = ">=6.2.0" },
     { name = "vulkan", specifier = ">=1.3.275.1" },
+    { name = "vulkan", marker = "extra == 'dev'", specifier = ">=1.3,<1.5" },
     { name = "vulkan", marker = "extra == 'gpu'", specifier = ">=1.3,<1.5" },
     { name = "vulkan", marker = "extra == 'vulkan'", specifier = ">=1.3,<1.5" },
 ]
-provides-extras = ["optional", "vulkan", "cuda", "opencl", "torch", "gpu"]
+provides-extras = ["optional", "dev", "vulkan", "cuda", "opencl", "torch", "gpu"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "build", specifier = ">=1.4.4" },
+    { name = "cupy", specifier = ">=14.0.1" },
+    { name = "mako", specifier = ">=1.3.11" },
+    { name = "pygments", specifier = ">=2.20.0" },
+    { name = "pyopencl", specifier = ">=2026.1.2" },
     { name = "pytest", specifier = ">=9.0.3" },
+    { name = "requests", specifier = ">=2.33.1" },
+    { name = "torch", specifier = ">=2.11.0" },
     { name = "twine", specifier = ">=6.2.0" },
+    { name = "vulkan", specifier = ">=1.3,<1.5" },
 ]
 runtime-gpu = [
     { name = "pyopencl", marker = "sys_platform == 'linux'", specifier = ">=2026.1.2" },
