@@ -211,6 +211,52 @@ def _model_mermaid_diagram(models: Dict[str, Any], model_id: Optional[str]) -> O
             prev = n
         return "\n".join(lines)
 
+    if mtype == "CV":
+        node(root, f"CV {model_id[:8]}")
+        in_ch = cfg.get("in_channels")
+        out_ch = cfg.get("out_channels") or []
+        kernels = cfg.get("kernels")
+        num_classes = cfg.get("num_classes")
+        pool = cfg.get("pool")
+        input_hw = cfg.get("input_hw")
+        prev = root
+        n0 = f"{root}_in"
+        node(n0, f"in_ch: {in_ch} ({input_hw}x{input_hw})")
+        edge(prev, n0)
+        prev = n0
+        for i, ch in enumerate(out_ch):
+            n = f"{root}_c{i}"
+            k = None
+            if isinstance(kernels, list) and i < len(kernels):
+                k = kernels[i]
+            node(n, f"c{i}: {ch}" + (f" (k={k})" if k is not None else ""))
+            edge(prev, n)
+            prev = n
+        n_head = f"{root}_head"
+        node(n_head, f"Flatten→Linear({num_classes})")
+        edge(prev, n_head)
+        return "\n".join(lines)
+
+    if mtype == "JEV":
+        node(root, f"JEV {model_id[:8]}")
+        input_size = cfg.get("input_size")
+        hidden = cfg.get("hidden_sizes") or []
+        num_decisions = cfg.get("num_decisions")
+        prev = root
+        n0 = f"{root}_in"
+        node(n0, f"in: {input_size}")
+        edge(prev, n0)
+        prev = n0
+        for i, h in enumerate(hidden):
+            n = f"{root}_h{i}"
+            node(n, f"h{i}: {h}")
+            edge(prev, n)
+            prev = n
+        n_out = f"{root}_out"
+        node(n_out, f"decisions: {num_decisions}")
+        edge(prev, n_out)
+        return "\n".join(lines)
+
     node(root, f"{mtype} {model_id[:8]}")
     return "\n".join(lines)
 
@@ -521,6 +567,43 @@ def _model_plotly_3d_figure(models: Dict[str, Any], model_id: Optional[str]):
             if act_s:
                 hover += f"<br>{act_s}"
             _add(ch, lab, hover=hover)
+    elif mtype == "CV":
+        act_s = _act_summary()
+        kernels = cfg.get("kernels")
+        in_ch = cfg.get("in_channels")
+        num_classes = cfg.get("num_classes")
+        pool = cfg.get("pool")
+        input_hw = cfg.get("input_hw")
+        hover = f"type=CV<br>in_channels={in_ch}<br>input_hw={input_hw}x{input_hw}<br>pool={pool}"
+        if act_s:
+            hover += f"<br>{act_s}"
+        _add(in_ch or 1, f"in_ch: {in_ch}", hover=hover)
+        for i, ch in enumerate(cfg.get("out_channels") or []):
+            k = None
+            if isinstance(kernels, list) and i < len(kernels):
+                k = kernels[i]
+            lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
+            hover = f"type=CV<br>out_channels[{i}]={ch}"
+            if k is not None:
+                hover += f"<br>kernel={k}"
+            if act_s:
+                hover += f"<br>{act_s}"
+            _add(ch, lab, hover=hover)
+        _add(num_classes or 1, f"classes: {num_classes}", hover=f"type=CV<br>num_classes={num_classes}<br>pool={pool}")
+    elif mtype == "JEV":
+        act_s = _act_summary()
+        input_size = cfg.get("input_size")
+        num_decisions = cfg.get("num_decisions")
+        hover = f"type=JEV<br>input_size={input_size}<br>num_decisions={num_decisions}"
+        if act_s:
+            hover += f"<br>{act_s}"
+        _add(input_size or 1, f"in: {input_size}", hover=hover)
+        for i, h in enumerate(cfg.get("hidden_sizes") or []):
+            hover = f"type=JEV<br>hidden[{i}]={h}"
+            if act_s:
+                hover += f"<br>{act_s}"
+            _add(h, f"h{i}: {h}", hover=hover)
+        _add(num_decisions or 1, f"decisions: {num_decisions}", hover=f"type=JEV<br>num_decisions={num_decisions}")
     else:
         io_in = cfg.get("input_size")
         _add(io_in or 8, mtype, hover=f"type={mtype}<br>input_size={io_in}")
@@ -835,6 +918,27 @@ def _model_pyvista_plotter(models: Dict[str, Any], model_id: Optional[str], *, o
                     k = kernels[i]
                 lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
                 _add(ch, lab)
+        elif mtype == "CV":
+            kernels = cfg.get("kernels")
+            in_ch = cfg.get("in_channels")
+            num_classes = cfg.get("num_classes")
+            pool = cfg.get("pool")
+            input_hw = cfg.get("input_hw")
+            _add(in_ch or 1, f"in_ch: {in_ch} ({input_hw}x{input_hw})")
+            for i, ch in enumerate(cfg.get("out_channels") or []):
+                k = None
+                if isinstance(kernels, list) and i < len(kernels):
+                    k = kernels[i]
+                lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
+                _add(ch, lab)
+            _add(num_classes or 1, f"classes: {num_classes}")
+        elif mtype == "JEV":
+            input_size = cfg.get("input_size")
+            num_decisions = cfg.get("num_decisions")
+            _add(input_size or 1, f"in: {input_size}")
+            for i, h in enumerate(cfg.get("hidden_sizes") or []):
+                _add(h, f"h{i}: {h}")
+            _add(num_decisions or 1, f"decisions: {num_decisions}")
         else:
             io_in = cfg.get("input_size")
             _add(io_in or 8, mtype)
@@ -994,6 +1098,41 @@ def _model_plotly_2d_figure(models: Dict[str, Any], model_id: Optional[str]):
                 if act_s:
                     hover += f"<br>{act_s}"
                 _add(ch, lab, hover=hover)
+        elif model_type == "CV":
+            kernels = model_cfg.get("kernels")
+            in_ch = model_cfg.get("in_channels")
+            num_classes = model_cfg.get("num_classes")
+            pool = model_cfg.get("pool")
+            input_hw = model_cfg.get("input_hw")
+            hover = f"type=CV<br>in_channels={in_ch}<br>input_hw={input_hw}x{input_hw}<br>pool={pool}"
+            if act_s:
+                hover += f"<br>{act_s}"
+            _add(in_ch or 1, f"in_ch: {in_ch}", hover=hover)
+            for i, ch in enumerate(model_cfg.get("out_channels") or []):
+                k = None
+                if isinstance(kernels, list) and i < len(kernels):
+                    k = kernels[i]
+                lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
+                hover = f"type=CV<br>out_channels[{i}]={ch}"
+                if k is not None:
+                    hover += f"<br>kernel={k}"
+                if act_s:
+                    hover += f"<br>{act_s}"
+                _add(ch, lab, hover=hover)
+            _add(num_classes or 1, f"classes: {num_classes}", hover=f"type=CV<br>num_classes={num_classes}<br>pool={pool}")
+        elif model_type == "JEV":
+            input_size = model_cfg.get("input_size")
+            num_decisions = model_cfg.get("num_decisions")
+            hover = f"type=JEV<br>input_size={input_size}<br>num_decisions={num_decisions}"
+            if act_s:
+                hover += f"<br>{act_s}"
+            _add(input_size or 1, f"in: {input_size}", hover=hover)
+            for i, h in enumerate(model_cfg.get("hidden_sizes") or []):
+                hover = f"type=JEV<br>hidden[{i}]={h}"
+                if act_s:
+                    hover += f"<br>{act_s}"
+                _add(h, f"h{i}: {h}", hover=hover)
+            _add(num_decisions or 1, f"decisions: {num_decisions}", hover=f"type=JEV<br>num_decisions={num_decisions}")
         else:
             io_in = model_cfg.get("input_size")
             _add(io_in or 8, model_type, hover=f"type={model_type}<br>input_size={io_in}")
@@ -1186,6 +1325,8 @@ def _model_canvas3d_html(models: Dict[str, Any], model_id: Optional[str]) -> Opt
         "MLP": "#5B7EC9",
         "Linear": "#5BB87E",
         "CNN": "#C9855B",
+        "CV": "#7E9BC9",
+        "JEV": "#C97E9B",
         "GRU": "#C9C05B",
         "Transformer": "#C95B5B",
         "Combined": "#9B5BC9",
@@ -1339,6 +1480,55 @@ def _model_canvas3d_html(models: Dict[str, Any], model_id: Optional[str]) -> Opt
             szs.append(_coerce(ch)); lbs.append(lab); tps.append(t)
         _build_stack(szs, lbs, tps, _col("CNN"))
 
+    elif mtype == "CV":
+        act_s = _act_summary()
+        kernels = cfg.get("kernels")
+        in_ch = cfg.get("in_channels")
+        num_classes = cfg.get("num_classes")
+        pool = cfg.get("pool")
+        input_hw = cfg.get("input_hw")
+        szs, lbs, tps = [], [], []
+        t = f"CV\nin_channels: {in_ch}\ninput_hw: {input_hw}x{input_hw}\npool: {pool}"
+        if act_s:
+            t += f"\n{act_s}"
+        szs.append(_coerce(in_ch or 1)); lbs.append(f"in_ch: {in_ch}"); tps.append(t)
+        for i, ch in enumerate(cfg.get("out_channels") or []):
+            k = None
+            if isinstance(kernels, list) and i < len(kernels):
+                k = kernels[i]
+            lab = f"c{i}: {ch}" + (f" k={k}" if k is not None else "")
+            t = f"CV\nout_channels[{i}]: {ch}"
+            if k is not None:
+                t += f"\nkernel: {k}"
+            if act_s:
+                t += f"\n{act_s}"
+            szs.append(_coerce(ch)); lbs.append(lab); tps.append(t)
+        t = f"CV\nnum_classes: {num_classes}\npool: {pool}"
+        if act_s:
+            t += f"\n{act_s}"
+        szs.append(_coerce(num_classes or 1)); lbs.append(f"classes: {num_classes}"); tps.append(t)
+        _build_stack(szs, lbs, tps, _col("CV"))
+
+    elif mtype == "JEV":
+        act_s = _act_summary()
+        input_size = cfg.get("input_size")
+        num_decisions = cfg.get("num_decisions")
+        szs, lbs, tps = [], [], []
+        t = f"JEV\ninput_size: {input_size}\nnum_decisions: {num_decisions}"
+        if act_s:
+            t += f"\n{act_s}"
+        szs.append(_coerce(input_size or 1)); lbs.append(f"in: {input_size}"); tps.append(t)
+        for i, h in enumerate(cfg.get("hidden_sizes") or []):
+            t = f"JEV\nhidden[{i}]: {h}"
+            if act_s:
+                t += f"\n{act_s}"
+            szs.append(_coerce(h)); lbs.append(f"h{i}: {h}"); tps.append(t)
+        t = f"JEV\nnum_decisions: {num_decisions}"
+        if act_s:
+            t += f"\n{act_s}"
+        szs.append(_coerce(num_decisions or 1)); lbs.append(f"decisions: {num_decisions}"); tps.append(t)
+        _build_stack(szs, lbs, tps, _col("JEV"))
+
     else:
         io_in = cfg.get("input_size")
         _add_box(0.0, 0.6, 0.0, 3.0, _col(mtype), mtype,
@@ -1356,6 +1546,8 @@ def _model_canvas3d_html(models: Dict[str, Any], model_id: Optional[str]) -> Opt
         {"label": "MLP",         "color": "#5B7EC9"},
         {"label": "Linear",      "color": "#5BB87E"},
         {"label": "CNN",         "color": "#C9855B"},
+        {"label": "CV",          "color": "#7E9BC9"},
+        {"label": "JEV",         "color": "#C97E9B"},
         {"label": "GRU",         "color": "#C9C05B"},
         {"label": "Transformer", "color": "#C95B5B"},
         {"label": "Combined",    "color": "#9B5BC9"},
@@ -1478,6 +1670,14 @@ canvas:active{{cursor:grabbing}}
     <div class="leg-row">
       <span class="leg-icon" style="color:#C9855B">■</span>
       <span class="leg-desc"><b>CNN</b> — <code>in_channels</code>, <code>out_channels</code></span>
+    </div>
+    <div class="leg-row">
+      <span class="leg-icon" style="color:#7E9BC9">■</span>
+      <span class="leg-desc"><b>CV</b> — <code>in_channels</code>, <code>out_channels</code>, <code>num_classes</code>, <code>pool</code>, <code>input_hw</code></span>
+    </div>
+    <div class="leg-row">
+      <span class="leg-icon" style="color:#C97E9B">■</span>
+      <span class="leg-desc"><b>JEV</b> — <code>input_size</code>, <code>hidden_sizes</code>, <code>num_decisions</code></span>
     </div>
     <div class="leg-row">
       <span class="leg-icon" style="color:#9B5BC9">■</span>
@@ -1769,7 +1969,7 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
             io_in = cfg.get("input_size")
             io_out = cfg.get("output_size")
             return f"type=Combined(sequential)\nA={a_t}\nB={b_t}\ninput_size={io_in}\noutput_size={io_out}"
-        if mtype in {"Linear", "MLP", "CNN"}:
+        if mtype in {"Linear", "MLP", "CNN", "CV", "JEV"}:
             bits: List[str] = [f"type={mtype}"]
             if cfg.get("input_size") is not None:
                 bits.append(f"input_size={cfg.get('input_size')}")
@@ -1777,6 +1977,20 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
                 bits.append(f"output_size={cfg.get('output_size')}")
             if mtype == "CNN" and cfg.get("in_channels") is not None:
                 bits.append(f"in_channels={cfg.get('in_channels')}")
+            if mtype == "CV":
+                if cfg.get("in_channels") is not None:
+                    bits.append(f"in_channels={cfg.get('in_channels')}")
+                if cfg.get("num_classes") is not None:
+                    bits.append(f"num_classes={cfg.get('num_classes')}")
+                if cfg.get("pool") is not None:
+                    bits.append(f"pool={cfg.get('pool')}")
+                if cfg.get("input_hw") is not None:
+                    bits.append(f"input_hw={cfg.get('input_hw')}")
+            if mtype == "JEV":
+                if cfg.get("input_size") is not None:
+                    bits.append(f"input_size={cfg.get('input_size')}")
+                if cfg.get("num_decisions") is not None:
+                    bits.append(f"num_decisions={cfg.get('num_decisions')}")
             act_s = _act_summary()
             if act_s:
                 bits.append(act_s)
@@ -1843,6 +2057,35 @@ def _model_structure_svg_html(models: Dict[str, Any], model_id: Optional[str]) -
                 if act_s:
                     hover += f"\n{act_s}"
                 _add(ch, lab, hover)
+        elif mtype == "CV":
+            kernels = cfg.get("kernels")
+            in_ch = cfg.get("in_channels")
+            num_classes = cfg.get("num_classes")
+            pool = cfg.get("pool")
+            input_hw = cfg.get("input_hw")
+            hover = f"type=CV\nin_channels={in_ch}\ninput_hw={input_hw}x{input_hw}\npool={pool}" + (f"\n{act_s}" if act_s else "")
+            _add(in_ch or 1, f"in_ch: {in_ch}", hover)
+            for i, ch in enumerate(cfg.get("out_channels") or []):
+                k = None
+                if isinstance(kernels, list) and i < len(kernels):
+                    k = kernels[i]
+                lab = f"c{i}: {ch}" + (f" (k={k})" if k is not None else "")
+                hover = f"type=CV\nout_channels[{i}]={ch}" + (f"\nkernel={k}" if k is not None else "")
+                if act_s:
+                    hover += f"\n{act_s}"
+                _add(ch, lab, hover)
+            hover = f"type=CV\nnum_classes={num_classes}\npool={pool}" + (f"\n{act_s}" if act_s else "")
+            _add(num_classes or 1, f"classes: {num_classes}", hover)
+        elif mtype == "JEV":
+            input_size = cfg.get("input_size")
+            num_decisions = cfg.get("num_decisions")
+            hover = f"type=JEV\ninput_size={input_size}\nnum_decisions={num_decisions}" + (f"\n{act_s}" if act_s else "")
+            _add(input_size or 1, f"in: {input_size}", hover)
+            for i, h in enumerate(cfg.get("hidden_sizes") or []):
+                hover = f"type=JEV\nhidden[{i}]={h}" + (f"\n{act_s}" if act_s else "")
+                _add(h, f"h{i}: {h}", hover)
+            hover = f"type=JEV\nnum_decisions={num_decisions}" + (f"\n{act_s}" if act_s else "")
+            _add(num_decisions or 1, f"decisions: {num_decisions}", hover)
         else:
             io_in = cfg.get("input_size")
             _add(io_in or 8, mtype, f"type={mtype}\ninput_size={io_in}")
@@ -3338,7 +3581,7 @@ def _render_build_train_page() -> None:
         return f"{_display_name(mid)} — {t}"
 
     st.subheader("Build")
-    model_type = st.selectbox("Model type", options=["MLP", "Linear", "CNN", "GRU", "Transformer"], index=0)
+    model_type = st.selectbox("Model type", options=["MLP", "Linear", "CNN", "CV", "JEV", "GRU", "Transformer"], index=0)
 
     activation_mode = st.radio(
         "Activation mode",
@@ -3391,6 +3634,17 @@ def _render_build_train_page() -> None:
             in_ch = int(st.number_input("Input channels", min_value=1, value=3, step=1))
             out_ch_csv = st.text_input("Out channels (CSV)", value="32,64,128")
             kernels_csv = st.text_input("Kernel sizes (CSV, optional)", value="")
+        elif model_type == "CV":
+            cv_in_ch = int(st.number_input("Input channels", min_value=1, value=3, step=1))
+            cv_out_ch_csv = st.text_input("Out channels (CSV)", value="32,64,128")
+            cv_kernels_csv = st.text_input("Kernel sizes (CSV, optional)", value="")
+            cv_num_classes = int(st.number_input("Num classes", min_value=1, value=10, step=1))
+            cv_pool = st.selectbox("Pool", options=["max", "avg", "none"], index=0)
+            cv_input_hw = int(st.number_input("Input H/W (square)", min_value=1, value=32, step=1))
+        elif model_type == "JEV":
+            jev_input_size = int(st.number_input("Input size", min_value=1, value=10, step=1))
+            jev_hidden_csv = st.text_input("Hidden sizes (CSV)", value="32,32")
+            jev_num_decisions = int(st.number_input("Num decisions", min_value=1, value=2, step=1))
         elif model_type == "GRU":
             gru_in = int(st.number_input("Input size", min_value=1, value=128, step=1))
             gru_hidden = int(st.number_input("Hidden size", min_value=1, value=256, step=1))
@@ -3424,6 +3678,34 @@ def _render_build_train_page() -> None:
                 out_ch = _parse_csv_ints(out_ch_csv)
                 kernels = _parse_csv_ints(kernels_csv) if kernels_csv.strip() else None
                 res = cmds.create_cnn(int(in_ch), out_ch, kernels, activation=activation, activations=activations)  # type: ignore[arg-type]
+            except Exception as e:
+                res = {"error": str(e)}
+        elif model_type == "CV":
+            try:
+                out_ch = _parse_csv_ints(cv_out_ch_csv)
+                kernels = _parse_csv_ints(cv_kernels_csv) if cv_kernels_csv.strip() else None
+                res = cmds.create_cv_model(
+                    int(cv_in_ch),
+                    out_ch,
+                    kernel_sizes=kernels,
+                    num_classes=int(cv_num_classes),
+                    activation=activation,
+                    activations=activations,
+                    pool=cv_pool,
+                    input_hw=int(cv_input_hw),
+                )
+            except Exception as e:
+                res = {"error": str(e)}
+        elif model_type == "JEV":
+            try:
+                hidden = _parse_csv_ints(jev_hidden_csv)
+                res = cmds.create_jev_model(
+                    int(jev_input_size),
+                    hidden,
+                    int(jev_num_decisions),
+                    activation=activation,
+                    activations=activations,
+                )
             except Exception as e:
                 res = {"error": str(e)}
         elif model_type == "GRU":

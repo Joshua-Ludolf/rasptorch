@@ -33,6 +33,51 @@ def test_mermaid_diagram_for_mlp() -> None:
     assert "10" in m and "32" in m and "2" in m
 
 
+def test_mermaid_diagram_for_cv() -> None:
+    ui = _import_ui_app()
+
+    models = {
+        "cv1234": {
+            "type": "CV",
+            "config": {
+                "in_channels": 3,
+                "out_channels": [32, 64],
+                "kernels": [3, 3],
+                "num_classes": 10,
+                "pool": "max",
+                "input_hw": 32,
+                "activation": "relu",
+            },
+        },
+    }
+    m = ui._model_mermaid_diagram(models, "cv1234")
+    assert m is not None
+    assert "flowchart" in m
+    assert "CV" in m
+    assert "3" in m and "32" in m and "64" in m and "10" in m
+
+
+def test_mermaid_diagram_for_jev() -> None:
+    ui = _import_ui_app()
+
+    models = {
+        "jev1234": {
+            "type": "JEV",
+            "config": {
+                "input_size": 10,
+                "hidden_sizes": [32, 16],
+                "num_decisions": 2,
+                "activation": "relu",
+            },
+        },
+    }
+    m = ui._model_mermaid_diagram(models, "jev1234")
+    assert m is not None
+    assert "flowchart" in m
+    assert "JEV" in m
+    assert "10" in m and "32" in m and "16" in m and "2" in m
+
+
 def test_mermaid_diagram_for_combined_sequential() -> None:
     ui = _import_ui_app()
 

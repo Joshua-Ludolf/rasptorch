@@ -284,6 +284,88 @@ class ChatREPL:
             return None
         return {"in_channels": in_ch, "out_channels": out_chs, "kernels": kernels, "activation": act, "activations": None}
 
+    def _wizard_cv(self) -> Optional[Dict[str, Any]]:
+        in_ch = self._prompt_int("Input channels", default=3, min_value=1)
+        if in_ch is None:
+            return None
+        n_layers = self._prompt_int("Number of conv layers", default=3, min_value=1)
+        if n_layers is None:
+            return None
+        out_chs: List[int] = []
+        for i in range(n_layers):
+            val = self._prompt_int(f"Output channels for layer{i+1}", default=32 if i == 0 else 64, min_value=1)
+            if val is None:
+                return None
+            out_chs.append(val)
+
+        kernels_mode = self._prompt_text("Kernel sizes? (default/enter)", default="default")
+        if kernels_mode is None:
+            return None
+        kernels = None
+        if kernels_mode.strip().lower() not in ("default", "d", ""):
+            kernels = []
+            for i in range(n_layers):
+                k = self._prompt_int(f"Kernel size for layer{i+1}", default=3, min_value=1)
+                if k is None:
+                    return None
+                kernels.append(k)
+
+        num_classes = self._prompt_int("Number of classes", default=10, min_value=1)
+        if num_classes is None:
+            return None
+        pool = self._prompt_text("Pooling (max/avg/none)", default="max")
+        if pool is None:
+            return None
+        pool = pool.strip().lower()
+        if pool not in ("max", "avg", "none"):
+            print(f"✗ Unknown pool '{pool}'. Using 'max'.")
+            pool = "max"
+        input_hw = self._prompt_int("Input height/width (square)", default=32, min_value=1)
+        if input_hw is None:
+            return None
+
+        act = self._prompt_activation("Activation between layers", default="relu")
+        if act is None:
+            return None
+        return {
+            "in_channels": in_ch,
+            "out_channels": out_chs,
+            "kernels": kernels,
+            "num_classes": num_classes,
+            "pool": pool,
+            "input_hw": input_hw,
+            "activation": act,
+            "activations": None,
+        }
+
+    def _wizard_jev(self) -> Optional[Dict[str, Any]]:
+        input_size = self._prompt_int("Input size", default=10, min_value=1)
+        if input_size is None:
+            return None
+        n_hidden = self._prompt_int("Number of hidden layers", default=2, min_value=0)
+        if n_hidden is None:
+            return None
+        hidden_sizes: List[int] = []
+        for i in range(n_hidden):
+            val = self._prompt_int(f"Units for hidden{i+1}", default=32, min_value=1)
+            if val is None:
+                return None
+            hidden_sizes.append(val)
+        num_decisions = self._prompt_int("Number of decisions", default=2, min_value=1)
+        if num_decisions is None:
+            return None
+
+        act = self._prompt_activation("Activation after each hidden layer", default="relu")
+        if act is None:
+            return None
+        return {
+            "input_size": input_size,
+            "hidden_sizes": hidden_sizes,
+            "num_decisions": num_decisions,
+            "activation": act,
+            "activations": None,
+        }
+
     def _wizard_gru(self) -> Optional[Dict[str, Any]]:
         input_sz = self._prompt_int("Input size", default=128, min_value=1)
         if input_sz is None:
@@ -507,7 +589,7 @@ Type 'help <command>' for more details.
         """Print help for specific command."""
         helps = {
             "tensor": "tensor create|zeros|ones <shape> - Create tensors",
-            "model": "model mlp|linear|cnn|gru|transformer|transfer|lora|combine|list|info|use|select|deselect|remove|remove-all <args> - Create/manage models (interactive if args omitted)",
+            "model": "model mlp|linear|cnn|cv|jev|gru|transformer|transfer|lora|combine|list|info|use|select|deselect|remove|remove-all <args> - Create/manage models (interactive if args omitted)",
             "train": "train epochs|batch-size|start - Configure and start training",
             "optimizer": "optimizer create|set-lr - Configure optimizer",
             "backend": "backend list|use|status - Manage active backend adapter",
@@ -705,7 +787,107 @@ Type 'help <command>' for more details.
                         print(f"✗ Error: {result['error']}")
                 except ValueError:
                     print("✗ Invalid numeric value")
-            
+
+            elif subcmd == "cv":
+                try:
+                    if len(args) < 2:
+                        wiz = self._wizard_cv()
+                        if wiz is None:
+                            return
+                        result = cmds.create_cv_model(
+                            wiz["in_channels"],
+                            wiz["out_channels"],
+                            wiz.get("kernels"),
+                            num_classes=wiz.get("num_classes", 10),
+                            activation=wiz.get("activation", "relu"),
+                            activations=wiz.get("activations"),
+                            pool=wiz.get("pool", "max"),
+                            input_hw=wiz.get("input_hw", 32),
+                        )
+                    else:
+                        # Format: model cv <in_channels> <out_channels_csv> [kernels_csv] [num_classes] [pool] [input_hw] [act/activations]
+                        if len(args) < 3:
+                            print("✗ Usage: model cv <in_channels> <out_channels_csv> [kernels_csv] [num_classes] [pool] [input_hw] [act=relu|activations=...]")
+                            return
+                        in_ch = int(args[1])
+                        out_chs = [int(x.strip()) for x in args[2].split(",") if x.strip()]
+                        kernels = None
+                        num_classes = 10
+                        pool = "max"
+                        input_hw = 32
+                        extra_start = 3
+                        if len(args) >= 4 and args[3].replace(",", "").strip().isdigit():
+                            kernels = [int(x.strip()) for x in args[3].split(",") if x.strip()]
+                            extra_start = 4
+                        if len(args) > extra_start:
+                            num_classes = int(args[extra_start])
+                            extra_start += 1
+                        if len(args) > extra_start:
+                            pool = args[extra_start].strip().lower()
+                            extra_start += 1
+                        if len(args) > extra_start:
+                            input_hw = int(args[extra_start])
+                            extra_start += 1
+                        parsed = self._parse_builder_args(args[extra_start:])
+                        result = cmds.create_cv_model(
+                            in_ch,
+                            out_chs,
+                            kernels,
+                            num_classes=num_classes,
+                            activation=parsed["activation"],
+                            activations=parsed["activations"],
+                            pool=pool,
+                            input_hw=input_hw,
+                        )
+
+                    if "error" not in result:
+                        mid = result["model_id"]
+                        self.context["current_model"] = mid
+                        print(f"✓ Created CV: {mid[:8]}")
+                    else:
+                        print(f"✗ Error: {result['error']}")
+                except ValueError:
+                    print("✗ Invalid numeric value")
+
+            elif subcmd == "jev":
+                try:
+                    if len(args) < 2:
+                        wiz = self._wizard_jev()
+                        if wiz is None:
+                            return
+                        result = cmds.create_jev_model(
+                            wiz["input_size"],
+                            wiz["hidden_sizes"],
+                            wiz["num_decisions"],
+                            activation=wiz.get("activation", "relu"),
+                            activations=wiz.get("activations"),
+                        )
+                    else:
+                        # Format: model jev <input_size> <hidden_sizes_csv> <num_decisions> [act/activations]
+                        if len(args) < 4:
+                            print("✗ Usage: model jev <input_size> <hidden_sizes_csv> <num_decisions> [act=relu|activations=...]")
+                            return
+                        input_size = int(args[1])
+                        hidden_sizes = [int(x.strip()) for x in args[2].split(",") if x.strip()]
+                        num_decisions = int(args[3])
+                        parsed = self._parse_builder_args(args[4:])
+                        result = cmds.create_jev_model(
+                            input_size,
+                            hidden_sizes,
+                            num_decisions,
+                            activation=parsed["activation"],
+                            activations=parsed["activations"],
+                        )
+
+                    if "error" not in result:
+                        mid = result["model_id"]
+                        self.context["current_model"] = mid
+                        print(f"✓ Created JEV: {mid[:8]}")
+                    else:
+                        print(f"✗ Error: {result['error']}")
+                except ValueError:
+                    print("✗ Invalid numeric value")
+
             elif subcmd == "gru":
                 try:
                     if len(args) < 2:
