@@ -66,9 +66,11 @@ rasptorch tensor ones --shape 5,10 [--device cpu|gpu] [--dtype float32|float64|i
 # Create a linear neural network
 rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
 
-# Create other model types (mlp, cnn, gru, transformer, etc.)
+# Create other model types (mlp, cnn, cv, jev, gru, transformer, etc.)
 rasptorch model mlp --layers "64,32,16,2"
 rasptorch model cnn --in-channels 3 --out-channels "32,64,128"
+rasptorch model cv --in-channels 3 --out-channels "32,64" --num-classes 10 --input-hw 32
+rasptorch model jev --input-size 10 --hidden-sizes "32,16" --num-decisions 2
 
 # List all created models
 rasptorch model list

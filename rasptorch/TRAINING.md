@@ -21,6 +21,12 @@ rasptorch model linear --input-size 10 --hidden-sizes "32,16" --output-size 2
 # CNN (Convolutional Neural Network)
 rasptorch model cnn --in-channels 3 --out-channels "32,64,128"
 
+# CV (Computer Vision) model - Conv2d blocks -> Flatten -> Linear
+rasptorch model cv --in-channels 3 --out-channels "32,64" --num-classes 10 --input-hw 32
+
+# JEV (decision) model - MLP outputting decision vector
+rasptorch model jev --input-size 10 --hidden-sizes "32,16" --num-decisions 2
+
 # GRU (Gated Recurrent Unit)
 rasptorch model gru --input-size 128 --hidden-size 256 --num-layers 2
 

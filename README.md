@@ -298,6 +298,10 @@ Models are defined using structured commands:
 uv run rasptorch model mlp --layers "64,32,16,2"
 # Complex CNN
 uv run rasptorch model cnn --in-channels 3 --out-channels "32,64,128"
+# Computer Vision model (Conv2d -> Flatten -> Linear)
+uv run rasptorch model cv --in-channels 3 --out-channels "32,64" --num-classes 10 --input-hw 32
+# JEV (decision) model (MLP outputting decision vector)
+uv run rasptorch model jev --input-size 10 --hidden-sizes "32,16" --num-decisions 2
 ```
 Managing the lifecycle:
 ```bash

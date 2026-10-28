@@ -474,6 +474,8 @@ MODEL BUILDERS:
     model mlp [args]             Create MLP (args or interactive)
     model linear [args]          Create Linear/MLP-style model (args or interactive)
     model cnn [args]             Create CNN (args or interactive)
+    model cv [args]              Create CV model (args or interactive)
+    model jev [args]             Create JEV decision model (args or interactive)
     model gru [args]             Create GRU (args or interactive)
     model transformer [args]     Create Transformer (args or interactive)
     model transfer [args]        Create a transfer-learning classifier head

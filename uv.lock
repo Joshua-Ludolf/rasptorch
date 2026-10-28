@@ -1514,7 +1514,7 @@ wheels = [
 
 [[package]]
 name = "rasptorch"
-version = "2.0.1"
+version = "2.0.0"
 source = { editable = "." }
 default-groups = ["runtime-gpu"]
 dependencies = [
