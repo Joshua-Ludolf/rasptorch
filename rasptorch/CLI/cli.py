@@ -584,6 +584,118 @@ def create_cnn(ctx, in_channels, out_channels, kernels, activation, activations)
         sys.exit(1)
 
 
+@model.command("cv")
+@click.option("--in-channels", required=True, type=int)
+@click.option("--out-channels", required=True)
+@click.option("--kernels", default=None)
+@click.option("--num-classes", default=10, type=int, help="Number of output classes")
+@click.option(
+    "--pool",
+    default="max",
+    type=click.Choice(["max", "avg", "none"], case_sensitive=False),
+    show_default=True,
+    help="Pooling type after each conv block",
+)
+@click.option(
+    "--activation",
+    default="relu",
+    type=click.Choice(["relu", "gelu", "tanh", "sigmoid", "silu", "leaky_relu", "elu", "none"], case_sensitive=False),
+    show_default=True,
+    help="Activation between layers (or 'none')",
+)
+@click.option(
+    "--activations",
+    default=None,
+    help="Comma-separated per-layer activations (count must be out_channels-1; overrides --activation)",
+)
+@click.pass_context
+def create_cv(ctx, in_channels, out_channels, kernels, num_classes, pool, activation, activations):
+    """Create a computer vision model (Conv2d-based CNN classifier)."""
+    try:
+        out_ch_list = [int(x.strip()) for x in out_channels.split(",")]
+        kernel_list = [int(x.strip()) for x in kernels.split(",")] if kernels else None
+        activations_list = None
+        if activations:
+            activations_list = [x.strip() for x in str(activations).split(",") if x.strip()]
+            expected = max(len(out_ch_list) - 1, 0)
+            if len(activations_list) != expected:
+                raise ValueError(
+                    f"--activations must have {expected} value(s) (one per transition)"
+                )
+        cmds = get_model_commands()
+        result = cmds.create_cv_model(
+            in_channels,
+            out_ch_list,
+            kernel_list,
+            num_classes=int(num_classes),
+            pool=str(pool),
+            activation=str(activation),
+            activations=activations_list,
+        )
+        if "error" in result:
+            raise ValueError(result["error"])
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(result))
+        else:
+            click.echo(f"✓ CV model: {result['model_id'][:8]}")
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
+
+
+@model.command("jev")
+@click.option("--input-size", required=True, type=int, help="Input feature size")
+@click.option("--hidden-sizes", required=True, help="Comma-separated hidden layer sizes")
+@click.option("--num-decisions", required=True, type=int, help="Number of decision outputs")
+@click.option(
+    "--activation",
+    default="relu",
+    type=click.Choice(["relu", "gelu", "tanh", "sigmoid", "silu", "leaky_relu", "elu", "none"], case_sensitive=False),
+    show_default=True,
+    help="Activation between layers (or 'none')",
+)
+@click.option(
+    "--activations",
+    default=None,
+    help="Comma-separated per-hidden-layer activations (count must equal hidden-sizes count; overrides --activation)",
+)
+@click.pass_context
+def create_jev(ctx, input_size, hidden_sizes, num_decisions, activation, activations):
+    """Create a JEV (decision) model."""
+    try:
+        hidden_list = [int(x.strip()) for x in hidden_sizes.split(",")]
+        activations_list = None
+        if activations:
+            activations_list = [x.strip() for x in str(activations).split(",") if x.strip()]
+            if len(activations_list) != len(hidden_list):
+                raise ValueError(
+                    f"--activations must have {len(hidden_list)} value(s) (one per hidden layer)"
+                )
+        cmds = get_model_commands()
+        result = cmds.create_jev_model(
+            input_size,
+            hidden_list,
+            num_decisions,
+            activation=str(activation),
+            activations=activations_list,
+        )
+        if "error" in result:
+            raise ValueError(result["error"])
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(result))
+        else:
+            click.echo(f"✓ JEV model: {result['model_id'][:8]}")
+    except Exception as e:
+        if ctx.obj.get("json_output"):
+            click.echo(format_json_output(format_error(str(e))))
+        else:
+            click.echo(f"✗ Error: {e}")
+        sys.exit(1)
+
+
 @model.command("gru")
 @click.option("--input-size", required=True, type=int)
 @click.option("--hidden-size", required=True, type=int)

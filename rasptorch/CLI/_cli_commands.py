@@ -461,6 +461,74 @@ class ModelCommands:
                 rasptorch.nn.ReLU(),
                 rasptorch.nn.Linear(hidden, num_classes),
             )
+        elif model_type == "CV":
+            in_channels = int(config.get("in_channels", 3))
+            out_channels = config.get("out_channels", [32, 64])
+            kernel_sizes = config.get("kernel_sizes", [3] * len(out_channels))
+            num_classes = int(config.get("num_classes", 10))
+            activation = config.get("activation", "relu")
+            activations = config.get("activations")
+            pool_name = str(config.get("pool", "max")).lower()
+            hw = int(config.get("input_hw", 32))
+
+            def _act_layer(name: str) -> Optional[Any]:
+                return self._make_activation_layer(name)
+
+            layers = []
+            in_ch = in_channels
+            for i, out_ch in enumerate(out_channels):
+                layers.append(
+                    rasptorch.nn.Conv2d(
+                        in_ch,
+                        int(out_ch),
+                        kernel_size=int(kernel_sizes[i]) if i < len(kernel_sizes) else 3,
+                        stride=1,
+                        padding=1,
+                    )
+                )
+                act_name = None
+                if isinstance(activations, list) and i < len(activations):
+                    act_name = str(activations[i])
+                else:
+                    act_name = str(activation)
+                act = _act_layer(act_name)
+                if act is not None:
+                    layers.append(act)
+                if pool_name == "max":
+                    layers.append(rasptorch.nn.MaxPool2d(kernel_size=2, stride=2))
+                    hw = max(1, hw // 2)
+                elif pool_name == "avg":
+                    layers.append(rasptorch.nn.AvgPool2d(kernel_size=2, stride=2))
+                    hw = max(1, hw // 2)
+                in_ch = int(out_ch)
+            layers.append(rasptorch.nn.Flatten())
+            layers.append(rasptorch.nn.Linear(in_ch * hw * hw, num_classes))
+            return rasptorch.nn.Sequential(*layers)
+        elif model_type == "JEV":
+            input_size = int(config.get("input_size", 10))
+            hidden_sizes = config.get("hidden_sizes", [32])
+            num_decisions = int(config.get("num_decisions", 2))
+            activation = config.get("activation", "relu")
+            activations = config.get("activations")
+
+            def _act_layer(name: str) -> Optional[Any]:
+                return self._make_activation_layer(name)
+
+            layers = []
+            prev_size = input_size
+            for idx, hidden_size in enumerate(hidden_sizes):
+                layers.append(rasptorch.nn.Linear(prev_size, int(hidden_size)))
+                act_name = None
+                if isinstance(activations, list) and idx < len(activations):
+                    act_name = str(activations[idx])
+                else:
+                    act_name = str(activation)
+                act = _act_layer(act_name)
+                if act is not None:
+                    layers.append(act)
+                prev_size = int(hidden_size)
+            layers.append(rasptorch.nn.Linear(prev_size, num_decisions))
+            return rasptorch.nn.Sequential(*layers)
         else:
             return None
 
@@ -584,6 +652,20 @@ class ModelCommands:
                     in_features = int(config.get("feature_size"))
                 if "num_classes" in config:
                     out_features = int(config.get("num_classes"))
+            elif model_type == "CV":
+                # CV model: Conv2d stack -> Flatten -> Linear(num_classes).
+                # Accepts rank-4 (NCHW) input; outputs rank-2 (B, num_classes).
+                in_ranks = {4}
+                if "in_channels" in config:
+                    in_features = int(config.get("in_channels"))
+                if "num_classes" in config:
+                    out_features = int(config.get("num_classes"))
+            elif model_type == "JEV":
+                # JEV model: MLP -> decision vector. Rank-2 in/out.
+                if "input_size" in config:
+                    in_features = int(config.get("input_size"))
+                if "num_decisions" in config:
+                    out_features = int(config.get("num_decisions"))
             elif model_type == "Combined":
                 # Prefer stored metadata if present.
                 if "input_size" in config:
@@ -876,7 +958,13 @@ class ModelCommands:
         activation: str = "relu",
         activations: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Create a CNN."""
+        """Create a real Conv2d-based CNN (NCHW).
+
+        Builds a stack of Conv2d -> (activation) blocks followed by a Flatten
+        and a final Linear classification head.  This is a proper computer
+        vision model, unlike the previous implementation which incorrectly
+        used Linear layers (treating channels as features).
+        """
         if not out_channels:
             return {"error": "CNN requires output channels"}
         try:
@@ -887,19 +975,49 @@ class ModelCommands:
                 }
             if kernel_sizes is None:
                 kernel_sizes = [3] * len(out_channels)
+            if len(kernel_sizes) != len(out_channels):
+                return {
+                    "error": f"kernel_sizes must have {len(out_channels)} value(s) (one per conv layer)"
+                }
+
+            norm_activation = self._normalize_activation_name(activation)
+            norm_activations = (
+                [self._normalize_activation_name(a) for a in activations]
+                if isinstance(activations, list)
+                else None
+            )
+
             layers = []
             in_ch = in_channels
             for i, out_ch in enumerate(out_channels):
-                layers.append(rasptorch.nn.Linear(in_ch, out_ch))
-                if i < len(out_channels) - 1:
-                    act_name = activations[i] if isinstance(activations, list) and i < len(activations) else activation
+                layers.append(
+                    rasptorch.nn.Conv2d(
+                        in_ch,
+                        out_ch,
+                        kernel_size=int(kernel_sizes[i]),
+                        stride=1,
+                        padding=1,
+                    )
+                )
+                # Activation after every conv layer except the last (kept before Flatten/head).
+                act_idx = i if i < len(out_channels) - 1 else None
+                if act_idx is not None:
+                    act_name = (
+                        norm_activations[act_idx]
+                        if isinstance(norm_activations, list) and act_idx < len(norm_activations)
+                        else norm_activation
+                    )
                     act = self._make_activation_layer(act_name)
                     if act is not None:
                         layers.append(act)
                 in_ch = out_ch
+
+            # Classification head: flatten spatial dims and map to the last channel count.
+            layers.append(rasptorch.nn.Flatten())
+            layers.append(rasptorch.nn.Linear(in_ch, in_ch))
             model = rasptorch.nn.Sequential(*layers)
             model_id = str(uuid.uuid4())[:8]
-            
+
             model_data = {
                 "model_id": model_id,
                 "model": model,
@@ -908,12 +1026,16 @@ class ModelCommands:
                     "in_channels": in_channels,
                     "out_channels": out_channels,
                     "kernel_sizes": kernel_sizes,
-                    "activation": self._normalize_activation_name(activation),
-                    **({"activations": [self._normalize_activation_name(a) for a in activations]} if isinstance(activations, list) else {}),
+                    "activation": norm_activation,
+                    **(
+                        {"activations": norm_activations}
+                        if isinstance(norm_activations, list)
+                        else {}
+                    ),
                 },
             }
             self._save_session_model(model_id, model_data)
-            
+
             return {
                 "status": "success",
                 "model_id": model_id,
@@ -921,8 +1043,193 @@ class ModelCommands:
                 "architecture": {
                     "in_channels": in_channels,
                     "out_channels": out_channels,
+                    "kernel_sizes": kernel_sizes,
                     "num_layers": len(out_channels),
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def create_cv_model(
+        self,
+        in_channels: int,
+        out_channels: List[int],
+        kernel_sizes: List[int] = None,
+        num_classes: int = 10,
+        activation: str = "relu",
+        activations: Optional[List[str]] = None,
+        pool: str = "max",
+        input_hw: int = 32,
+    ) -> Dict[str, Any]:
+        """Create a computer vision model (Conv2d-based CNN classifier).
+
+        Builds a stack of Conv2d -> (activation) -> (pool) blocks, then
+        Flatten + Linear classification head mapping to ``num_classes``.
+        This is the proper CV counterpart to the legacy (buggy) MLP-like
+        ``create_cnn`` which used Linear layers instead of Conv2d.
+        """
+        if not out_channels:
+            return {"error": "CV model requires output channels"}
+        if int(num_classes) <= 0:
+            return {"error": "num_classes must be > 0"}
+        try:
+            if kernel_sizes is None:
+                kernel_sizes = [3] * len(out_channels)
+            if len(kernel_sizes) != len(out_channels):
+                return {
+                    "error": f"kernel_sizes must have {len(out_channels)} value(s) (one per conv layer)"
                 }
+
+            norm_activation = self._normalize_activation_name(activation)
+            norm_activations = (
+                [self._normalize_activation_name(a) for a in activations]
+                if isinstance(activations, list)
+                else None
+            )
+
+            pool_name = str(pool).strip().lower()
+            if pool_name not in {"max", "avg", "none"}:
+                return {"error": f"Unsupported pool: {pool} (use 'max', 'avg', or 'none')"}
+
+            layers = []
+            in_ch = in_channels
+            hw = int(input_hw)
+            for i, out_ch in enumerate(out_channels):
+                layers.append(
+                    rasptorch.nn.Conv2d(
+                        in_ch,
+                        out_ch,
+                        kernel_size=int(kernel_sizes[i]),
+                        stride=1,
+                        padding=1,
+                    )
+                )
+                act_name = (
+                    norm_activations[i]
+                    if isinstance(norm_activations, list) and i < len(norm_activations)
+                    else norm_activation
+                )
+                act = self._make_activation_layer(act_name)
+                if act is not None:
+                    layers.append(act)
+                if pool_name == "max":
+                    layers.append(rasptorch.nn.MaxPool2d(kernel_size=2, stride=2))
+                    hw = max(1, hw // 2)
+                elif pool_name == "avg":
+                    layers.append(rasptorch.nn.AvgPool2d(kernel_size=2, stride=2))
+                    hw = max(1, hw // 2)
+                in_ch = out_ch
+
+            # Classification head: Flatten -> Linear(in_ch * H * W, num_classes).
+            layers.append(rasptorch.nn.Flatten())
+            layers.append(rasptorch.nn.Linear(in_ch * hw * hw, int(num_classes)))
+            model = rasptorch.nn.Sequential(*layers)
+            model_id = str(uuid.uuid4())[:8]
+
+            model_data = {
+                "model_id": model_id,
+                "model": model,
+                "type": "CV",
+                "config": {
+                    "in_channels": in_channels,
+                    "out_channels": out_channels,
+                    "kernel_sizes": kernel_sizes,
+                    "num_classes": int(num_classes),
+                    "activation": norm_activation,
+                    **(
+                        {"activations": norm_activations}
+                        if isinstance(norm_activations, list)
+                        else {}
+                    ),
+                    "pool": pool_name,
+                    "input_hw": int(input_hw),
+                },
+            }
+            self._save_session_model(model_id, model_data)
+
+            return {
+                "status": "success",
+                "model_id": model_id,
+                "type": "CV",
+                "architecture": {
+                    "in_channels": in_channels,
+                    "out_channels": out_channels,
+                    "kernel_sizes": kernel_sizes,
+                    "num_classes": int(num_classes),
+                    "pool": pool_name,
+                    "input_hw": int(input_hw),
+                    "num_layers": len(out_channels),
+                },
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def create_jev_model(
+        self,
+        input_size: int,
+        hidden_sizes: List[int],
+        num_decisions: int,
+        activation: str = "relu",
+        activations: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Create a JEV (decision) model.
+
+        A JEV model is a feed-forward MLP that outputs a decision vector of
+        size ``num_decisions`` (e.g. action logits for a decision/control
+        policy). It shares the MLP backbone but is typed distinctly so it can
+        be identified, trained, and combined as a decision model rather than a
+        generic classifier.
+        """
+        if int(num_decisions) <= 0:
+            return {"error": "num_decisions must be > 0"}
+        if not hidden_sizes:
+            return {"error": "jev requires at least one hidden size"}
+        try:
+            if isinstance(activations, list) and len(activations) != len(hidden_sizes):
+                return {
+                    "error": f"activations must have {len(hidden_sizes)} value(s) (one per hidden layer)"
+                }
+            layers = []
+            prev_size = int(input_size)
+            for idx, hidden_size in enumerate(hidden_sizes):
+                layers.append(rasptorch.nn.Linear(prev_size, int(hidden_size)))
+                act_name = activations[idx] if isinstance(activations, list) and idx < len(activations) else activation
+                act = self._make_activation_layer(act_name)
+                if act is not None:
+                    layers.append(act)
+                prev_size = int(hidden_size)
+            layers.append(rasptorch.nn.Linear(prev_size, int(num_decisions)))
+            model = rasptorch.nn.Sequential(*layers)
+            model_id = str(uuid.uuid4())[:8]
+
+            model_data = {
+                "model_id": model_id,
+                "model": model,
+                "type": "JEV",
+                "config": {
+                    "input_size": int(input_size),
+                    "hidden_sizes": [int(h) for h in hidden_sizes],
+                    "num_decisions": int(num_decisions),
+                    "activation": self._normalize_activation_name(activation),
+                    **(
+                        {"activations": [self._normalize_activation_name(a) for a in activations]}
+                        if isinstance(activations, list)
+                        else {}
+                    ),
+                },
+            }
+            self._save_session_model(model_id, model_data)
+
+            return {
+                "status": "success",
+                "model_id": model_id,
+                "type": "JEV",
+                "architecture": {
+                    "input_size": int(input_size),
+                    "hidden_sizes": [int(h) for h in hidden_sizes],
+                    "num_decisions": int(num_decisions),
+                    "num_layers": len(layers),
+                },
             }
         except Exception as e:
             return {"error": str(e)}
@@ -1546,6 +1853,12 @@ class ModelCommands:
                 inferred_in = getattr(first_gru, "input_size", None)
                 input_size = int(inferred_in if inferred_in is not None else (config.get("input_size") or 128))
                 input_shape = (batch_size, seq_len, input_size)
+            elif str(model_data.get("type", "")) == "CV":
+                # CV model expects NCHW input: (batch, channels, H, W).
+                in_channels = int(config.get("in_channels", 3))
+                # Default spatial size; users can override via config["input_hw"].
+                hw = int(config.get("input_hw", 32))
+                input_shape = (batch_size, in_channels, hw, hw)
             else:
                 input_size = int(config.get("input_size") or config.get("vocab_size") or config.get("layer_sizes", [10])[0])
                 input_shape = (batch_size, input_size)

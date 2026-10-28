@@ -87,6 +87,8 @@ All model creation commands now work with training:
 rasptorch model linear --input-size 10 --hidden-sizes "32,16" --output-size 2
 rasptorch model mlp --layers "128,64,32,10"
 rasptorch model cnn --in-channels 3 --out-channels "32,64,128"
+rasptorch model cv --in-channels 3 --out-channels "32,64" --num-classes 10 --input-hw 32
+rasptorch model jev --input-size 10 --hidden-sizes "32,16" --num-decisions 2
 rasptorch model gru --input-size 128 --hidden-size 256 --num-layers 2
 rasptorch model transformer --vocab-size 10000 --d-model 512 --num-heads 8 --num-layers 6
 
@@ -101,6 +103,8 @@ Model Management:
   linear                - Create linear MLP
   mlp                   - Create multi-layer perceptron
   cnn                   - Create convolutional network
+  cv                    - Create computer vision model (Conv2d -> Flatten -> Linear)
+  jev                   - Create JEV decision model (MLP -> decision vector)
   gru                   - Create GRU model
   transformer           - Create transformer architecture
   lora                  - Create LoRA adapter
