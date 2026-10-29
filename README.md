@@ -93,20 +93,17 @@ For local development and access to all potential backends:
 pip install -e ".[dev]"
 ```
 
-**C. GPU Mode Prerequisites:**
-To utilize the GPU backend, you must meet these prerequisites:
-**D. GPU Backend Dependencies:**
-For systems with a proper GPU setup (e.g., Raspberry Pi 5), install the GPU backend dependencies using:
+**C. GPU Backend Dependencies:**
+To use the GPU backends, install the extra for the backend(s) you need:
 ```bash
-
 # Prerequisites for Vulkan backend (Raspberry Pi 4/5 & Linux)
 sudo apt update
-sudo apt install -y glslc (for raspberry pi 4/5 & linux operating systems)
+sudo apt install -y glslc
 
 # For Windows, install the Vulkan SDK from LunarG:
 ./VulkanSDK-Installer.exe --accept-licenses --default-answer --confirm-command install
 
-# Then install rasptorch with GPU support after installing prerequisites (for either platform):
+# Then install rasptorch with GPU support:
 pip install rasptorch[gpu]
 ```
 
@@ -119,13 +116,27 @@ pip install rasptorch[vulkan]
 # OpenCL-only
 pip install rasptorch[opencl]
 
-# CUDA-only (for NVIDIA systems with CUDA installed)
+# CUDA-only for NVIDIA systems with CUDA 13
+# The CuPy CUDA runtime libraries are installed by the extra when they are
+# not present locally.
 pip install rasptorch[cuda]
+
+# uv equivalents
+uv sync --extra opencl
+uv sync --extra cuda
+uv sync --extra cuda --extra opencl
 
 # Vulkan + OpenCL
 pip install "rasptorch[vulkan,opencl]"
 ```
-```
+
+The CUDA extra uses the prebuilt `cupy-cuda13x` wheel with CuPy's `ctk`
+runtime extra. Do not run `uv add cupy`: the generic `cupy` package may resolve
+to a source distribution and require a complete local CUDA build toolchain.
+
+`uv lock` does not accept `--extra`; it resolves the project and declared
+extras. Select extras when installing or running commands with `uv sync
+--extra ...` or `uv run --extra ...`.
 
 #### 2. Quick Run Examples
 
@@ -139,6 +150,14 @@ uv run rasptorch chat
 uv run rasptorch ui
 ```
 *(This will usually open at `http://localhost:8501`)*
+
+When using `uv`, optional backend dependencies are not installed by a plain
+`uv sync`. Use the corresponding `--extra` flags, for example:
+
+```bash
+uv sync --extra cuda --extra opencl
+uv run --extra cuda --extra opencl rasptorch backend benchmark
+```
 
 **Streamlit Community Cloud:**
 
@@ -195,6 +214,14 @@ uv run rasptorch backend benchmark
 
 # Benchmark with custom size and multiple backends
 uv run rasptorch --json backend benchmark --backends numpy,vulkan,cuda --size 2048 --iterations 100 --warmup 20 --seed 42
+```
+
+On Windows, if the console uses a legacy code page and cannot display the
+benchmark's checkmark/cross characters, enable UTF-8 output:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+uv run --extra cuda --extra opencl rasptorch backend benchmark
 ```
 
 **Performance Results (Windows 11, NVIDIA GeForce RTX 3070 Ti):**
