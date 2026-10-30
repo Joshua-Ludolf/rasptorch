@@ -7197,6 +7197,11 @@ def matmul_fast(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
         return _fallback_buf(a.host @ b.host)
 
     out = empty((m, n))
+    if min(int(m), int(n), int(k)) >= 256:
+        try:
+            return matmul_vec4_32x32_tiled_into(a, b, out)
+        except Exception:
+            pass
     if min(int(m), int(n), int(k)) >= 128:
         try:
             return matmul_vec4_wide_tiled_into(a, b, out)
