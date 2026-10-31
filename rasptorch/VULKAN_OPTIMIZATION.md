@@ -2,11 +2,26 @@
 
 ## Overview
 
-The rasptorch Vulkan backend has been heavily optimized to deliver high-performance GPU computing on resource-constrained devices like the Raspberry Pi 4/5. This document explains the optimizations, their impact, and how to best utilize them.
+The rasptorch Vulkan backend has been heavily optimized to deliver high-performance GPU computing both on resource-constrained unified-memory devices (Raspberry Pi 4/5) and on discrete GPUs with dedicated VRAM. This document explains the optimizations, their impact, and how to best utilize them.
 
 ## Performance Results
 
-### Benchmark Summary (Raspberry Pi 5 target)
+### Current Headline (discrete NVIDIA GPU, Windows)
+
+```
+Operation: Matrix Multiplication (2048x2048, resident)
+Iterations: 5, Warmup: 1, Seed: 42
+
+Backend Performance (auto-probed, since the VRAM + blocked-GEMM update):
+├── Vulkan:           8101.5 GFLOPS  ✅ (auto → matmul_blk_tiled, VRAM-resident)
+├── CUDA (cuBLAS):    1585.1 GFLOPS  (per-iteration transfers)
+└── NumPy:             925.8 GFLOPS  (CPU reference)
+
+Fair GPU-side comparison (--cuda-resident), 2048²:  Vulkan 9029.7 vs CUDA 8587.1
+Kernel: matmul_blk_tiled;  Submission batching: submit_every=8
+```
+
+### Historical Baseline (Raspberry Pi 5 target track, before the discrete fast path)
 
 ```
 Operation: Matrix Multiplication (2048x2048)
@@ -53,7 +68,7 @@ RASPTORCH_VULKAN_DEVICE_LOCAL=0   # force the legacy host-mapped (zero-copy) pat
 VRAM (`device_local`), eliminating per-tile PCIe traffic and lifting plateaued
 large-GEMM throughput ~4-14x (see the table below).
 
-### 2. `matmul_blk_tiled`: Register-Blocked Shared-Memory GEMM (`Phase 2 ✅`)
+### 2. `matmul_blk_tiled`: Register-Blocked Shared-Memory GEMM (Phase 2 ✅)
 
 **Kernel design** (`shaders/matmul_blk_tiled.comp`):
 - 64x64 output tile per workgroup, 16x16 threads, 4x4 per-thread register tile
@@ -104,16 +119,19 @@ sync) so both numbers measure GPU-side GEMM throughput.
 
 | Size | Before (host-mapped) | After (VRAM + `blk_tiled`) | CUDA (per-iteration) |
 |------|----------------------|----------------------------|----------------------|
-| 256  | 765                  | **979**                    | 123                  |
+| 256  | 765                  | **979**                    | ~123-143             |
 | 512  | 1249                 | **4068**                   | ~425-1434            |
-| 1024 | 1823                 | **7793**                   | ~1204-1198           |
-| 2048 | 930                  | **8827**                   | 2418                 |
-| 4096 | 582                  | **8042-8146**              | 4565                 |
+| 1024 | 1823                 | **7793**                   | ~1143-1204           |
+| 2048 | 930                  | **8827**                   | ~1585-2418           |
+| 4096 | 582                  | **8042-8146**              | ~2957-4565           |
 
-Resident-vs-resident (both skipping host transfers): **2048 is a dead heat**
-(Vulkan 8657 vs CUDA/cuBLAS 8600 GFLOPS); at 4096 cuBLAS leads
-(12552 vs 8146 GFLOPS, ~65% of cuBLAS). Remaining gap heads future work
-(cooperative matrices, wider per-thread tiles, occupancy tuning).
+The CUDA columns show the observed range across sessions (same flags, different runs) — cuBLAS timing
+varies run-to-run on this machine. Vulkan leads at every size either way.
+
+Resident-vs-resident (both skipping host transfers, `--cuda-resident`): **Vulkan edges out cuBLAS at
+2048** (9029.7 vs 8587.1 GFLOPS, latest run; earlier runs were a dead heat, e.g. 8657 vs 8600). At 4096
+cuBLAS leads (12551.9 vs 8146.0 GFLOPS, ~65% of cuBLAS). Remaining gap heads future work (cooperative
+matrices, wider per-thread tiles, occupancy tuning).
 
 ## Roadmap: Shared-Memory Tiled GEMM
 
@@ -128,9 +146,10 @@ Phase 3 (cooperative matrices) remains the main remaining step.
 
 ### Phase 2: Implement Blocked Shared-Memory GEMM ✅
 
-- Use 16x16 or 32x32 tiles with cooperative loading into `shared` memory.
-- Minimize redundant global-memory loads by reusing each tile across multiple MAC steps.
-- Keep the output resident so benchmarking remains compute-bound rather than transfer-bound.
+- Implemented as `matmul_blk_tiled`: 64x64 output tiles, 4x4 per-thread register block, 32-deep
+  double-buffered shared k-tiles (~32 KiB shared memory).
+- Minimizes redundant global-memory loads by reusing each tile across multiple MAC steps (~16 FLOP/byte).
+- The output stays resident in DEVICE_LOCAL memory so benchmarking remains compute-bound rather than transfer-bound.
 
 ### Phase 3: Add a Cooperative-Matrix Backend Path
 
@@ -146,10 +165,11 @@ Phase 3 (cooperative matrices) remains the main remaining step.
 
 ### What Changed
 
-- **Before Optimization**: ~545 GFLOPS
-- **After Optimization**: ~564 GFLOPS
-- **Improvement**: +19 GFLOPS (+3.5%)
-- **Gap to NumPy**: Only ~22% (excellent for GPU acceleration)
+- **Historical (Pi 5 track)**: ~545 → ~564 GFLOPS (+3.5%) from batching + auto-tuning alone.
+- **Discrete fast path (this update, matmul 4096x4096)**: 582 → 8042-8146 GFLOPS (~14x) from DEVICE_LOCAL
+  VRAM residency + the `matmul_blk_tiled` kernel; 2048² went 930 → 8827 GFLOPS (~9.5x).
+- **Gap to cuBLAS**: closed at 2048 (Vulkan at parity or ahead, resident-vs-resident); remaining 1.5x gap at 4096
+  tracked under Future Optimizations (cooperative matrices, wider per-thread tiles).
 
 ## Key Optimizations Implemented
 
@@ -193,6 +213,7 @@ rasptorch --json backend benchmark \
 
 **Kernels Probed:**
 - `matmul` - Reference implementation
+- `matmul_tiled` - Shared-memory tiled implementation
 - `matmul_blk_tiled` - Register-blocked 64x64-tile GEMM (fastest on discrete GPUs with >=32 KiB shared memory)
 - `matmul_vec4_32x32_tiled` - Rewritten correct 32x32-tile GEMM (~8 FLOP/byte)
 - `matmul_vec4` - Vec4 optimized (fastest on most Raspberry Pi hardware)
@@ -202,50 +223,56 @@ rasptorch --json backend benchmark \
 - `matmul_a_bt_tiled` - Aggressive tiling (may cause device loss on some hardware)
 
 **Submission Strategies Probed:**
-- Batch sizes: 1, 2, 4, 8, 16, 32
+- Batch sizes: 1, 2, 4, 8 (without `--vulkan-autotune-submit`), plus 16 with it
 
 **Impact:**
 - Automatically finds optimal kernel for your hardware
 - Finds optimal submission batching
-- 564 GFLOPS achieved through auto-tuning
+- ~8,800 GFLOPS at 2048^2 achieved through auto-tuning on a discrete GPU (564 GFLOPS on the Pi 5 track)
 
 **How to Use:**
 ```bash
 # Let the system choose the best configuration
 rasptorch model train --model-id <id> --device gpu --vulkan-autotune-submit
 
-# Explicitly use best-known configuration
+# Explicitly use the blocked kernel (discrete GPUs, large workloads)
 rasptorch model train --model-id <id> --device gpu \
-  --vulkan-kernel matmul_vec4 \
-  --vulkan-submit-every 16
+  --vulkan-kernel matmul_blk_tiled \
+  --vulkan-submit-every 8
 ```
 
-### 3. Memory-Mapped Buffer Management
+### 3. Hybrid Memory Management (DEVICE_LOCAL VRAM + Host-Mapped Zero-Copy)
 
 **Problem Solved:** Expensive CPU-GPU data transfers between host and device memory.
+This is a two-sided problem: unified-memory devices need *mapped* buffers (copies would be
+wasteful), while discrete GPUs need *unmapped* DEVICE_LOCAL buffers (mapped buffers stream
+every tile access across PCIe).
 
-**Solution:** Prioritize persistent host-mapped memory to minimize explicit copies.
+**Solution:** Memory types are selected once at device init (`_select_memory_types`) and
+`alloc_buffer` binds each buffer accordingly:
 
-**Implementation:**
-```cpp
-// VulkanBuffer structure prioritizes host memory
-@dataclass
-class VulkanBuffer:
-    shape: tuple[int, ...]
-    buffer: int          # Device buffer handle
-    memory: int          # Device memory handle
-    host: Optional[np.ndarray] = None  # ← Host-mapped memory (preferred)
-    
-    def __post_init__(self):
-        # If host is available, we can minimize device operations
-        if self.host is not None:
-            self.memory = VK_NULL_HANDLE  # Marked as using host fallback
+```python
+def alloc_buffer(self, nbytes: int) -> tuple[VkBuffer, VkDeviceMemory]:
+    ...
+    mem, is_device = self._allocate_memory(buf, req)   # prefer DEVICE_LOCAL
+    vkBindBufferMemory(self.device, buf, mem, 0)
+    self._buffer_is_device[_vk_handle_key(buf)] = is_device
 ```
 
+- **Discrete GPUs:** buffers land in a non-host-visible DEVICE_LOCAL type from a dedicated
+  heap (>2 GiB). `write_buffer`/`read_buffer` route through a small pool of host-visible
+  staging buffers plus queued `vkCmdCopyBuffer` transfers (works inside batched recording).
+- **Unified memory / Raspberry Pi 4/5:** no dedicated non-host-visible heap resolves ->
+  legacy host-mapped, host-coherent buffers with direct mapped access (zero-copy).
+- **Out of VRAM:** allocation failures fall back to host-visible automatically.
+- **Override:** `RASPTORCH_VULKAN_DEVICE_LOCAL=1` forces VRAM-residency when a suitable type
+  exists; `=0` forces the host-mapped path.
+
 **Impact:**
-- Reduces data copy overhead
-- Enables zero-copy pathways where possible
-- Better memory utilization on constrained devices
+- Zero-copy on Raspberry Pi 4/5 (legacy behavior preserved automatically)
+- 37/37 benchmark buffers resident in VRAM on the discrete-GPU track; tile
+  reads/writes never cross PCIe (see "Measured Impact" above)
+- Fallback-safe: eviction/underground failures keep the legacy path rather than erroring
 
 ### 4. Resource Pooling & Reuse
 
@@ -273,7 +300,9 @@ class VulkanBuffer:
 **Pipelines Now Initialized:**
 ```
 Element-wise: add, mul, relu, neg, mul_add_relu
-Matrix Ops: matmul, matmul_vec4, matmul_a_bt, matmul_a_bt_tiled
+Matrix Ops: matmul, matmul_tiled, matmul_vec4, matmul_vec4_tiled,
+            matmul_vec4_wide_tiled, matmul_vec4_32x32_tiled, matmul_blk_tiled,
+            matmul_a_bt, matmul_a_bt_tiled
 Training: relu_backward, reduce_sum_rows, mse_grad, sgd_update
 CNN: im2col_nchw, col2im_nchw, nchw2mat, mat2nchw
 NN Essentials: softmax, layernorm, log_softmax
@@ -336,17 +365,14 @@ input_tensor.to('gpu')  # Input on GPU only during forward
 
 ## Benchmarking Results
 
-### Configuration Tested
+### Historical Baseline (pre-VRAM-residency, desktop track)
 
 ```
-Device: Raspberry Pi 5 (target)
+Device: desktop NVIDIA GPU (numbers carried over from the pre-VRAM-residency tuning track)
 Operation: matmul (A: 2048x2048, B: 2048x2048)
-Iterations: 100
-Warmup: 20
+Iterations: 100, Warmup: 20
 Data Transfer: Resident (upload once, reuse, download once)
 ```
-
-### Performance Comparison
 
 | Backend | Kernel | GFLOPS | Batching | Stable |
 |---------|--------|--------|----------|--------|
@@ -357,11 +383,35 @@ Data Transfer: Resident (upload once, reuse, download once)
 | Vulkan | matmul_a_bt | 541.3 | 8 | ✅ |
 | Vulkan | matmul_a_bt_tiled | - | - | ❌ Device Lost |
 
-**Key Findings:**
-- `matmul_vec4` is the clear winner on most hardware
-- Batching size of 16 is optimal for Raspberry Pi 5
-- ~78% of NumPy performance achieved (excellent for embedded GPU)
+**Key Findings (historical):**
+- `matmul_vec4` was the clear winner with host-mapped buffers
+- Batching size of 16 was optimal on the Pi 5 target
+- ~78% of NumPy performance achieved (embedded track)
 - All standard kernels stable except aggressive tiling
+
+### Current Results (DEVICE_LOCAL VRAM + `matmul_blk_tiled`, 5 iterations, Windows 11 / NVIDIA RTX 3070 Ti)
+
+Per-kernel throughput at 2048x2048 (explicit `--vulkan-kernel <kernel>`, submit_every=8):
+
+| Vulkan Kernel | GFLOPS | Status |
+|---------------|--------|--------|
+| `matmul_blk_tiled` | **8175.7** | ✅ (auto-selected) |
+| `matmul_vec4_wide_tiled` | 4043.3 | ✅ |
+| `matmul_vec4_32x32_tiled` | 3264.6 | ✅ |
+| `matmul_vec4_tiled` | 2389.8 | ✅ |
+| `matmul` | 2385.3 | ✅ |
+| `matmul_tiled` | 2235.6 | ✅ |
+| `matmul_a_bt_tiled` | 2207.9 | ✅ |
+| `matmul_vec4` | 1777.3 | ✅ |
+| `matmul_a_bt` | 450.2 | ✅ |
+
+Backend comparison and resident CUDA comparison: see the "Measured Impact" table in the
+Discrete-GPU Fast Path section above.
+
+**Key Findings (current):**
+- `matmul_blk_tiled` is ~2x the next-best kernel on discrete GPUs; auto mode picks it for `min(m,n,k) >= 512`
+- All nine kernels (including `matmul_a_bt_tiled`) stable on this hardware
+- Buffers are VRAM-resident, so throughput no longer degrades at large sizes
 
 ## Code Architecture
 
@@ -371,11 +421,14 @@ Data Transfer: Resident (upload once, reuse, download once)
 rasptorch/vulkan_backend.py
 ├── VulkanBuffer (dataclass)
 │   ├── Vulkan device handles
-│   ├── Host-mapped memory support
+│   ├── DEVICE_LOCAL (VRAM) or host-mapped backing per buffer kind
 │   └── View/refcounting for safety
 │
 ├── _VulkanContext (class)
 │   ├── init() - Full context initialization
+│   ├── _select_memory_types() - DEVICE_LOCAL vs host-visible resolution
+│   ├── alloc_buffer/_allocate_memory - VRAM-first allocation with host fallback
+│   ├── write_buffer/read_buffer - staging-pool copies for VRAM buffers
 │   ├── begin_batch/end_batch - Command grouping
 │   ├── _ensure_spv() - Shader loading
 │   ├── _create_pipeline_*() - All compute pipelines
@@ -385,6 +438,7 @@ rasptorch/vulkan_backend.py
     ├── begin_batch() - Start batching
     ├── end_batch() - End batching
     ├── flush() - Force submission
+    ├── matmul_blk_tiled_into / matmul_vec4_32x32_tiled_into - Blocked GEMMs
     └── All tensor operations
 ```
 
@@ -407,11 +461,18 @@ def end_batch(self) -> None:
 
 **Memory Management:**
 ```python
-def __post_init__(self) -> None:
-    """Prioritize host memory if available."""
-    if self.host is not None:
-        self.memory = VK_NULL_HANDLE
-        self.buffer = VK_NULL_HANDLE
+def _allocate_memory(self, buf: VkBuffer, req) -> tuple[VkDeviceMemory, bool]:
+    """Bind memory to `buf`, preferring DEVICE_LOCAL with host fallback."""
+    dl_type = self._device_local_mem_type
+    if dl_type is not None and (req.memoryTypeBits & (1 << dl_type)):
+        try:
+            mem = vkAllocateMemory(self.device, VkMemoryAllocateInfo(
+                allocationSize=req.size, memoryTypeIndex=dl_type), None)
+            return mem, True            # VRAM-resident
+        except Exception:
+            pass                         # out of VRAM -> host-visible fallback
+    ...                                  # HOST_VISIBLE | HOST_COHERENT path
+    return mem, False
 ```
 
 ## Troubleshooting
@@ -438,12 +499,20 @@ rasptorch model train --device gpu \
 
 2. If slow kernel is selected, explicitly force better one:
    ```bash
-   rasptorch model train --device gpu --vulkan-kernel matmul_vec4
+   rasptorch model train --device gpu --vulkan-kernel matmul_blk_tiled
    ```
 
 3. Reduce submission batching if overhead is high:
    ```bash
    rasptorch model train --device gpu --vulkan-submit-every 1
+   ```
+
+4. Confirm buffers are VRAM-resident on discrete GPUs (legacy host-mapped mode caps
+   large-GEMM throughput an order of magnitude below blocked-kernel + VRAM):
+   ```bash
+   RASPTORCH_VULKAN_DEVICE_LOCAL=1 rasptorch model train --device gpu
+   # or explicitly force the zero-copy host-mapped path to compare:
+   RASPTORCH_VULKAN_DEVICE_LOCAL=0 rasptorch model train --device gpu
    ```
 
 ### Issue: Checksum Mismatch
@@ -454,14 +523,18 @@ rasptorch model train --device gpu \
 
 ## Future Optimizations
 
-Potential areas for further improvement:
+Potential areas for further improvement (remaining gap to cuBLAS at 4096^2: ~1.5x):
 
-1. **Memory Pooling** - Pre-allocate large buffer pools
-2. **Kernel Fusion** - Combine multiple operations into single kernel
-3. **Async Transfers** - Non-blocking CPU-GPU communication
-4. **Precision Reduction** - FP16 for reduced bandwidth
-5. **Multi-Threading** - Parallel command buffer recording
-6. **Device-Specific Tuning** - Per-GPU optimization profiles
+1. **Cooperative Matrices (Phase 3)** - `VK_KHR_cooperative_matrix` accelerator path for
+   desktop NVIDIA hardware, falling back to the tiled kernels elsewhere
+2. **Wider Per-Thread Register Tiles** - 8x8 or shaped MMA-style blocking in `matmul_blk_tiled`
+3. **Dedicated Transfer Queue** - Allow staging copies to overlap a running compute batch
+   (copies currently borrow the compute queue when not batching)
+4. **Kernel Fusion** - Combine multiple operations into single kernel
+5. **Precision Reduction** - FP16 for reduced bandwidth and doubled register-tile width
+6. **Multi-Threading** - Parallel command buffer recording
+7. **Device-Specific Tuning** - Per-GPU optimization profiles; memory-pool sizing already
+   adapts (buffer + staging pools), per-device kernel heuristics are next
 
 ## References
 
