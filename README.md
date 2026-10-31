@@ -230,18 +230,31 @@ uv run --extra cuda --extra opencl rasptorch backend benchmark
 
 **Performance Results (Windows 11, NVIDIA GeForce RTX 3070 Ti):**
 
-Measured backend scaling with:
+Measured backend scaling with (single pass; individual runs vary by a few percent due to GPU clock variance):
 ```bash
-uv run rasptorch --json backend benchmark --backends numpy,opencl,vulkan,cuda --vulkan-kernel matmul_vec4_wide_tiled --vulkan-submit-every 8 --iterations 5 --warmup 1 --seed 42
+uv run rasptorch --json backend benchmark --backends numpy,opencl,vulkan,cuda --vulkan-kernel auto --vulkan-submit-every 8 --iterations 5 --warmup 1 --seed 42
 ```
+
+Auto mode selects `matmul_blk_tiled` for these sizes, and buffers are VRAM-resident (DEVICE_LOCAL), so Vulkan tile traffic stays on-card.
 
 #### 256×256 → 4096×4096 Scaling
 | Backend  | 256×256 (GFLOPS) | 512×512 (GFLOPS) | 1024×1024 (GFLOPS) | 2048×2048 (GFLOPS) | 4096×4096 (GFLOPS) |
 |----------|------------------|------------------|-------------------|-------------------|-------------------|
-| NumPy | 101.01 | 368.14 | 720.12 | 816.57 | 883.75 |
-| OpenCL | 44.24 | 68.20 | 107.01 | 97.75 | 46.87 |
-| Vulkan (`matmul_vec4_wide_tiled`) | 259.43 | 654.88 | 1043.37 | 809.62 | 534.92 |
-| CUDA | 116.48 | 380.50 | 1063.82 | 2136.75 | 3990.81 |
+| NumPy | 174.07 | 373.64 | 770.34 | 925.75 | 1001.66 |
+| OpenCL | 27.03 | 38.34 | 35.94 | 33.98 | 18.66 |
+| Vulkan (`auto` → `matmul_blk_tiled`, resident) | **990.98** | **4068.44** | **7858.76** | **8101.50** | **8476.71** |
+| CUDA (cuBLAS, per-iteration transfers) | 142.66 | 1433.61 | 1142.64 | 1585.06 | 2956.98 |
+
+Vulkan leads at every size from 256 up. The CUDA column pays one host→device + download + sync per iteration; add `--cuda-resident`
+(so cuBLAS also uploads once and runs N GEMMs before a single sync) for the fair GPU-side comparison:
+
+| Size | Vulkan (resident) | CUDA (`--cuda-resident`) |
+|------|-------------------|--------------------------|
+| 2048×2048 | 9029.7 | 8587.1 |
+| 4096×4096 | 8146.0 | 12551.9 |
+
+Resident-vs-resident, Vulkan edges out cuBLAS at 2048 and cuBLAS leads by ~1.5× at 4096 — the remaining headroom for Vulkan is
+cooperative-matrix extensions (`VK_KHR_cooperative_matrix`) and wider per-thread register tiles (see [VULKAN_OPTIMIZATION.md](VULKAN_OPTIMIZATION.md)).
 
 #### Vulkan Kernel Comparison (2048×2048)
 Measured with:
@@ -251,23 +264,30 @@ uv run rasptorch --json backend benchmark --backends vulkan --vulkan-submit-ever
 
 | Vulkan Kernel | GFLOPS | Status |
 |---------------|--------|--------|
-| `matmul` | 492.73 | ok |
-| `matmul_tiled` | 497.81 | ok |
-| `matmul_vec4` | 493.15 | ok |
-| `matmul_vec4_tiled` | 484.03 | ok |
-| `matmul_vec4_wide_tiled` | 778.27 | ok |
-| `matmul_a_bt` | 150.90 | ok |
-| `matmul_a_bt_tiled` | 173.23 | ok |
+| `matmul_blk_tiled` | **8175.7** | ok (auto-selected) |
+| `matmul_vec4_wide_tiled` | 4043.3 | ok |
+| `matmul_vec4_32x32_tiled` | 3264.6 | ok |
+| `matmul_vec4_tiled` | 2389.8 | ok |
+| `matmul` | 2385.3 | ok |
+| `matmul_tiled` | 2235.6 | ok |
+| `matmul_a_bt_tiled` | 2207.9 | ok |
+| `matmul_vec4` | 1777.3 | ok |
+| `matmul_a_bt` | 450.2 | ok |
 
+`matmul_blk_tiled` (64×64 output tiles, 4×4 register block per thread, double-buffered shared k-tiles, ~16 FLOP/byte of global traffic)
+is roughly 2× the next-best kernel and is chosen automatically for `min(m, n, k) >= 512` when the device provides ≥32 KiB of shared memory.
 
 **Vulkan Kernel Selection:**
-The `--vulkan-kernel auto` flag intelligently probes available kernels:
+The `--vulkan-kernel auto` flag intelligently probes available kernels (one untimed warm-up dispatch each, then timed probes):
 - `matmul` - Basic single-threaded implementation
+- `matmul_tiled` - Shared-memory tiled implementation
 - `matmul_vec4` - SIMD-style vec4 operations
 - `matmul_vec4_tiled` - vec4 plus shared-memory tiling
 - `matmul_vec4_wide_tiled` - vec4 plus wider output tiling for better reuse
+- `matmul_vec4_32x32_tiled` - 32×32 tiles (2×2 outputs per thread), ~8 FLOP/byte
+- `matmul_blk_tiled` - 64×64 tiles (4×4 per thread), double-buffered, ~16 FLOP/byte (fastest on discrete GPUs)
 - `matmul_a_bt` - Matrix transpose optimization (for A @ B.T)
-- `matmul_a_bt_tiled` - Tiled transpose optimization (fastest when applicable)
+- `matmul_a_bt_tiled` - Tiled transpose optimization
 
 **Advanced Tuning:**
 ```bash
@@ -283,10 +303,15 @@ uv run rasptorch --json backend benchmark --backends vulkan \
   --vulkan-kernel matmul_a_bt_tiled \
   --vulkan-submit-every 4 \
   --size 2048 --iterations 100
+
+# Fair GPU-vs-GPU comparison: CUDA also runs resident (upload once, sync once)
+uv run rasptorch --json backend benchmark --backends vulkan,cuda \
+  --size 4096 --iterations 5 --cuda-resident
 ```
 
 **Large Workload Guidance:**
-- For 4096x4096 matmul, use the default auto mode or pin `matmul_vec4_wide_tiled` directly.
+- For 4096x4096 matmul, use the default `--vulkan-kernel auto` (picks `matmul_blk_tiled`); pinning `matmul_vec4_wide_tiled` is no longer needed.
+- Buffers are DEVICE_LOCAL on discrete GPUs, so large sizes no longer degrade the way host-mapped buffers did.
 - If a custom Vulkan kernel triggers `VkErrorDeviceLost`, reduce `--vulkan-submit-every` first.
 - The benchmark path uses resident buffers, so the large-size slowdown is kernel quality rather than repeated host-device transfers.
 
@@ -299,12 +324,14 @@ Results are provided in JSON format (with `--json` flag) including:
 - `checksum`: Verification result
 - `kernel`: Selected kernel name (for auto mode)
 - `submit_every`: Submission batch size (for Vulkan)
+- `mode`: "resident" when the run uploads once and syncs at the end (Vulkan always; CUDA with `--cuda-resident`)
 
 **Optimization Tips:**
 - Use `--vulkan-autotune-submit` for best results (probes kernel + batch combinations)
 - If you see `VkErrorDeviceLost`, reduce `--vulkan-submit-every` (try `4` or `1`)
 - Larger problem sizes better amortize GPU setup overhead
 - Command buffer batching (`--vulkan-submit-every`) balances latency and throughput
+- On discrete GPUs buffers are DEVICE_LOCAL (VRAM) by default; set `RASPTORCH_VULKAN_DEVICE_LOCAL=0` to force the zero-copy host-mapped path (or `=1` to force VRAM residency when a device offers it)
 - Compute+readback timing includes transfer overhead. On Raspberry Pi eGPU setups over PCIe, this overhead can outweigh compute gains, so CPU can be faster for smaller workloads.
 
 For detailed optimization guide, see [VULKAN_OPTIMIZATION.md](VULKAN_OPTIMIZATION.md).
