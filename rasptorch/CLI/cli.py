@@ -196,7 +196,18 @@ def connect_backend_cmd(ctx, name, strict):
 @click.option(
     "--vulkan-kernel",
     type=click.Choice(
-        ["auto", "matmul", "matmul_tiled", "matmul_vec4", "matmul_vec4_tiled", "matmul_vec4_wide_tiled", "matmul_a_bt", "matmul_a_bt_tiled"],
+        [
+            "auto",
+            "matmul",
+            "matmul_tiled",
+            "matmul_vec4",
+            "matmul_vec4_tiled",
+            "matmul_vec4_32x32_tiled",
+            "matmul_vec4_wide_tiled",
+            "matmul_blk_tiled",
+            "matmul_a_bt",
+            "matmul_a_bt_tiled",
+        ],
         case_sensitive=False,
     ),
     default="auto",
@@ -216,9 +227,16 @@ def connect_backend_cmd(ctx, name, strict):
     default=False,
     help="Probe multiple Vulkan submit chunk sizes and select the fastest stable one",
 )
+@click.option(
+    "--cuda-resident",
+    is_flag=True,
+    default=False,
+    help="Resident CUDA mode: upload once, launch N GEMMs, sync once at the end "
+    "(fair GPU-side comparison against the Vulkan resident benchmark)",
+)
 @click.pass_context
 def benchmark_backends(
-    ctx, backends, size, iterations, warmup, seed, vulkan_kernel, vulkan_submit_every, vulkan_autotune_submit
+    ctx, backends, size, iterations, warmup, seed, vulkan_kernel, vulkan_submit_every, vulkan_autotune_submit, cuda_resident
 ):
     """Benchmark backend matmul throughput with a reproducible workload."""
     if int(size) <= 0:
@@ -276,17 +294,16 @@ def benchmark_backends(
                                 remaining -= step
 
                         requested_kernel = str(vulkan_kernel).lower()
-                        if requested_kernel == "auto" and int(size) >= 4096:
-                            requested_kernel = "matmul_vec4_wide_tiled"
                         dispatch_variants = {
+                            "matmul_blk_tiled": (lambda: vk.matmul_blk_tiled_into(a_buf, b_buf, out_buf)),
+                            "matmul_vec4_32x32_tiled": (lambda: vk.matmul_vec4_32x32_tiled_into(a_buf, b_buf, out_buf)),
                             "matmul_tiled": (lambda: vk.matmul_tiled_into(a_buf, b_buf, out_buf)),
                             "matmul_vec4_wide_tiled": (lambda: vk.matmul_vec4_wide_tiled_into(a_buf, b_buf, out_buf)),
                             "matmul_vec4_tiled": (lambda: vk.matmul_vec4_tiled_into(a_buf, b_buf, out_buf)),
                             "matmul": (lambda: vk.matmul_into(a_buf, b_buf, out_buf)),
                             "matmul_vec4": (lambda: vk.matmul_vec4_into(a_buf, b_buf, out_buf)),
                         }
-                        allow_transpose_aware_auto = requested_kernel != "auto" or int(size) < 4096
-                        if requested_kernel in {"auto", "matmul_a_bt", "matmul_a_bt_tiled"} and allow_transpose_aware_auto:
+                        if requested_kernel in {"auto", "matmul_a_bt", "matmul_a_bt_tiled"}:
                             b_t_buf = vk.transpose2d(b_buf)
                             dispatch_variants["matmul_a_bt"] = (lambda: vk.matmul_a_bt_out(a_buf, b_t_buf, out_buf))
                             dispatch_variants["matmul_a_bt_tiled"] = (
@@ -299,8 +316,20 @@ def benchmark_backends(
                             best_kernel = None
                             best_chunk = selected_submit_every
                             best_time = float("inf")
-                            probe_dispatches = max(4, min(24, int(iterations) // 2 or 4))
+                            probe_dispatches = max(4, min(24, int(iterations) * 2 or 4))
+                            # Large GEMMs make probes wall-time bound; keep them cheap.
+                            if int(size) >= 2048:
+                                probe_dispatches = min(probe_dispatches, 4)
+                            if int(size) >= 4096:
+                                probe_dispatches = min(probe_dispatches, 2)
                             candidates = [1, 2, 4, 8, 16] if bool(vulkan_autotune_submit) else [1, 2, 4, 8]
+                            # Equalize one-time costs (pipeline creation, shader build)
+                            # with one untimed dispatch per variant before probing.
+                            for probe_fn in dispatch_variants.values():
+                                try:
+                                    _run_vulkan_dispatches_chunked(1, probe_fn, 1)
+                                except Exception:
+                                    continue
                             for kernel_name, fn in dispatch_variants.items():
                                 for candidate in candidates:
                                     try:
@@ -353,16 +382,32 @@ def benchmark_backends(
                             vk.free(b_t_buf)
                         vk.free(out_buf)
                 else:
-                    # Warmup includes setup/JIT/driver overhead and is excluded from timing.
-                    for _ in range(int(warmup)):
-                        backend_obj.matmul(a, b)
+                    if label == "cuda" and bool(cuda_resident) and hasattr(backend_obj, "matmul_resident"):
+                        # Resident CUDA path: buffers stay on the GPU across
+                        # iterations (one upload, one sync at the end), so the
+                        # timing is comparable to the Vulkan resident mode.
+                        for _ in range(int(warmup)):
+                            backend_obj.matmul(a, b)
+                        start = time.perf_counter()
+                        out = backend_obj.matmul_resident(a, b, int(iterations))
+                        elapsed = float(time.perf_counter() - start)
+                        checksum = (
+                            float(np.asarray(out, dtype=np.float32).reshape(-1)[0])
+                            * float(int(iterations))
+                        )
+                        resident_mode = True
+                    else:
+                        # Warmup includes setup/JIT/driver overhead and is excluded from timing.
+                        for _ in range(int(warmup)):
+                            backend_obj.matmul(a, b)
 
-                    checksum = 0.0
-                    start = time.perf_counter()
-                    for _ in range(int(iterations)):
-                        out = backend_obj.matmul(a, b)
-                        checksum += float(np.asarray(out, dtype=np.float32).reshape(-1)[0])
-                    elapsed = float(time.perf_counter() - start)
+                        checksum = 0.0
+                        start = time.perf_counter()
+                        for _ in range(int(iterations)):
+                            out = backend_obj.matmul(a, b)
+                            checksum += float(np.asarray(out, dtype=np.float32).reshape(-1)[0])
+                        elapsed = float(time.perf_counter() - start)
+                        resident_mode = False
 
                 iters_per_sec = float(int(iterations) / elapsed) if elapsed > 0 else 0.0
                 gflops = float((2.0 * (int(size) ** 3) * int(iterations)) / elapsed / 1e9) if elapsed > 0 else 0.0
@@ -379,6 +424,8 @@ def benchmark_backends(
                     result_item["mode"] = "resident"
                     result_item["submit_every"] = int(selected_submit_every)
                     result_item["kernel"] = selected_kernel
+                elif label == "cuda" and resident_mode:
+                    result_item["mode"] = "resident"
                 results.append(result_item)
             except Exception as e:
                 error_msg = str(e).strip()

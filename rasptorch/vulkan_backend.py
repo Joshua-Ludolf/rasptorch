@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 import ctypes
+import os
 import subprocess
 import numpy as np
 import time
@@ -114,12 +115,24 @@ class _VulkanContext:
         self._matmul_vec4_wide_tiled_bind_key: Optional[tuple[object, object, object]] = None
         self._matmul_a_bt_bind_key: Optional[tuple[object, object, object]] = None
         self._matmul_a_bt_tiled_bind_key: Optional[tuple[object, object, object]] = None
+        self._matmul_vec4_32x32_tiled_bind_key: Optional[tuple[object, object, object]] = None
+        self._matmul_blk_tiled_bind_key: Optional[tuple[object, object, object]] = None
 
         # Optional command buffer batching to reduce submit+wait overhead.
         self._batch_depth: int = 0
         self._cmd_recording: bool = False
         self._buffer_pool: dict[int, list[tuple[VkBuffer, VkDeviceMemory]]] = {}
         self._buffer_pool_limit: int = 8
+
+        # Discrete-GPU support: hot buffers live in DEVICE_LOCAL (VRAM) memory
+        # and uploads/downloads stage through small host-visible scratch
+        # buffers. Unified-memory devices (Raspberry Pi 4/5, integrated GPUs)
+        # automatically keep the legacy host-mapped zero-copy path.
+        self._staging_pool: list[tuple[VkBuffer, VkDeviceMemory, int]] = []
+        self._staging_limit: int = 3
+        self._buffer_is_device: dict[object, bool] = {}
+        self._device_local_mem_type: Optional[int] = None
+        self._host_visible_mem_type: Optional[int] = None
 
         self.p_add: Optional[_Pipeline] = None
         self.p_mul: Optional[_Pipeline] = None
@@ -162,6 +175,10 @@ class _VulkanContext:
         self.p_softmax_xent_loss_vec: Optional[_Pipeline] = None
         self.p_softmax_xent_backward: Optional[_Pipeline] = None
         self.p_sgd_momentum_update: Optional[_Pipeline] = None
+
+        # Large-GEMM kernels (lazily created)
+        self.p_matmul_vec4_32x32_tiled: Optional[_Pipeline] = None
+        self.p_matmul_blk_tiled: Optional[_Pipeline] = None
 
         # NN essentials
         self.p_softmax2d: Optional[_Pipeline] = None
@@ -310,6 +327,10 @@ class _VulkanContext:
         self.p_log_softmax2d_backward = self._create_pipeline_vec3_u32u32("log_softmax2d_backward")
         self.p_layernorm2d = self._create_pipeline_vec2_u32u32("layernorm2d")
         self.p_layernorm2d_backward = self._create_pipeline_vec3_u32u32("layernorm2d_backward")
+
+        # Prefer DEVICE_LOCAL (VRAM) on discrete GPUs; on unified-memory
+        # devices this resolves to the legacy host-mapped path.
+        self._select_memory_types()
 
     def set_job_timeout(self, timeout: int) -> None:
         self._job_timeout = timeout
@@ -1287,6 +1308,121 @@ class _VulkanContext:
                 return i
         raise RuntimeError("Failed to find suitable Vulkan memory type")
 
+    def _select_memory_types(self) -> None:
+        """Pick memory types for hot buffers.
+
+        Prefers a non-host-visible DEVICE_LOCAL type (real VRAM on discrete
+        GPUs) when the backing heap is large enough. Unified-memory devices
+        (Raspberry Pi 4/5, integrated GPUs) either only expose host-visible
+        device-local types or tiny carve-out heaps, in which case the legacy
+        host-mapped zero-copy path is kept automatically.
+
+        RASPTORCH_VULKAN_DEVICE_LOCAL=1 forces VRAM residency whenever a
+        suitable type exists; RASPTORCH_VULKAN_DEVICE_LOCAL=0 forces the
+        legacy host-mapped path.
+        """
+
+        self._device_local_mem_type = None
+        self._host_visible_mem_type = self._find_memory_type(
+            0xFFFFFFFF,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        )
+        assert self.physical_device is not None
+        mem_props = vkGetPhysicalDeviceMemoryProperties(self.physical_device)
+
+        env = os.environ.get("RASPTORCH_VULKAN_DEVICE_LOCAL", "").strip().lower()
+
+        for i in range(mem_props.memoryTypeCount):
+            props = mem_props.memoryTypes[i].propertyFlags
+            mti = mem_props.memoryTypes[i]
+            if not (props & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT):
+                continue
+            if props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT:
+                continue
+            # Skip "device local" types living in the same heap as the host
+            # memory (e.g. MoltenVK/unified-memory reports) — those carry no
+            # dedicated VRAM bandwidth and the mapped path is zero-copy there.
+            if mti.heapIndex == mem_props.memoryTypes[self._host_visible_mem_type].heapIndex:
+                continue
+            # Require a real dedicated heap (>2 GiB) so small iGPU/APU
+            # carve-outs don't exhaust device memory.
+            heap = mem_props.memoryHeaps[mti.heapIndex]
+            if heap.size >= 2 * 1024 * 1024 * 1024 or env == "1":
+                self._device_local_mem_type = i
+                break
+
+    def _alloc_staging_buffer(self, nbytes: int) -> tuple[VkBuffer, VkDeviceMemory]:
+        """Allocate a host-visible scratch buffer for copies to/from VRAM."""
+
+        assert self.device is not None
+        bci = VkBufferCreateInfo(
+            sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            size=nbytes,
+            usage=(
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+            ),
+            sharingMode=VK_SHARING_MODE_EXCLUSIVE,
+        )
+        sbuf = vkCreateBuffer(self.device, bci, None)
+        req = vkGetBufferMemoryRequirements(self.device, sbuf)
+        mem_type = self._find_memory_type(
+            req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        )
+        mai = VkMemoryAllocateInfo(
+            sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            allocationSize=req.size,
+            memoryTypeIndex=mem_type,
+        )
+        smem = vkAllocateMemory(self.device, mai, None)
+        vkBindBufferMemory(self.device, sbuf, smem, 0)
+        return sbuf, smem
+
+    def _get_staging(self, nbytes: int) -> tuple[VkBuffer, VkDeviceMemory]:
+        """Fetch (or create) a staging buffer of at least `nbytes` bytes."""
+
+        assert self.device is not None
+        for i, (sbuf, smem, ssize) in enumerate(self._staging_pool):
+            if ssize >= nbytes:
+                self._staging_pool.pop(i)
+                return sbuf, smem
+        return self._alloc_staging_buffer(nbytes)
+
+    def _release_staging(self, sbuf: VkBuffer, smem: VkDeviceMemory, size: int) -> None:
+        """Return a staging buffer to the pool, evicting small entries."""
+
+        self._staging_pool.append((sbuf, smem, int(size)))
+        while len(self._staging_pool) > self._staging_limit:
+            smallest_i = min(range(len(self._staging_pool)), key=lambda i: self._staging_pool[i][2])
+            ebuf, emem, _ = self._staging_pool.pop(smallest_i)
+            try:
+                if self.device is not None:
+                    vkDestroyBuffer(self.device, ebuf, None)
+                    vkFreeMemory(self.device, emem, None)
+            except Exception:
+                pass
+
+    def _copy_via_queue(self, src: VkBuffer, dst: VkBuffer, nbytes: int) -> None:
+        """Record a blocking src->dst buffer copy on the compute queue."""
+
+        assert self.device is not None
+        assert self.command_buffer is not None
+        if self._cmd_recording:
+            # Don't clobber an in-flight batch command buffer.
+            self.flush()
+
+        vkResetCommandBuffer(self.command_buffer, 0)
+        begin = VkCommandBufferBeginInfo(
+            sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )
+        vkBeginCommandBuffer(self.command_buffer, begin)
+        vkCmdCopyBuffer(self.command_buffer, src, dst, 1, [VkBufferCopy(srcOffset=0, dstOffset=0, size=nbytes)])
+        vkEndCommandBuffer(self.command_buffer)
+        self._submit_and_wait()
+
     def alloc_buffer(self, nbytes: int) -> tuple[VkBuffer, VkDeviceMemory]:
         assert self.device is not None
 
@@ -1307,6 +1443,30 @@ class _VulkanContext:
         buf = vkCreateBuffer(self.device, bci, None)
         req = vkGetBufferMemoryRequirements(self.device, buf)
 
+        mem, is_device = self._allocate_memory(buf, req)
+        vkBindBufferMemory(self.device, buf, mem, 0)
+        self._buffer_is_device[_vk_handle_key(buf)] = is_device
+        return buf, mem
+
+    def _allocate_memory(self, buf: VkBuffer, req) -> tuple[VkDeviceMemory, bool]:
+        """Bind memory to `buf`, preferring DEVICE_LOCAL with host fallback."""
+
+        assert self.device is not None
+
+        dl_type = self._device_local_mem_type
+        if dl_type is not None and (req.memoryTypeBits & (1 << dl_type)):
+            try:
+                mai = VkMemoryAllocateInfo(
+                    sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    allocationSize=req.size,
+                    memoryTypeIndex=dl_type,
+                )
+                mem = vkAllocateMemory(self.device, mai, None)
+                assert mem is not None
+                return mem, True
+            except Exception:
+                pass  # e.g. out of VRAM; fall back to host-visible below.
+
         mem_type = self._find_memory_type(
             req.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -1317,8 +1477,8 @@ class _VulkanContext:
             memoryTypeIndex=mem_type,
         )
         mem = vkAllocateMemory(self.device, mai, None)
-        vkBindBufferMemory(self.device, buf, mem, 0)
-        return buf, mem
+        assert mem is not None
+        return mem, False
 
     def free_buffer(self, buf: VkBuffer, mem: VkDeviceMemory, nbytes: int) -> None:
         assert self.device is not None
@@ -1329,6 +1489,7 @@ class _VulkanContext:
             return
         if buf != VK_NULL_HANDLE:
             vkDestroyBuffer(self.device, buf, None)
+            self._buffer_is_device.pop(_vk_handle_key(buf), None)
         if mem != VK_NULL_HANDLE:
             vkFreeMemory(self.device, mem, None)
 
@@ -1336,7 +1497,34 @@ class _VulkanContext:
         assert self.device is not None
         arr = np.ascontiguousarray(data, dtype=np.float32)
 
-        mapped = vkMapMemory(self.device, mem, 0, arr.nbytes, 0)
+        if self._buffer_is_device.get(_vk_handle_key(buf), False):
+            # DEVICE_LOCAL (VRAM) buffer: stage through host-visible memory.
+            sbuf, smem = self._get_staging(arr.nbytes)
+            try:
+                if not self._copy_into_mapped(sbuf, smem, arr):
+                    # Staging map not CPU-writable: last resort writes the
+                    # destination buffer directly from the command buffer.
+                    self._update_buffer_via_cmd(buf, arr)
+                    return
+                self._copy_via_queue(sbuf, buf, arr.nbytes)
+            finally:
+                self._release_staging(sbuf, smem, arr.nbytes)
+            return
+
+        if self._copy_into_mapped(buf, mem, arr):
+            return
+
+        # Host-visible mapping is not CPU-writable: fall back to
+        # vkCmdUpdateBuffer (4-byte aligned, submitted directly).
+        self._update_buffer_via_cmd(buf, arr)
+
+    def _copy_into_mapped(self, buf: VkBuffer, mem: VkDeviceMemory, arr: np.ndarray) -> bool:
+        """memcpy into host-visible memory. Returns False when unwritable."""
+
+        assert self.device is not None
+        nbytes = int(arr.nbytes)
+
+        mapped = vkMapMemory(self.device, mem, 0, nbytes, 0)
         if isinstance(mapped, (tuple, list)):
             mapped_ptr = mapped[1]
         else:
@@ -1346,95 +1534,96 @@ class _VulkanContext:
         if hasattr(mapped_ptr, "value"):
             mapped_ptr = mapped_ptr.value
 
-        # Some environments return a bytes-like snapshot here (not writable).
-        # In that case, fall back to vkCmdUpdateBuffer (supports arbitrary size, 4-byte aligned).
-        if isinstance(mapped_ptr, (bytes, bytearray, memoryview, np.bytes_)):
+        # Immutable bytes snapshot: cannot write through it.
+        if isinstance(mapped_ptr, (bytes, np.bytes_)):
             try:
                 vkUnmapMemory(self.device, mem)
             except Exception:
                 pass
+            return False
 
-            if self.command_buffer is None or self.queue is None:
-                raise RuntimeError("Vulkan command buffer/queue not initialized")
+        # Pointer-like (int address from ctypes bindings, or integer wrapper).
+        if isinstance(mapped_ptr, (int, np.integer)):
+            addr = int(mapped_ptr)
+        else:
+            # Buffer-protocol object (e.g. python-vulkan's cffi
+            # _cffi_backend.buffer): derive a writable ctypes address.
+            addr = None
+            holder = None
+            try:
+                mv = memoryview(mapped_ptr)
+                holder = ctypes.c_char.from_buffer(mv)
+                addr = ctypes.addressof(holder)
+            except Exception:
+                addr = None
+            if addr is None:
+                try:
+                    vkUnmapMemory(self.device, mem)
+                except Exception:
+                    pass
+                return False
 
-            if (arr.nbytes % 4) != 0:
-                raise RuntimeError(
-                    "vkCmdUpdateBuffer fallback only supports 4-byte aligned sizes"
-                )
-
-            if self._cmd_recording:
-                # Don't clobber an in-flight batch command buffer.
-                self.flush()
-
-            vkResetCommandBuffer(self.command_buffer, 0)
-            begin = VkCommandBufferBeginInfo(
-                sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            )
-            vkBeginCommandBuffer(self.command_buffer, begin)
-
-            raw = arr.tobytes()
-            max_chunk = 65536
-            for offset in range(0, len(raw), max_chunk):
-                chunk = raw[offset : offset + max_chunk]
-                if (len(chunk) % 4) != 0:
-                    raise RuntimeError("vkCmdUpdateBuffer chunk not 4-byte aligned")
-                import vulkan as _vk  # type: ignore
-
-                p_data = _vk.ffi.new("char[]", chunk)
-                vkCmdUpdateBuffer(self.command_buffer, buf, offset, len(chunk), p_data)
-
-            vkEndCommandBuffer(self.command_buffer)
-            self._submit_and_wait()
-            return
-
-        # Pointer-like: normalize to an integer address. If we can't, treat as non-writable and
-        # use vkCmdUpdateBuffer.
         try:
-            mapped_addr = int(mapped_ptr)
-        except Exception:
+            ctypes.memmove(addr, arr.ctypes.data, nbytes)
+        finally:
             try:
                 vkUnmapMemory(self.device, mem)
             except Exception:
                 pass
+        return True
 
-            if self.command_buffer is None or self.queue is None:
-                raise RuntimeError("Vulkan command buffer/queue not initialized")
-            if (arr.nbytes % 4) != 0:
-                raise RuntimeError(
-                    "vkCmdUpdateBuffer fallback only supports 4-byte aligned sizes"
-                )
+    def _update_buffer_via_cmd(self, buf: VkBuffer, arr: np.ndarray) -> None:
+        """Upload via vkCmdUpdateBuffer when no CPU-writable map is available."""
 
-            if self._cmd_recording:
-                # Don't clobber an in-flight batch command buffer.
-                self.flush()
+        assert self.device is not None
+        if self.command_buffer is None or self.queue is None:
+            raise RuntimeError("Vulkan command buffer/queue not initialized")
+        if (arr.nbytes % 4) != 0:
+            raise RuntimeError("vkCmdUpdateBuffer fallback only supports 4-byte aligned sizes")
 
-            vkResetCommandBuffer(self.command_buffer, 0)
-            begin = VkCommandBufferBeginInfo(
-                sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            )
-            vkBeginCommandBuffer(self.command_buffer, begin)
+        if self._cmd_recording:
+            # Don't clobber an in-flight batch command buffer.
+            self.flush()
 
-            raw = arr.tobytes()
-            max_chunk = 65536
-            for offset in range(0, len(raw), max_chunk):
-                chunk = raw[offset : offset + max_chunk]
-                if (len(chunk) % 4) != 0:
-                    raise RuntimeError("vkCmdUpdateBuffer chunk not 4-byte aligned")
-                import vulkan as _vk  # type: ignore
+        vkResetCommandBuffer(self.command_buffer, 0)
+        begin = VkCommandBufferBeginInfo(
+            sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        )
+        vkBeginCommandBuffer(self.command_buffer, begin)
 
-                p_data = _vk.ffi.new("char[]", chunk)
-                vkCmdUpdateBuffer(self.command_buffer, buf, offset, len(chunk), p_data)
+        raw = arr.tobytes()
+        max_chunk = 65536
+        for offset in range(0, len(raw), max_chunk):
+            chunk = raw[offset : offset + max_chunk]
+            if (len(chunk) % 4) != 0:
+                raise RuntimeError("vkCmdUpdateBuffer chunk not 4-byte aligned")
+            import vulkan as _vk  # type: ignore
 
-            vkEndCommandBuffer(self.command_buffer)
-            self._submit_and_wait()
-            return
+            p_data = _vk.ffi.new("char[]", chunk)
+            vkCmdUpdateBuffer(self.command_buffer, buf, offset, len(chunk), p_data)
 
-        ctypes.memmove(mapped_addr, arr.ctypes.data, arr.nbytes)
-        vkUnmapMemory(self.device, mem)
+        vkEndCommandBuffer(self.command_buffer)
+        self._submit_and_wait()
 
-    def read_buffer(self, mem: VkDeviceMemory, nbytes: int) -> bytes:
+    def read_buffer(
+        self, mem: VkDeviceMemory, nbytes: int, buffer: Optional[VkBuffer] = None
+    ) -> bytes:
+        assert self.device is not None
+
+        if buffer is not None and self._buffer_is_device.get(_vk_handle_key(buffer), False):
+            # DEVICE_LOCAL (VRAM) buffer: copy into host-visible staging first.
+            sbuf, smem = self._get_staging(nbytes)
+            try:
+                self._copy_via_queue(buffer, sbuf, int(nbytes))
+                out = self._read_mapped(smem, nbytes)
+                return out
+            finally:
+                self._release_staging(sbuf, smem, nbytes)
+
+        return self._read_mapped(mem, nbytes)
+
+    def _read_mapped(self, mem: VkDeviceMemory, nbytes: int) -> bytes:
         assert self.device is not None
         mapped = vkMapMemory(self.device, mem, 0, nbytes, 0)
         if isinstance(mapped, (tuple, list)):
@@ -1605,6 +1794,19 @@ class _VulkanContext:
                             pass
                 self._buffer_pool.clear()
 
+                for sbuf, smem, _size in self._staging_pool:
+                    try:
+                        if sbuf != VK_NULL_HANDLE:
+                            vkDestroyBuffer(device, sbuf, None)
+                    except Exception:
+                        pass
+                    try:
+                        if smem != VK_NULL_HANDLE:
+                            vkFreeMemory(device, smem, None)
+                    except Exception:
+                        pass
+                self._staging_pool.clear()
+
                 for value in list(self.__dict__.values()):
                     if not isinstance(value, _Pipeline):
                         continue
@@ -1655,6 +1857,8 @@ class _VulkanContext:
                     pass
         finally:
             self._ds_cache.clear()
+            self._buffer_is_device.clear()
+            self._staging_pool.clear()
             self.p_add = None
             self.p_mul = None
             self.p_relu = None
@@ -1664,6 +1868,8 @@ class _VulkanContext:
             self.p_matmul_vec4 = None
             self.p_matmul_vec4_tiled = None
             self.p_matmul_vec4_wide_tiled = None
+            self.p_matmul_vec4_32x32_tiled = None
+            self.p_matmul_blk_tiled = None
             self.p_neg = None
             self.p_add_scalar = None
             self.p_mul_scalar = None
@@ -1968,7 +2174,7 @@ def to_cpu(buffer: VulkanBuffer) -> np.ndarray:
         return np.array(buffer.host, copy=True)
 
     ctx = _ctx()
-    raw = ctx.read_buffer(buffer.memory, buffer.nbytes)
+    raw = ctx.read_buffer(buffer.memory, buffer.nbytes, buffer.buffer)
     out = np.frombuffer(raw, dtype=np.float32).copy()
     return out.reshape(buffer.shape)
 
@@ -2038,6 +2244,11 @@ def write(dst: VulkanBuffer, data: np.ndarray) -> None:
             dst.host = np.empty(dst.shape, dtype=np.float32)
         np.copyto(dst.host, arr.reshape(dst.shape))
         return
+
+    if dst.buffer == VK_NULL_HANDLE or dst.memory == VK_NULL_HANDLE:
+        # Fail fast instead of handing null handles to the driver (native
+        # access violations are not catchable at the Python layer).
+        raise RuntimeError("write: destination buffer has no usable Vulkan backing storage")
 
     ctx = _ctx()
     ctx.write_buffer(dst.buffer, dst.memory, arr)
@@ -7197,6 +7408,11 @@ def matmul_fast(a: VulkanBuffer, b: VulkanBuffer) -> VulkanBuffer:
         return _fallback_buf(a.host @ b.host)
 
     out = empty((m, n))
+    if min(int(m), int(n), int(k)) >= 512:
+        try:
+            return matmul_blk_tiled_into(a, b, out)
+        except Exception:
+            pass
     if min(int(m), int(n), int(k)) >= 256:
         try:
             return matmul_vec4_32x32_tiled_into(a, b, out)
@@ -7773,6 +7989,224 @@ def matmul_vec4_tiled_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) 
     )
     group_count_x = (int(n) + 15) // 16
     group_count_y = (int(m) + 15) // 16
+    vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
+    ctx._end_commands()
+    return out
+
+
+def matmul_vec4_32x32_tiled_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """32x32-tiled matmul into a preallocated output buffer.
+
+    Uses the existing `matmul_vec4_32x32_tiled` shader (32x32 shared tiles,
+    16x16 workgroups, one output per thread): ~8 FLOP/byte of global traffic,
+    so it halves the tile traffic of the 16x16 tiled kernel.
+    """
+
+    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+        raise ValueError("matmul_vec4_32x32_tiled_into expects 2D matrices")
+
+    m, k = a.shape
+    k2, n = b.shape
+    if k != k2:
+        raise ValueError(f"matmul_vec4_32x32_tiled_into shape mismatch: {a.shape} @ {b.shape}")
+    if out.shape != (m, n):
+        raise ValueError(
+            f"matmul_vec4_32x32_tiled_into output shape mismatch: out={out.shape} expected={(m, n)}"
+        )
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        if a.host is None or b.host is None:
+            aa = np.zeros(a.shape, dtype=np.float32)
+            bb = np.zeros(b.shape, dtype=np.float32)
+            write(out, aa @ bb)
+            return out
+        write(out, a.host @ b.host)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    if ctx.p_matmul_vec4_32x32_tiled is None:
+        ctx.p_matmul_vec4_32x32_tiled = ctx._create_pipeline_matmul("matmul_vec4_32x32_tiled")
+    assert ctx.p_matmul_vec4_32x32_tiled is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_matmul_vec4_32x32_tiled)
+    bind_key = (_vk_handle_key(a.buffer), _vk_handle_key(b.buffer), _vk_handle_key(out.buffer))
+    if ctx._matmul_vec4_32x32_tiled_bind_key != bind_key:
+        infos = [
+            VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+            VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+            VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+        ]
+        writes = [
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=0,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[0]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=1,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[1]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=2,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[2]],
+            ),
+        ]
+        vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+        ctx._matmul_vec4_32x32_tiled_bind_key = bind_key
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_vec4_32x32_tiled.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_matmul_vec4_32x32_tiled.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_matmul_vec4_32x32_tiled.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        12,
+        pc,
+    )
+    group_count_x = (int(n) + 31) // 32
+    group_count_y = (int(m) + 31) // 32
+    vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
+    ctx._end_commands()
+    return out
+
+
+def matmul_blk_tiled_into(a: VulkanBuffer, b: VulkanBuffer, out: VulkanBuffer) -> VulkanBuffer:
+    """Register-blocked tiled matmul into a preallocated output buffer.
+
+    64x64 output tile per workgroup, 16x16 threads, 4x4 per-thread register
+    tiles, 32-deep double-buffered shared k-tiles (~32 KiB shared memory).
+    Global traffic per workgroup drops to ~16 FLOP/byte, which paired with
+    DEVICE_LOCAL buffers keeps large GEMMs compute bound. Requires
+    maxComputeSharedMemorySize >= 32 KiB; falls back via callers otherwise.
+    """
+
+    if len(a.shape) != 2 or len(b.shape) != 2 or len(out.shape) != 2:
+        raise ValueError("matmul_blk_tiled_into expects 2D matrices")
+
+    m, k = a.shape
+    k2, n = b.shape
+    if k != k2:
+        raise ValueError(f"matmul_blk_tiled_into shape mismatch: {a.shape} @ {b.shape}")
+    if out.shape != (m, n):
+        raise ValueError(f"matmul_blk_tiled_into output shape mismatch: out={out.shape} expected={(m, n)}")
+
+    if not _ensure_vulkan_or_numpy(a, b):
+        if a.host is None or b.host is None:
+            aa = np.zeros(a.shape, dtype=np.float32)
+            bb = np.zeros(b.shape, dtype=np.float32)
+            write(out, aa @ bb)
+            return out
+        write(out, a.host @ b.host)
+        return out
+
+    ctx = _ctx()
+    assert ctx.device is not None
+    assert ctx.command_buffer is not None
+    if ctx.p_matmul_blk_tiled is None:
+        ctx.p_matmul_blk_tiled = ctx._create_pipeline_matmul("matmul_blk_tiled")
+    assert ctx.p_matmul_blk_tiled is not None
+
+    ds = ctx._alloc_descriptor_set(ctx.p_matmul_blk_tiled)
+    bind_key = (_vk_handle_key(a.buffer), _vk_handle_key(b.buffer), _vk_handle_key(out.buffer))
+    if ctx._matmul_blk_tiled_bind_key != bind_key:
+        infos = [
+            VkDescriptorBufferInfo(buffer=a.buffer, offset=0, range=a.nbytes),
+            VkDescriptorBufferInfo(buffer=b.buffer, offset=0, range=b.nbytes),
+            VkDescriptorBufferInfo(buffer=out.buffer, offset=0, range=out.nbytes),
+        ]
+        writes = [
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=0,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[0]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=1,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[1]],
+            ),
+            VkWriteDescriptorSet(
+                sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                dstSet=ds,
+                dstBinding=2,
+                descriptorCount=1,
+                descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                pBufferInfo=[infos[2]],
+            ),
+        ]
+        vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
+        ctx._matmul_blk_tiled_bind_key = bind_key
+
+    import vulkan as _vk  # type: ignore
+
+    pc = _vk.ffi.new("uint32_t[3]", [int(m), int(n), int(k)])
+
+    ctx._maybe_continue_batch()
+    if ctx._batch_depth == 0:
+        ctx._begin_commands()
+
+    vkCmdBindPipeline(
+        ctx.command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.p_matmul_blk_tiled.pipeline
+    )
+    vkCmdBindDescriptorSets(
+        ctx.command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        ctx.p_matmul_blk_tiled.pipeline_layout,
+        0,
+        1,
+        [ds],
+        0,
+        None,
+    )
+    vkCmdPushConstants(
+        ctx.command_buffer,
+        ctx.p_matmul_blk_tiled.pipeline_layout,
+        VK_SHADER_STAGE_COMPUTE_BIT,
+        0,
+        12,
+        pc,
+    )
+    group_count_x = (int(n) + 63) // 64
+    group_count_y = (int(m) + 63) // 64
     vkCmdDispatch(ctx.command_buffer, group_count_x, group_count_y, 1)
     ctx._end_commands()
     return out

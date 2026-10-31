@@ -21,17 +21,112 @@ Vulkan Kernel: matmul_vec4 (auto-selected)
 Submission Batching: submit_every=16 (auto-tuned)
 ```
 
+## Discrete-GPU Fast Path: DEVICE_LOCAL VRAM + Blocked GEMM
+
+The optimizations above target Raspberry Pi-class unified-memory devices, where
+host-mapped zero-copy buffers are the fastest (and only sensible) storage. On
+discrete GPUs (PCIe VRAM + copy queues) that same policy forces every tiled-GEMM
+tile fetch to cross the bus, which is why large square matmuls underperformed.
+This section documents the discrete fast path; unified-memory devices keep the
+legacy behavior automatically.
+
+### 1. DEVICE_LOCAL (VRAM) Buffer Residency
+
+**Problem:** Every `VulkanBuffer` was backed by host-visible memory, so even
+"resident" benchmarks streamed all reads/writes across PCIe.
+
+**Solution:** `alloc_buffer` now prefers a non-host-visible `DEVICE_LOCAL`
+memory type when the device exposes a dedicated heap (>2 GiB), falling back to
+the legacy host-mapped allocation otherwise (out of VRAM, integrated GPUs,
+Raspberry Pi 4/5). Uploads/downloads stage through a small pool of
+host-visible scratch buffers and execute as queued `vkCmdCopyBuffer`
+transfers, including inside batched command recording.
+
+**Environment override:**
+
+```bash
+RASPTORCH_VULKAN_DEVICE_LOCAL=1   # force VRAM residency whenever a suitable type exists
+RASPTORCH_VULKAN_DEVICE_LOCAL=0   # force the legacy host-mapped (zero-copy) path
+```
+
+**Impact (discrete NVIDIA GPU, Windows):** 37/37 benchmark buffers landed in
+VRAM (`device_local`), eliminating per-tile PCIe traffic and lifting plateaued
+large-GEMM throughput ~4-14x (see the table below).
+
+### 2. `matmul_blk_tiled`: Register-Blocked Shared-Memory GEMM (`Phase 2 ✅`)
+
+**Kernel design** (`shaders/matmul_blk_tiled.comp`):
+- 64x64 output tile per workgroup, 16x16 threads, 4x4 per-thread register tile
+- 32-deep k-tiles in shared memory, **double-buffered** so the next tile's
+  global loads overlap compute on the current one
+- ~32 KiB shared memory per workgroup: pipelines that exceed the device's
+  `maxComputeSharedMemorySize` fail at creation and callers fall back
+- Arithmetic intensity ~16 FLOP/byte of global traffic (vs ~4-5.3 for the
+  16x16-tiled variants), keeping large GEMMs compute-bound from VRAM
+
+**Dispatch gates** (`matmul_fast` and `--vulkan-kernel auto` probing):
+`min(m,n,k) >= 512` -> `matmul_blk_tiled_into`, `>= 256` ->
+`matmul_vec4_32x32_tiled_into`, then the legacy tiled/vec4 fallbacks.
+
+### 3. `matmul_vec4_32x32_tiled`: Fixed Correct Kernel
+
+The previously shipped 32x32 shader was broken: it loaded only half of each
+k-tile into shared memory and wrote outputs at 16x16-tile coordinates while the
+dispatch grid expected 32x32 tiles, so results silently depended on stale
+shared memory. It is rewritten as a correct 32x32-tile kernel (16x16 threads,
+2x2 outputs per thread, ~8 FLOP/byte) and now sits between `wide_tiled` and
+`blk_tiled` in the fallback chain. Verified against NumPy on square, ragged
+(67x66x65), skinny, and batched shapes.
+
+### 4. Fair CUDA Comparison: `--cuda-resident`
+
+The CUDA backend previously paid per-iteration host->device/device->host
+transfers plus a sync, while the Vulkan path is resident (upload once, launch
+N dispatches, download once). `backend benchmark --cuda-resident` now runs
+CUDA the same way (`CUDABackend.matmul_resident`: upload, N GEMMs, single
+sync) so both numbers measure GPU-side GEMM throughput.
+
+### 5. Safer Auto-Probing
+
+- All auto-probe variants (including the two new kernels) get one untimed
+  dispatch first, so one-time pipeline/shader-build costs don't skew timing.
+- Probe dispatch counts scale with the size (all: ~2x iterations; >=2048: 4;
+  >=4096: 2) to keep probing wall-time bounded on big GEMMs.
+- The hard-coded `size >= 4096 -> matmul_vec4_wide_tiled` override is removed;
+  probing is trusted at every size.
+- Bytes-level upload hardening: `vkMapMemory` now handles cffi
+  `_cffi_backend.buffer` maps (the previous code silently degraded *every*
+  upload to the `vkCmdUpdateBuffer` fallback path), and `write()` fails fast
+  with a Python exception on null Vulkan handles instead of triggering
+  uncatchable native access violations.
+
+### Measured Impact (discrete NVIDIA GPU, matmul N x N, 5 iterations)
+
+| Size | Before (host-mapped) | After (VRAM + `blk_tiled`) | CUDA (per-iteration) |
+|------|----------------------|----------------------------|----------------------|
+| 256  | 765                  | **979**                    | 123                  |
+| 512  | 1249                 | **4068**                   | ~425-1434            |
+| 1024 | 1823                 | **7793**                   | ~1204-1198           |
+| 2048 | 930                  | **8827**                   | 2418                 |
+| 4096 | 582                  | **8042-8146**              | 4565                 |
+
+Resident-vs-resident (both skipping host transfers): **2048 is a dead heat**
+(Vulkan 8657 vs CUDA/cuBLAS 8600 GFLOPS); at 4096 cuBLAS leads
+(12552 vs 8146 GFLOPS, ~65% of cuBLAS). Remaining gap heads future work
+(cooperative matrices, wider per-thread tiles, occupancy tuning).
+
 ## Roadmap: Shared-Memory Tiled GEMM
 
-The current Vulkan matmul path already has tiled and vec4 variants, but a true shared-memory GEMM remains the next major step for large workloads.
+Status: Phases 1, 2, and 4 are implemented (`matmul_blk_tiled`,
+`matmul_vec4_32x32_tiled`, DEVICE_LOCAL residency, and size-aware auto-probing).
+Phase 3 (cooperative matrices) remains the main remaining step.
 
-### Phase 1: Stabilize the Large-Square Path
+### Phase 1: Stabilize the Large-Square Path ✅
 
-- Keep `matmul_vec4_wide_tiled` as the default auto-selected kernel for large square workloads.
-- Retain `matmul`, `matmul_vec4`, and `matmul_vec4_tiled` as fallbacks.
-- Avoid transpose-aware probing in the 4096x4096 auto path when it is not needed.
+- `matmul_blk_tiled` is the default auto-selected kernel for large square workloads.
+- `matmul_vec4_32x32_tiled`, `matmul_vec4_wide_tiled`, `matmul_vec4_tiled`, `matmul`, and `matmul_vec4` remain fallbacks.
 
-### Phase 2: Implement Blocked Shared-Memory GEMM
+### Phase 2: Implement Blocked Shared-Memory GEMM ✅
 
 - Use 16x16 or 32x32 tiles with cooperative loading into `shared` memory.
 - Minimize redundant global-memory loads by reusing each tile across multiple MAC steps.
@@ -43,9 +138,9 @@ The current Vulkan matmul path already has tiled and vec4 variants, but a true s
 - Prefer it for desktop NVIDIA hardware first, then gate it behind runtime feature checks.
 - Keep the tiled shared-memory kernel as the portable fallback for Raspberry Pi and other devices.
 
-### Phase 4: Benchmark and Auto-Tune
+### Phase 4: Benchmark and Auto-Tune ✅
 
-- Extend `--vulkan-kernel auto` to probe the tiled shared-memory kernels first on large workloads.
+- `--vulkan-kernel auto` probes every kernel (including the new tiled kernels) with one untimed dispatch each, then selects the fastest stable combination.
 - Keep submission chunk auto-tuning separate so kernel quality and dispatch strategy can be measured independently.
 - Add regression coverage for large square workloads to prevent device-lost regressions.
 
@@ -98,7 +193,9 @@ rasptorch --json backend benchmark \
 
 **Kernels Probed:**
 - `matmul` - Reference implementation
-- `matmul_vec4` - Vec4 optimized (fastest on most hardware)
+- `matmul_blk_tiled` - Register-blocked 64x64-tile GEMM (fastest on discrete GPUs with >=32 KiB shared memory)
+- `matmul_vec4_32x32_tiled` - Rewritten correct 32x32-tile GEMM (~8 FLOP/byte)
+- `matmul_vec4` - Vec4 optimized (fastest on most Raspberry Pi hardware)
 - `matmul_vec4_tiled` - Shared-memory tiled vec4 path
 - `matmul_vec4_wide_tiled` - Wider tiled vec4 path for better reuse
 - `matmul_a_bt` - Transpose-optimized
@@ -214,7 +311,9 @@ NN Essentials: softmax, layernorm, log_softmax
    ```
 
 3. **Kernel Selection:**
+   - `matmul_blk_tiled` - Best for discrete GPUs with real VRAM (>=512 per dim, >=32 KiB shared memory)
    - `matmul_vec4` - Best for most Raspberry Pi hardware (recommended)
+   - `matmul_vec4_32x32_tiled` - Mid-size workloads where 64x64 tiles are too coarse
    - `matmul` - Slower but more stable fallback
    - `matmul_a_bt` - Alternative if vec4 is unstable
    - `matmul_a_bt_tiled` - Fastest but may cause device loss

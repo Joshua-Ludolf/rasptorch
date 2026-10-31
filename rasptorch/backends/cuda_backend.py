@@ -137,6 +137,41 @@ class CUDABackend(Backend):
         self._fallback_or_raise("CUDA provider unavailable")
         return np.asarray(a, dtype=np.float32) @ np.asarray(b, dtype=np.float32)
 
+    def matmul_resident(self, a: np.ndarray, b: np.ndarray, iterations: int = 1) -> np.ndarray:
+        """Resident matmul: upload A/B once, launch `iterations` GEMMs, sync once.
+
+        Mirrors the Vulkan resident benchmark mode (no per-iteration host
+        transfers) so GPU-side throughput can be compared fairly. Returns the
+        final result as a NumPy array.
+        """
+
+        iterations = max(1, int(iterations))
+        if not self.is_available():
+            return np.asarray(a, dtype=np.float32) @ np.asarray(b, dtype=np.float32)
+        if self._provider == "cupy":
+            cp = self._cp
+            if cp is None:
+                return np.asarray(a, dtype=np.float32) @ np.asarray(b, dtype=np.float32)
+            ca = cp.asarray(a, dtype=cp.float32)
+            cb = cp.asarray(b, dtype=cp.float32)
+            out = ca @ cb
+            for _ in range(iterations - 1):
+                out = ca @ cb
+            cp.cuda.get_current_stream().synchronize()
+            return np.asarray(cp.asnumpy(out), dtype=np.float32)
+        if self._provider == "torch":
+            torch = self._torch
+            if torch is None:
+                return np.asarray(a, dtype=np.float32) @ np.asarray(b, dtype=np.float32)
+            ta = torch.as_tensor(a, device="cuda", dtype=torch.float32)
+            tb = torch.as_tensor(b, device="cuda", dtype=torch.float32)
+            out = ta @ tb
+            for _ in range(iterations - 1):
+                out = ta @ tb
+            torch.cuda.synchronize()
+            return np.asarray(out.detach().cpu().numpy(), dtype=np.float32)
+        return np.asarray(a, dtype=np.float32) @ np.asarray(b, dtype=np.float32)
+
     def relu(self, x: np.ndarray) -> np.ndarray:
         if not self.is_available():
             self._fallback_or_raise("CUDA backend unavailable")

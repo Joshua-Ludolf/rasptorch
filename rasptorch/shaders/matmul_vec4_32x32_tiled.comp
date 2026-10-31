@@ -1,66 +1,90 @@
 #version 450
 
+// 32x32-tiled GEMM. One workgroup computes a 32x32 output tile with 16x16
+// threads, so each thread accumulates 2x2 outputs. k-tiles of depth 32 are
+// staged in shared memory (2 x 32x32 floats = 8 KiB).
+//
+// Traffic: per workgroup each k-tile loads 32 rows of A and 32 columns of B
+// once -> ~8 FLOP per byte of global traffic (the 16x16 tiled kernel reaches
+// ~4). Useful where the 64x64 block kernel is too coarse (256..511) or where
+// shared memory limits rule it out.
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer ABuffer {
-    float a[];
-} buf_a;
+layout(set = 0, binding = 0, std430) readonly buffer BufA { float a[]; } bufa;
+layout(set = 0, binding = 1, std430) readonly buffer BufB { float b[]; } bufb;
+layout(set = 0, binding = 2, std430) writeonly buffer BufO { float o[]; } bufo;
 
-layout(set = 0, binding = 1, std430) readonly buffer BBuffer {
-    float b[];
-} buf_b;
-
-layout(set = 0, binding = 2, std430) writeonly buffer OBuffer {
-    float o[];
-} buf_o;
-
-layout(push_constant) uniform PushConstants {
+layout(push_constant) uniform Push {
     uint m;
     uint n;
     uint k;
 } pc;
 
-shared float Asub[32][32];
-shared float Bsub[32][32];
+const uint TS = 32u;  // output tile edge and shared k depth
+
+// Asub[kk][r] = A[rt + r][kt + kk]; Bsub[kk][c] = B[kt + kk][ct + c]
+shared float Asub[TS][TS];
+shared float Bsub[TS][TS];
 
 void main() {
-    uint row = gl_GlobalInvocationID.y;
-    uint col = gl_GlobalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
     uint lx = gl_LocalInvocationID.x;
+    uint rt = gl_WorkGroupID.y * TS;
+    uint ct = gl_WorkGroupID.x * TS;
 
-    float sum = 0.0;
-    uint tile_count = (pc.k + 31u) / 32u;
+    // Thread tile: rows ly*2 + j, cols lx*2 + h (j, h in {0, 1}).
+    float s00 = 0.0;
+    float s01 = 0.0;
+    float s10 = 0.0;
+    float s11 = 0.0;
 
-    for (uint t = 0u; t < tile_count; ++t) {
-        uint a_col = t * 32u + lx;
-        uint b_row = t * 32u + ly;
+    uint tiles = (pc.k + TS - 1u) / TS;
 
-        Asub[ly][lx] = (row < pc.m && a_col < pc.k) ? buf_a.a[row * pc.k + a_col] : 0.0;
-        Bsub[ly][lx] = (b_row < pc.k && col < pc.n) ? buf_b.b[b_row * pc.n + col] : 0.0;
+    for (uint t = 0u; t < tiles; ++t) {
+        uint kt = t * TS;
 
-        barrier();
+        // A tile: 32 rows x 32 k-values; 4 loads per thread.
+        for (uint j = 0u; j < 2u; ++j) {
+            uint ar = rt + ly * 2u + j;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint ak = kt + lx * 2u + h;
+                float v = (ar < pc.m && ak < pc.k) ? bufa.a[ar * pc.k + ak] : 0.0;
+                Asub[lx * 2u + h][ly * 2u + j] = v;
+            }
+        }
 
-        for (uint i = 0u; i < 32u; i += 4u) {
-            vec4 a_vec = vec4(
-                Asub[ly][i + 0u],
-                Asub[ly][i + 1u],
-                Asub[ly][i + 2u],
-                Asub[ly][i + 3u]
-            );
-            vec4 b_vec = vec4(
-                Bsub[i + 0u][lx],
-                Bsub[i + 1u][lx],
-                Bsub[i + 2u][lx],
-                Bsub[i + 3u][lx]
-            );
-            sum += dot(a_vec, b_vec);
+        // B tile: 32 k-rows x 32 cols; 4 loads per thread.
+        for (uint j = 0u; j < 2u; ++j) {
+            uint bk = kt + ly * 2u + j;
+            for (uint h = 0u; h < 2u; ++h) {
+                uint bc = ct + lx * 2u + h;
+                float v = (bk < pc.k && bc < pc.n) ? bufb.b[bk * pc.n + bc] : 0.0;
+                Bsub[ly * 2u + j][lx * 2u + h] = v;
+            }
         }
 
         barrier();
+
+        for (uint i = 0u; i < TS; ++i) {
+            float a0 = Asub[i][ly * 2u + 0u];
+            float a1 = Asub[i][ly * 2u + 1u];
+            float b0 = Bsub[i][lx * 2u + 0u];
+            float b1 = Bsub[i][lx * 2u + 1u];
+            s00 += a0 * b0;
+            s01 += a0 * b1;
+            s10 += a1 * b0;
+            s11 += a1 * b1;
+        }
+
+        // All reads of the current tile must retire before it is refilled.
+        barrier();
     }
 
-    if (row < pc.m && col < pc.n) {
-        buf_o.o[row * pc.n + col] = sum;
-    }
+    uint row0 = rt + ly * 2u;
+    uint col0 = ct + lx * 2u;
+    if (row0 + 0u < pc.m && col0 + 0u < pc.n) bufo.o[(row0 + 0u) * pc.n + col0 + 0u] = s00;
+    if (row0 + 0u < pc.m && col0 + 1u < pc.n) bufo.o[(row0 + 0u) * pc.n + col0 + 1u] = s01;
+    if (row0 + 1u < pc.m && col0 + 0u < pc.n) bufo.o[(row0 + 1u) * pc.n + col0 + 0u] = s10;
+    if (row0 + 1u < pc.m && col0 + 1u < pc.n) bufo.o[(row0 + 1u) * pc.n + col0 + 1u] = s11;
 }

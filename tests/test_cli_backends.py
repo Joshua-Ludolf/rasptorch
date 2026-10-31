@@ -354,6 +354,21 @@ def test_backend_benchmark_vulkan_auto_skips_failing_variant(monkeypatch) -> Non
     monkeypatch.setattr(vk_mod, "matmul_vec4_into", _matmul_vec4_into)
     monkeypatch.setattr(vk_mod, "matmul_vec4_tiled_into", _matmul_vec4_tiled_into)
     monkeypatch.setattr(vk_mod, "matmul_vec4_wide_tiled_into", _matmul_vec4_wide_tiled_into)
+    monkeypatch.setattr(
+        vk_mod,
+        "matmul_blk_tiled_into",
+        lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("blk kernel not available")),
+    )
+    monkeypatch.setattr(
+        vk_mod,
+        "matmul_vec4_32x32_tiled_into",
+        lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("32x32 kernel not available")),
+    )
+    monkeypatch.setattr(
+        vk_mod,
+        "matmul_tiled_into",
+        lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("tiled kernel not available")),
+    )
     monkeypatch.setattr(vk_mod, "matmul_a_bt_out", _matmul_a_bt_out)
     monkeypatch.setattr(vk_mod, "matmul_a_bt_tiled_out", _matmul_a_bt_tiled_out)
     monkeypatch.setattr(vk_mod, "transpose2d", lambda b: _Buf(b.arr.T))
@@ -393,7 +408,7 @@ def test_backend_benchmark_vulkan_auto_skips_failing_variant(monkeypatch) -> Non
     )
 
 
-def test_backend_benchmark_vulkan_auto_large_size_avoids_transpose_kernels(monkeypatch) -> None:
+def test_backend_benchmark_vulkan_auto_falls_back_to_working_kernel(monkeypatch) -> None:
     import numpy as np
     import rasptorch.backend as backend_mod
     import rasptorch.vulkan_backend as vk_mod
@@ -429,12 +444,16 @@ def test_backend_benchmark_vulkan_auto_large_size_avoids_transpose_kernels(monke
     monkeypatch.setattr(vk_mod, "to_gpu", _to_gpu)
     monkeypatch.setattr(vk_mod, "empty", _empty)
     monkeypatch.setattr(vk_mod, "matmul_vec4_wide_tiled_into", _matmul_vec4_wide_tiled_into)
+    monkeypatch.setattr(vk_mod, "matmul_blk_tiled_into", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("blk")))
+    monkeypatch.setattr(vk_mod, "matmul_vec4_32x32_tiled_into", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("32x32")))
     monkeypatch.setattr(vk_mod, "matmul_vec4_tiled_into", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("tile")))
     monkeypatch.setattr(vk_mod, "matmul_into", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("naive")))
     monkeypatch.setattr(vk_mod, "matmul_vec4_into", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("vec4")))
-    monkeypatch.setattr(vk_mod, "matmul_a_bt_out", lambda _a, _b, _out: (_ for _ in ()).throw(AssertionError("transpose path should not be used")))
-    monkeypatch.setattr(vk_mod, "matmul_a_bt_tiled_out", lambda _a, _b, _out: (_ for _ in ()).throw(AssertionError("transpose path should not be used")))
-    monkeypatch.setattr(vk_mod, "transpose2d", lambda _b: (_ for _ in ()).throw(AssertionError("transpose2d should not be called")))
+    # Transpose-aware kernels are probed at large sizes as well; they must
+    # fail cleanly here so the auto probe skips them.
+    monkeypatch.setattr(vk_mod, "matmul_a_bt_out", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("a_bt")))
+    monkeypatch.setattr(vk_mod, "matmul_a_bt_tiled_out", lambda _a, _b, _out: (_ for _ in ()).throw(RuntimeError("a_bt_tiled")))
+    monkeypatch.setattr(vk_mod, "transpose2d", lambda b: _Buf(np.asarray(b.arr.T, dtype=np.float32)))
     monkeypatch.setattr(vk_mod, "to_cpu", lambda b: np.asarray(b.arr, dtype=np.float32))
     monkeypatch.setattr(vk_mod, "free", lambda _b: None)
     monkeypatch.setattr(vk_mod, "begin_batch", lambda: None)

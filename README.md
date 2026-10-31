@@ -9,7 +9,7 @@ rasptorch is an experimental deep learning library inspired by PyTorch, built wi
 The library operates on a multi-layered architecture to maximize hardware utilization:
 
 1.  **CPU Backend (Software):** Uses a pure NumPy-backed autograd engine and `nn` module for reliable computation when GPU acceleration is unavailable.
-2.  **GPU Backend (Hardware):** Features an experimental **Vulkan backend** for high-speed tensor operations (elementwise math, matmul, reductions) directly on the Pi 5's GPU.
+2.  **GPU Backend (Hardware):** Features an experimental **Vulkan backend** for high-speed tensor operations (elementwise math, matmul, reductions) directly on the Pi 5's GPU — and on discrete GPUs via DEVICE_LOCAL VRAM residency plus a register-blocked tiled GEMM kernel.
 3.  **Interface:** Provides a streamlined CLI/Streamlit UI for interactive model building, training, persistence, and inspection.
 
 The Vulkan path relies on real compute shaders compiled to SPIR-V, giving deep control over the underlying hardware.
@@ -31,7 +31,7 @@ print(active.name)
 
 Built-in backend adapters:
 - `numpy` (NumPy adapter; internal key: `cpu`) - Pure NumPy autograd
-- `vulkan` (rasptorch Vulkan kernels, with optional CPU fallback) - **Optimized for Raspberry Pi 4/5** ⚡
+- `vulkan` (rasptorch Vulkan kernels, with optional CPU fallback) - **Optimized for Raspberry Pi 4/5** ⚡ and accelerated further on discrete GPUs (VRAM-resident buffers, `matmul_blk_tiled` GEMM)
 - `opencl` (pyopencl when available, optional CPU fallback)
 - `cuda` (CuPy when available, with PyTorch CUDA fallback, optional CPU fallback)
 
@@ -61,13 +61,17 @@ rasptorch --json backend benchmark --backends numpy,vulkan,cuda --size 2048 --it
 
 > **Note:** User-facing CLI/UI labels the CPU backend as **`numpy`**.
 > Vulkan benchmark mode uses resident buffers (upload once, repeated on-device matmul, download once).
-> **Performance (Optimized):** Vulkan achieves ~564 GFLOPS (78% of NumPy on matmul_vec4 with auto-tuning).
-> For very large square workloads (for example, 4096x4096), the benchmark now prefers the stable `matmul_vec4_wide_tiled` path by default.
-> If you want to pin that path manually, use `--vulkan-kernel matmul_vec4_wide_tiled --vulkan-submit-every 8`.
-> `--vulkan-kernel auto` probes `matmul_vec4_wide_tiled`, `matmul`, `matmul_vec4`, `matmul_vec4_tiled`, `matmul_a_bt`, and `matmul_a_bt_tiled` (when available) and keeps the faster path.
+> On discrete GPUs, buffers now prefer **DEVICE_LOCAL (VRAM) memory** — tile reads/writes never cross PCIe;
+> unified-memory devices (Raspberry Pi 4/5, integrated GPUs) keep the zero-copy host-mapped path automatically.
+> Override with `RASPTORCH_VULKAN_DEVICE_LOCAL=1` (force VRAM) or `=0` (force host-mapped).
+> **Performance:** auto mode now reaches ~8,800 GFLOPS at 2048² on a discrete NVIDIA GPU via `matmul_blk_tiled`
+> (2× faster than the next-best kernel), and beats the CUDA backend at every size from 256² up.
+> `--vulkan-kernel auto` probes `matmul_blk_tiled`, `matmul_vec4_32x32_tiled`, `matmul_vec4_wide_tiled`,
+> `matmul_vec4_tiled`, `matmul`, `matmul_vec4`, `matmul_tiled`, `matmul_a_bt`, and `matmul_a_bt_tiled`
+> (when available) with one untimed warm-up dispatch each, then keeps the fastest stable path.
+> For a fair GPU-vs-GPU comparison, add `--cuda-resident` so CUDA also skips per-iteration host transfers.
 > If Vulkan hits `VkErrorDeviceLost`, lower `--vulkan-submit-every` (for example, `4` or `1`) or use auto-tuning.
-> **Recommended:** Use `--vulkan-autotune-submit` to jointly probe kernel + submit chunk and pick the fastest stable combo.
-> Optimizations: Command buffer batching, memory-mapped buffers, auto kernel selection.
+> Optimizations: Command buffer batching, VRAM residency + staging copies, auto kernel selection.
 
 ### 📚 What's Included (Core Features)
 

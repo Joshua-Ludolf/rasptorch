@@ -1,0 +1,137 @@
+#version 450
+
+// Register-blocked tiled GEMM for discrete GPUs.
+//
+// Each workgroup computes a 64x64 output tile with 16x16 threads, so every
+// thread accumulates a 4x4 register tile (16 outputs). k-tiles of depth 32
+// are staged in shared memory with double buffering, so global loads for the
+// next tile overlap compute on the current one.
+//
+// Arithmetic intensity: per workgroup each k-tile loads 64 + 64 floats of
+// A/B per k-row once, i.e. ~16 FLOP per byte of global traffic (the 16x16
+// vec4 tiled kernel only reaches ~4, the wide variant ~5.3). Combined with
+// DEVICE_LOCAL backing (see alloc_buffer) this keeps large GEMMs compute
+// bound instead of streaming-bound.
+//
+// Requires maxComputeSharedMemorySize >= 32 KiB. Pipelines that exceed the
+// device limit fail at creation and callers fall back to the tiled kernels.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer BufA { float a[]; } bufa;
+layout(set = 0, binding = 1, std430) readonly buffer BufB { float b[]; } bufb;
+layout(set = 0, binding = 2, std430) writeonly buffer BufO { float o[]; } bufo;
+
+layout(push_constant) uniform Push {
+    uint m;
+    uint n;
+    uint k;
+} pc;
+
+const uint T_M = 64u;  // output rows per workgroup
+const uint T_N = 64u;  // output cols per workgroup
+const uint T_K = 32u;  // shared-memory k depth
+const uint Q = 4u;     // per-thread tile is Q x Q outputs
+
+// Double-buffered tiles:
+//   Asub[buf][kk * T_M + r] = A[rt + r][kt + kk]
+//   Bsub[buf][kk * T_N + c] = B[kt + kk][ct + c]
+shared float Asub[2][T_K * T_M];
+shared float Bsub[2][T_K * T_N];
+
+void load_tile(uint t, uint buf) {
+    uint kt = t * T_K;
+    uint rt = gl_WorkGroupID.y * T_M;
+    uint ct = gl_WorkGroupID.x * T_N;
+    uint li = gl_LocalInvocationIndex;  // 0..255
+
+    // A tile: 64 rows x 32 k-values = 2048 floats, 8 per thread.
+    // Thread layout: 4 threads per row, each covering 8 consecutive k values.
+    {
+        uint arow = li >> 2u;         // 0..63
+        uint kbase = (li & 3u) * 8u;  // 0, 8, 16, 24
+        uint grow = rt + arow;
+        uint gcol = kt + kbase;
+        bool rok = grow < pc.m;
+        for (uint j = 0u; j < 8u; ++j) {
+            uint kk = kbase + j;
+            float v = (rok && gcol + j < pc.k) ? bufa.a[grow * pc.k + gcol + j] : 0.0;
+            Asub[buf][kk * T_M + arow] = v;
+        }
+    }
+
+    // B tile: 32 rows x 64 cols = 2048 floats, 8 per thread.
+    // Thread layout: 8 threads per row, each covering 8 consecutive columns.
+    {
+        uint brow = li >> 3u;         // 0..31
+        uint cbase = (li & 7u) * 8u;  // 0..56 step 8
+        uint grow = kt + brow;
+        uint gcol = ct + cbase;
+        bool rok = grow < pc.k;
+        for (uint j = 0u; j < 8u; ++j) {
+            uint ccol = gcol + j;
+            float v = (rok && ccol < pc.n) ? bufb.b[grow * pc.n + ccol] : 0.0;
+            Bsub[buf][brow * T_N + cbase + j] = v;
+        }
+    }
+}
+
+void main() {
+    uint row0 = gl_WorkGroupID.y * T_M + gl_LocalInvocationID.y * Q;
+    uint col0 = gl_WorkGroupID.x * T_N + gl_LocalInvocationID.x * Q;
+
+    vec4 acc0 = vec4(0.0);
+    vec4 acc1 = vec4(0.0);
+    vec4 acc2 = vec4(0.0);
+    vec4 acc3 = vec4(0.0);
+
+    uint tiles = (pc.k + T_K - 1u) / T_K;
+
+    load_tile(0u, 0u);
+    barrier();
+
+    uint cur = 0u;
+    for (uint t = 0u; t < tiles; ++t) {
+        uint nxt = 1u - cur;
+        if (t + 1u < tiles) {
+            // Prefetch the next tile while this one is being consumed.
+            load_tile(t + 1u, nxt);
+        }
+
+        uint lcol = gl_LocalInvocationID.x * Q;
+        uint lrow = gl_LocalInvocationID.y * Q;
+        for (uint kk = 0u; kk < T_K; ++kk) {
+            vec4 bv = vec4(
+                Bsub[cur][kk * T_N + lcol + 0u],
+                Bsub[cur][kk * T_N + lcol + 1u],
+                Bsub[cur][kk * T_N + lcol + 2u],
+                Bsub[cur][kk * T_N + lcol + 3u]
+            );
+            float a0 = Asub[cur][kk * T_M + lrow + 0u];
+            float a1 = Asub[cur][kk * T_M + lrow + 1u];
+            float a2 = Asub[cur][kk * T_M + lrow + 2u];
+            float a3 = Asub[cur][kk * T_M + lrow + 3u];
+            acc0 += a0 * bv;
+            acc1 += a1 * bv;
+            acc2 += a2 * bv;
+            acc3 += a3 * bv;
+        }
+
+        // All threads finished reading the current tile and all prefetch
+        // stores are visible before the buffers swap roles.
+        barrier();
+        cur = nxt;
+    }
+
+    for (uint j = 0u; j < Q; ++j) {
+        uint row = row0 + j;
+        if (row >= pc.m) {
+            break;
+        }
+        vec4 acc = (j == 0u) ? acc0 : ((j == 1u) ? acc1 : ((j == 2u) ? acc2 : acc3));
+        if (col0 + 0u < pc.n) bufo.o[row * pc.n + col0 + 0u] = acc.x;
+        if (col0 + 1u < pc.n) bufo.o[row * pc.n + col0 + 1u] = acc.y;
+        if (col0 + 2u < pc.n) bufo.o[row * pc.n + col0 + 2u] = acc.z;
+        if (col0 + 3u < pc.n) bufo.o[row * pc.n + col0 + 3u] = acc.w;
+    }
+}
