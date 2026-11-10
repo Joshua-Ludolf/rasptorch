@@ -4,6 +4,18 @@ rasptorch is an experimental deep learning library inspired by PyTorch, built wi
 
 ---
 
+### 🤖 Agent Skill
+
+This repo ships an [Agent Skill](https://code.claude.com/docs/en/skills) so AI agents (Claude Code, OpenCode, Codex CLI, Cursor, …) can operate rasptorch's CLI directly. Install it with:
+
+```bash
+npx skills add Joshua-Ludolf/rasptorch@rasptorch
+```
+
+The skill lives in `.claude/skills/rasptorch/` (also mirrored to `.agents/skills/` and `.opencode/skills/`) and teaches an agent how to check backends, create tensors and models, train, and save/load — always consuming JSON output via `rasptorch --json …`.
+
+---
+
 ### ✨ Core Concepts
 
 The library operates on a multi-layered architecture to maximize hardware utilization:
