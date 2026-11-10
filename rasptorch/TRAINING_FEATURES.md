@@ -26,8 +26,8 @@ rasptorch model train --model-id <id> --epochs 10 --lr 0.001 --batch-size 32 --d
 - JSON output for integration
 
 **GPU/Vulkan Support:**
-- Automatic Vulkan detection on Raspberry Pi 5
-- **Optimized performance**: 564 GFLOPS on matmul (78% of NumPy speed)
+- Automatic Vulkan detection on Raspberry Pi 5 and discrete GPUs
+- **Optimized performance**: ~8,800 GFLOPS matmul on discrete GPUs (blocked GEMM kernel); 564 GFLOPS on the Pi 5 target
 - Command buffer batching for minimal API overhead
 - Auto-tuning for optimal kernel selection and submission strategy
 - Seamless fallback to NumPy if Vulkan unavailable
@@ -147,7 +147,7 @@ System:
 
 **Files Modified:**
 - `rasptorch/_cli_commands.py` - ModelCommands class with train/save/load
-- `rasptorch/cli.py` - New train, save, load command handlers
+- `rasptorch/CLI/_cli_commands.py` - New train, save, load command handlers
 - `pyproject.toml` - Already had required dependencies (click, prompt-toolkit)
 
 ### New Classes & Methods
@@ -171,7 +171,7 @@ System:
 - Small model: ~0.15s (3.3x faster)
 - Medium model: ~0.6s (3.3x faster)
 - Large model: ~2.4s (3.3x faster)
-- **Matmul Benchmark**: 564 GFLOPS (Vulkan) vs 724 GFLOPS (NumPy)
+- **Matmul Benchmark** (2048², discrete GPU): ~8,100-8,800 GFLOPS (Vulkan `matmul_blk_tiled`) vs ~926 GFLOPS (NumPy)
 
 *Note: Performance includes Vulkan optimizations (command buffer batching, auto-tuning, memory-mapped buffers). Actual speed depends on model size, batch size, and Vulkan driver availability.*
 
@@ -238,7 +238,7 @@ Potential enhancements:
 ## ✨ Highlights
 
 - **Zero Configuration** - Works out of the box with sensible defaults
-- **GPU Ready** - Vulkan support on Raspberry Pi 5 with 564 GFLOPS matmul (3.3x speedup)
+- **GPU Ready** - Vulkan on Raspberry Pi 5 and discrete GPUs (VRAM-resident buffers + `matmul_blk_tiled` GEMM, ~8,800 GFLOPS at 2048²)
 - **Fully Optimized** - Command buffer batching, auto-tuning, memory-mapped buffers
 - **Persistent** - Models survive CLI restarts automatically
 - **Flexible** - All 6 model architectures supported

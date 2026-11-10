@@ -122,14 +122,15 @@ The Vulkan backend has been heavily optimized to minimize overhead and maximize 
 
 **Key Optimizations Implemented:**
 - ✅ **Command Buffer Batching** - Groups multiple kernel submissions to reduce API call overhead
-- ✅ **Auto-Tuning** - Automatically selects best kernel (`matmul`, `matmul_vec4`, `matmul_a_bt`, `matmul_a_bt_tiled`) and submission strategy
-- ✅ **Memory-Mapped Buffers** - Prioritizes host-mapped memory to minimize data copy overhead
+- ✅ **Auto-Tuning** - Automatically selects best kernel (`matmul`, `matmul_tiled`, `matmul_vec4`, `matmul_vec4_tiled`, `matmul_vec4_wide_tiled`, `matmul_vec4_32x32_tiled`, `matmul_blk_tiled`, `matmul_a_bt`, `matmul_a_bt_tiled`) and submission strategy
+- ✅ **Hybrid Memory Management** - DEVICE_LOCAL (VRAM) buffers with staging copies on discrete GPUs; zero-copy host-mapped buffers on Raspberry Pi 4/5
 - ✅ **Resource Pooling** - Reuses descriptor sets and command buffers to reduce allocation overhead
 
-**Performance Benchmarks (Raspberry Pi 5 target):**
-- **Vulkan (matmul_vec4, auto-tuned)**: 564 GFLOPS
-- **NumPy**: 724 GFLOPS
-- **Gap Closed**: ~22% performance gap (excellent for GPU-accelerated embedded computing)
+**Performance Benchmarks (discrete NVIDIA GPU, 2048x2048 resident):**
+- **Vulkan (auto → matmul_blk_tiled, VRAM-resident)**: ~8,100-8,800 GFLOPS
+- **CUDA (cuBLAS, per-iteration transfers)**: ~1,585-2,418 GFLOPS
+- **NumPy**: ~926 GFLOPS
+- Historical Pi 5 target track: 564 GFLOPS Vulkan vs 724 GFLOPS NumPy (pre-VRAM-residency)
 
 **For Best Results:**
 ```bash
@@ -137,12 +138,12 @@ The Vulkan backend has been heavily optimized to minimize overhead and maximize 
 rasptorch model train --model-id <id> --device gpu --vulkan-autotune-submit
 
 # Or explicitly tune for your hardware
-rasptorch model train --model-id <id> --device gpu --vulkan-kernel matmul_vec4 --vulkan-submit-every 16
+rasptorch model train --model-id <id> --device gpu --vulkan-kernel matmul_blk_tiled --vulkan-submit-every 8
 ```
 
 ### Vulkan Benefits
-- **Hardware acceleration** on Raspberry Pi 5 (VideoCore VI GPU)
-- **Optimized performance** - 564 GFLOPS matmul, competitive with CPU
+- **Hardware acceleration** on Raspberry Pi 5 (VideoCore VI GPU) and discrete GPUs
+- **Optimized performance** - `matmul_blk_tiled` GEMM at ~8,800 GFLOPS on discrete GPUs (blocked register tiles + VRAM residency); 564 GFLOPS on the Pi 5 target
 - **Lower power consumption** than pure CPU training
 - **Automatic fallback** - gracefully falls back to NumPy if Vulkan unavailable
 - **Full feature support** - all neural network layers, training operations, and optimizers

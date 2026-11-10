@@ -373,4 +373,4 @@ uv run rasptorch model save --model-id <id> --path model.pth
 
 1.  **Performance:** The fastest paths are those that keep the computation entirely on the GPU and minimize data transfer across the PCIe bus.
 2.  **Fallback:** If GPU operations fail due to driver issues, the system gracefully falls back to the CPU NumPy path, but performance will suffer.
-3.  **Advanced Use:** For understanding the deep dive into custom kernel optimization, please refer to the source code in the `rasptorch/gpu_demo.py` and `rasptorch/main.py` scripts.
+3.  **Advanced Use:** For understanding the deep dive into custom kernel optimization, please refer to the source code in the `gpu_demo.py` (repo root) demo harness and `main.py` demo scripts.

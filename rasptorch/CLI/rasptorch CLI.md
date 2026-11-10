@@ -21,30 +21,30 @@ Transform tensor operations, model creation, and training workflows into structu
 
 ```bash
 # Show help
-python -m rasptorch.cli --help
+uv run rasptorch --help
 
 # Get version and environment info
-python -m rasptorch.cli info
+uv run rasptorch info
 
 # Select backend globally (numpy|vulkan|opencl|cuda|auto)
-python -m rasptorch.cli --backend numpy info
+uv run rasptorch --backend numpy info
 
 # Create a random tensor
-python -m rasptorch.cli tensor random --shape 2,3,4
+uv run rasptorch tensor random --shape 2,3,4
 
 # Create zeros tensor
-python -m rasptorch.cli tensor zeros --shape 3,4
+uv run rasptorch tensor zeros --shape 3,4
 
 # Create ones tensor
-python -m rasptorch.cli tensor ones --shape 5,10
+uv run rasptorch tensor ones --shape 5,10
 ```
 
 ### JSON Output for Agents
 
 ```bash
 # All commands support --json flag for structured output
-python -m rasptorch.cli --json tensor zeros --shape 3,4
-python -m rasptorch.cli --json model create-linear --input-size 10 --hidden-sizes 32,16 --output-size 2
+uv run rasptorch --json tensor zeros --shape 3,4
+uv run rasptorch --json model create-linear --input-size 10 --hidden-sizes 32,16 --output-size 2
 ```
 
 ### Tensor Commands
@@ -101,11 +101,11 @@ rasptorch info
 
 ```bash
 # Create a random tensor
-$ python -m rasptorch.cli tensor random --shape 2,3,4
+$ uv run rasptorch tensor random --shape 2,3,4
 ✓ Created random tensor: [2, 3, 4] on cpu
 
 # Create a linear model
-$ python -m rasptorch.cli model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
+$ uv run rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
 ✓ Created linear model 140734406322768
   Architecture: 10 -> 32 -> 16 -> 2
 ```
@@ -113,7 +113,7 @@ $ python -m rasptorch.cli model create-linear --input-size 10 --hidden-sizes "32
 ### JSON Output for Agents
 
 ```bash
-$ python -m rasptorch.cli --json tensor zeros --shape 3,4
+$ uv run rasptorch --json tensor zeros --shape 3,4
 {
   "status": "success",
   "tensor_id": "140732147753584",
@@ -132,7 +132,7 @@ The CLI is built directly into rasptorch. After installing rasptorch with the CL
 pip install rasptorch
 
 # Access CLI via module invocation
-python -m rasptorch.cli --help
+uv run rasptorch --help
 
 # Or direct command (if installed via pip)
 rasptorch --help
@@ -142,7 +142,7 @@ rasptorch --help
 
 The CLI implementation consists of:
 
-- **[rasptorch/cli.py](cli.py)** — Main Click CLI entry point with all commands
+- **[rasptorch/CLI/cli.py](cli.py)** — Main Click CLI entry point with all commands
 - **[rasptorch/_cli_commands.py](_cli_commands.py)** — Command implementations
 - **[rasptorch/_cli_utils.py](_cli_utils.py)** — Utility functions and formatting
 
@@ -337,18 +337,18 @@ rasptorch --json model create-optimizer --model-id $MODEL_ID --optimizer Adam --
 
 ```bash
 # Run from repository root
-python -m rasptorch.cli --help
-python -m rasptorch.cli info
-python -m rasptorch.cli tensor random --shape 2,3,4
-python -m rasptorch.cli --json tensor zeros --shape 3,4
-python -m rasptorch.cli model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
+uv run rasptorch --help
+uv run rasptorch info
+uv run rasptorch tensor random --shape 2,3,4
+uv run rasptorch --json tensor zeros --shape 3,4
+uv run rasptorch model create-linear --input-size 10 --hidden-sizes "32,16" --output-size 2
 ```
 
 ### Adding New Commands
 
 1. Add command implementation to [rasptorch/_cli_commands.py](_cli_commands.py)
-2. Add Click decorator and handler in [rasptorch/cli.py](cli.py)
-3. Test with `python -m rasptorch.cli <command> --help`
+2. Add Click decorator and handler in [rasptorch/CLI/cli.py](cli.py)
+3. Test with `uv run rasptorch <command> --help`
 
 ## License
 
