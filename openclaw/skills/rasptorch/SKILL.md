@@ -1,33 +1,15 @@
 ---
 name: rasptorch
-description: Operate rasptorch (NumPy deep learning library) via its agent-native CLI, consuming JSON output. Supports tensors, model creation (mlp, cnn, cv, jev, gru, transformer, linear), training, save/load, and UI/chat modes.
-metadata:
-  clawdbot:
-    os: [windows, linux]
-    requires:
-      anyBins: [rasptorch, python, py]
-  interface:
-    version: "1.0"
-    transport: "cli"
-    output_format: "json"
-    stateful: true
-    long_running: [ui, chat]
+description: Operate rasptorch (NumPy deep learning library) via its agent-native CLI that outputs JSON. Use when the user asks to create tensors, build or train models (mlp, cnn, cv, jev, gru, transformer, linear, lora), manage GPU backends, benchmark matmul throughput, or save/load/convert rasptorch models.
 ---
 
-# rasptorch skill
+# Operate rasptorch
 
-Use this skill to operate **rasptorch** from any agent harness by calling its **agent-native CLI** and consuming structured JSON output.
+Operate the **rasptorch** deep learning library by calling its agent-native CLI and consuming structured JSON output.
 
-## Interface contract
+For detailed CLI examples, see `rasptorch/CLI/rasptorch CLI.md` in the repo.
 
-| Field | Value |
-|-------|-------|
-| Transport | CLI (stdout/stderr) |
-| Output format | JSON (pass `--json` on every call) |
-| Stateful | Yes — model registry persists within a session |
-| Long-running | `rasptorch ui` (Streamlit), `rasptorch chat` (REPL) |
-
-### How to invoke
+## Get started
 
 Prefer the installed console script:
 
@@ -35,110 +17,83 @@ Prefer the installed console script:
 rasptorch --json <command> [args...]
 ```
 
-If the console script is unavailable, use module invocation from this repo:
+If the console script is unavailable, use module invocation from the repo root:
 
 ```bash
 python -m rasptorch.CLI.cli --json <command> [args...]
 ```
 
-### Backend selection
+Rules:
 
-Always prefer `--backend auto` unless the user asks to pin a specific backend:
+- Pass `--json` on every call; parse stdout only after confirming the exit code is 0. Errors arrive as JSON with an `error` field and a non-zero exit code.
+- Global options go after the program name and before the command: `--device cpu|gpu|auto`, `--backend auto|numpy|vulkan|opencl|cuda`. Prefer `--backend auto` unless the user asks to pin a backend.
+- Model commands are stateful — a registry of created models persists in the session.
 
-- `--backend auto` (default): choose best available backend
-- `--backend vulkan`: prefer Vulkan GPU backend
-- `--backend opencl`: use OpenCL backend
-- `--backend cuda`: use CUDA backend (CuPy or PyTorch CUDA provider)
-- `--backend numpy`: CPU backend (internal key: `cpu`)
-
-## Read-only checks
-
-### Environment + GPU status
+## Check environment first
 
 ```bash
-rasptorch --json info
+rasptorch --json info          # version, device, vulkan_available, vulkan_status
+rasptorch --json backend list  # active backend + availability of each
 ```
 
-Key fields: `vulkan_available`, `vulkan_using_real_gpu`, `vulkan_status`.
-
-## Tensor workflows
-
-### Create tensors
+## Create tensors
 
 ```bash
 rasptorch --json --backend numpy tensor random --shape 2,3,4 --device cpu --dtype float32
-rasptorch --json tensor zeros --shape 3,4 --device auto
+rasptorch --json tensor zeros --shape 3,4
 rasptorch --json --backend vulkan tensor ones --shape 5,10 --device gpu
 ```
 
-Notes:
-- Keep shapes small unless the user explicitly requests large workloads.
-- Prefer `--backend auto` unless the user asks to pin a specific backend.
+Keep shapes small unless the user explicitly requests large workloads.
 
-## Model workflows (stateful)
-
-Model commands keep a session-like registry of created models.
-
-### Create models
+## Manage backends
 
 ```bash
-# Linear (single layer)
+rasptorch --json backend connect vulkan          # connect; add --strict to fail instead of falling back to CPU
+rasptorch --json backend benchmark --backends numpy,vulkan --size 256 --iterations 20
+```
+
+Benchmark results include `elapsed_seconds`, `iterations_per_second`, and `estimated_gflops` per backend; unavailable backends report `status: "unavailable"` with an `error`.
+
+## Build models
+
+```bash
 rasptorch --json model linear --input-size 10 --hidden-sizes 32,16 --output-size 2
-
-# MLP (multi-layer perceptron)
 rasptorch --json model mlp --layers 64,32,16,2
-
-# CNN (convolutional network)
-rasptorch --json model cnn --in-channels 3 --out-channels 16,32
-
-# CV (computer vision: Conv2d blocks -> Flatten -> Linear)
-rasptorch --json model cv --in-channels 3 --out-channels 32,64 --num-classes 10 --input-hw 32
-
-# JEV (decision: MLP outputting a decision vector)
+rasptorch --json model cnn --in-channels 3 --out-channels 16,32 --kernels 3,3
+rasptorch --json model cv --in-channels 3 --out-channels 32,64 --num-classes 10
 rasptorch --json model jev --input-size 10 --hidden-sizes 32,16 --num-decisions 2
-
-# GRU (gated recurrent unit)
 rasptorch --json model gru --input-size 8 --hidden-size 32 --num-layers 1
-
-# Transformer
 rasptorch --json model transformer --vocab-size 32000 --d-model 256 --num-heads 8 --num-layers 4
 ```
 
-### List / remove models
+Options:
+
+- `--activation relu|gelu|tanh|sigmoid|silu|leaky_relu|elu|none` (default `relu`) is supported by `linear`, `mlp`, `cnn`, `cv`, and `jev`; `--activations <a1,a2,...>` overrides it per layer-transition (count must match).
+- `--pool max|avg|none` pools after each conv block in `cv`.
+
+## Train, combine, save, and load
+
+Only run training and any commands that write files after user approval.
 
 ```bash
+rasptorch --json model train --model-id <model-id> --epochs 5 --lr 0.001 --batch-size 32 --device auto --optimizer Adam
+rasptorch --json model combine <model-a-id> <model-b-id>     # chain two registered models
+rasptorch --json model lora --base-model <model-id> --rank 8 --alpha 16.0
+rasptorch --json model save --model-id <model-id> --path ./model.pkl
+rasptorch --json model load --path ./model.pkl
+rasptorch --json model convert-legacy --src ./old_ckpt.pth --dst ./model.pth
 rasptorch --json model list
 rasptorch --json model remove --model-id <model-id>
 ```
 
-### Save / load (writes files)
+While training starts, a `{"status": "training_started"}` line is emitted on stdout before the final JSON result.
 
-Only do this when the user requests it (or approves writing files):
+## Launch UI or chat
 
-```bash
-rasptorch --json model save --model-id <model-id> --path ./model.pkl
-rasptorch --json model load --path ./model.pkl
-```
+- `rasptorch ui` starts a Streamlit server (long-running; supports `--port`) — only launch with user approval.
+- `rasptorch chat` starts an interactive REPL — avoid it in automated tool flows.
 
-### Train (writes compute + may take time)
+## Discover capabilities
 
-Only run training after user approval:
-
-```bash
-rasptorch --json model train --model-id <model-id> --epochs 5 --lr 0.001 --batch-size 32 --device auto --optimizer Adam
-```
-
-## UI / chat modes
-
-- `rasptorch ui` starts a Streamlit server (long-running). Only launch with user approval.
-- `rasptorch chat` starts an interactive REPL. Avoid in automated tool flows.
-
-## Error handling
-
-- Non-zero exit code indicates failure; inspect stderr for details.
-- JSON output is emitted on stdout; errors may be returned as JSON with an `error` field.
-- Always check the exit code before parsing stdout as JSON.
-
-## Capability discovery
-
-Run `rasptorch --json info` to discover available backends, GPU status, and supported commands at runtime.
+Run `rasptorch --json info` and `rasptorch --json backend list` to discover available backends and GPU status at runtime. Every command exposes agent-friendly `--help` (e.g. `rasptorch model --help`).
